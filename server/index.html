@@ -478,11 +478,11 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
           <div style="display:flex;justify-content:center;align-items:center;padding:10px 0">
             <svg width="120" height="120" viewBox="0 0 120 120">
               <circle cx="60" cy="60" r="50" fill="none" stroke="rgba(108,99,255,0.1)" stroke-width="12"/>
-              <circle cx="60" cy="60" r="50" fill="none" stroke="url(#g1)" stroke-width="12"
-                stroke-dasharray="314" stroke-dashoffset="80" stroke-linecap="round"
+              <circle id="project-health-ring" cx="60" cy="60" r="50" fill="none" stroke="url(#g1)" stroke-width="12"
+                stroke-dasharray="314" stroke-dashoffset="314" stroke-linecap="round"
                 transform="rotate(-90 60 60)"/>
               <defs><linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#6c63ff"/><stop offset="100%" stop-color="#00d4aa"/></linearGradient></defs>
-              <text x="60" y="55" text-anchor="middle" fill="var(--text)" font-size="18" font-weight="700" font-family="JetBrains Mono">74%</text>
+              <text id="project-health-value" x="60" y="55" text-anchor="middle" fill="var(--text)" font-size="18" font-weight="700" font-family="JetBrains Mono">—</text>
               <text x="60" y="72" text-anchor="middle" fill="var(--text3)" font-size="9" font-family="JetBrains Mono">HEALTH</text>
             </svg>
           </div>
@@ -492,10 +492,10 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
           <div style="display:flex;justify-content:center;align-items:center;padding:10px 0">
             <svg width="120" height="120" viewBox="0 0 120 120">
               <circle cx="60" cy="60" r="50" fill="none" stroke="rgba(0,212,170,0.1)" stroke-width="12"/>
-              <circle cx="60" cy="60" r="50" fill="none" stroke="#00d4aa" stroke-width="12"
-                stroke-dasharray="314" stroke-dashoffset="50" stroke-linecap="round"
+              <circle id="security-score-ring" cx="60" cy="60" r="50" fill="none" stroke="#00d4aa" stroke-width="12"
+                stroke-dasharray="314" stroke-dashoffset="314" stroke-linecap="round"
                 transform="rotate(-90 60 60)"/>
-              <text x="60" y="55" text-anchor="middle" fill="var(--text)" font-size="18" font-weight="700" font-family="JetBrains Mono">84%</text>
+              <text id="security-score-value" x="60" y="55" text-anchor="middle" fill="var(--text)" font-size="18" font-weight="700" font-family="JetBrains Mono">—</text>
               <text x="60" y="72" text-anchor="middle" fill="var(--text3)" font-size="9" font-family="JetBrains Mono">SECURE</text>
             </svg>
           </div>
@@ -505,8 +505,8 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
           <div style="display:flex;justify-content:center;align-items:center;padding:10px 0">
             <svg width="120" height="120" viewBox="0 0 120 120">
               <circle cx="60" cy="60" r="50" fill="none" stroke="rgba(255,209,102,0.1)" stroke-width="12"/>
-              <circle cx="60" cy="60" r="50" fill="none" stroke="#ffd166" stroke-width="12"
-                stroke-dasharray="314" stroke-dashoffset="220" stroke-linecap="round"
+              <circle id="active-agents-ring" cx="60" cy="60" r="50" fill="none" stroke="#ffd166" stroke-width="12"
+                stroke-dasharray="314" stroke-dashoffset="314" stroke-linecap="round"
                 transform="rotate(-90 60 60)"/>
               <text x="60" y="55" text-anchor="middle" fill="var(--text)" font-size="18" font-weight="700" font-family="JetBrains Mono" id="ring-agents">0</text>
               <text x="60" y="72" text-anchor="middle" fill="var(--text3)" font-size="9" font-family="JetBrains Mono">RUNNING</text>
@@ -738,6 +738,64 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 const BASE = '';
 let allLogs = [];
 let chatWs, logsWs, agentsWs, tasksWs;
+let latestAnalytics = null;
+let latestAgents = [];
+const RING_CIRCUMFERENCE = 314;
+
+function clamp(n, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, Number.isFinite(Number(n)) ? Number(n) : min));
+}
+
+function setRingProgress(id, percent) {
+  const ring = document.getElementById(id);
+  if (!ring) return;
+  const pct = clamp(percent);
+  ring.style.strokeDashoffset = String(RING_CIRCUMFERENCE - (pct / 100) * RING_CIRCUMFERENCE);
+}
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function computeFallbackHealth(d, agents) {
+  const totalAgents = agents.length;
+  const errors = agents.filter(a => a.status === 'error').length;
+  const coverage = totalAgents ? Math.min(100, (totalAgents / 22) * 100) : 0;
+  const runtime = 100 - (errors / Math.max(totalAgents, 1)) * 30;
+  const success = Number(d?.total_tasks) ? Number(d?.success_rate || 0) : 100;
+  const dbScore = d?.db_available === false ? 75 : 100;
+  return Math.round(clamp(coverage * 0.35 + runtime * 0.30 + success * 0.25 + dbScore * 0.10));
+}
+
+function computeFallbackSecurity(d, agents) {
+  const securityAgents = agents.filter(a => a.division === 'Security');
+  const securityErrors = securityAgents.filter(a => a.status === 'error').length;
+  const allErrors = agents.filter(a => a.status === 'error').length;
+  const securityHealth = securityAgents.length ? 100 - (securityErrors / securityAgents.length) * 35 : 0;
+  const runtime = 100 - (allErrors / Math.max(agents.length, 1)) * 30;
+  const failed = Number(d?.failed || 0);
+  const total = Number(d?.total_tasks || 0);
+  const taskSafety = total ? 100 - (failed / total) * 25 : 100;
+  return Math.round(clamp(securityHealth * 0.55 + taskSafety * 0.30 + runtime * 0.15));
+}
+
+function updateDashboardRings() {
+  const d = latestAnalytics || {};
+  const agents = latestAgents || [];
+  const totalAgents = Number(d.total_agents ?? agents.length);
+  const activeAgents = Number(d.active_agents ?? agents.filter(a => a.status === 'running').length);
+  const health = Number.isFinite(Number(d.project_health)) ? Number(d.project_health) : computeFallbackHealth(d, agents);
+  const security = Number.isFinite(Number(d.security_score)) ? Number(d.security_score) : computeFallbackSecurity(d, agents);
+
+  setText('project-health-value', `${Math.round(clamp(health))}%`);
+  setRingProgress('project-health-ring', health);
+  setText('security-score-value', `${Math.round(clamp(security))}%`);
+  setRingProgress('security-score-ring', security);
+  setText('ring-agents', String(activeAgents));
+  setText('active-agents-pill', `${activeAgents} active`);
+  setRingProgress('active-agents-ring', totalAgents ? (activeAgents / totalAgents) * 100 : 0);
+}
 
 // ── Navigation ─────────────────────────────────────────────────────────────
 const sections = {
@@ -900,10 +958,15 @@ function clearLogs() {
 
 // ── Agents ─────────────────────────────────────────────────────────────────
 function renderAgents(agents) {
+  latestAgents = Array.isArray(agents) ? agents : [];
   const grid = document.getElementById('agent-grid');
+  if (!grid) {
+    updateDashboardRings();
+    return;
+  }
   grid.innerHTML = '';
   let active = 0;
-  agents.forEach(a => {
+  latestAgents.forEach(a => {
     if (a.status === 'running') active++;
     const card = document.createElement('div');
     card.className = 'agent-card';
@@ -918,19 +981,30 @@ function renderAgents(agents) {
       <div class="agent-task">${a.current_task || 'Waiting for task...'}</div>`;
     grid.appendChild(card);
   });
-  document.getElementById('active-agents-pill').textContent = active + ' active';
-  document.getElementById('ring-agents').textContent = active;
+  updateDashboardRings();
 }
 
 function updateAgentCard(d) {
   const card = document.getElementById('agent-' + d.name.replace(/\s/g, '-'));
+  const agent = latestAgents.find(a => a.name === d.name);
+  if (agent) {
+    agent.status = d.status;
+    agent.current_task = d.task || '';
+  }
+  updateDashboardRings();
   if (!card) return;
   card.querySelector('.status-indicator').className = 'status-indicator ' + d.status;
   card.querySelector('.agent-task').textContent = d.task || 'Waiting for task...';
 }
 
 function loadAgents() {
-  fetch('/agents').then(r => r.json()).then(renderAgents).catch(console.error);
+  return fetch('/agents')
+    .then(r => {
+      if (!r.ok) throw new Error('agents request failed: ' + r.status);
+      return r.json();
+    })
+    .then(renderAgents)
+    .catch(console.error);
 }
 
 async function openAgentModal(name) {
@@ -1075,6 +1149,36 @@ function loadDashboard() {
 }
 
 // ── File Attachment ─────────────────────────────────────────────────────────
+async function loadDashboard() {
+  try {
+    const [d, agents] = await Promise.all([
+      fetch('/analytics').then(r => {
+        if (!r.ok) throw new Error('analytics request failed: ' + r.status);
+        return r.json();
+      }),
+      fetch('/agents').then(r => {
+        if (!r.ok) throw new Error('agents request failed: ' + r.status);
+        return r.json();
+      }),
+    ]);
+    latestAnalytics = d || {};
+    renderAgents(agents || []);
+    document.getElementById('d-tasks-today').textContent = d.tasks_today ?? '-';
+    document.getElementById('d-success-rate').textContent = (d.success_rate ?? '-') + '%';
+    document.getElementById('d-total').textContent = d.total_tasks ?? '-';
+    document.getElementById('d-failed').textContent = d.failed ?? '-';
+    document.getElementById('tasks-today-pill').textContent = (d.tasks_today || 0) + ' tasks today';
+    document.getElementById('active-agents-pill').textContent = (d.active_agents ?? latestAgents.filter(a => a.status === 'running').length) + ' active';
+    renderBars('usage-bars', d.by_agent || []);
+    updateDashboardRings();
+  } catch (e) {
+    console.error(e);
+    await loadAgents();
+    latestAnalytics = latestAnalytics || {};
+    updateDashboardRings();
+  }
+}
+
 let attachedFile = null;
 
 function handleFileSelect(input) {

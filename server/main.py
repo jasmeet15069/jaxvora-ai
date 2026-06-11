@@ -1033,6 +1033,8 @@ async def list_agents():
 
 @app.get("/tasks")
 async def list_tasks(status: Optional[str] = None, agent: Optional[str] = None, limit: int = 50):
+    if db_pool is None:
+        return []
     if status and agent:
         rows = await db_fetch("SELECT * FROM tasks WHERE status=$1 AND agent_name=$2 ORDER BY created_at DESC LIMIT $3", status, agent, limit)
     elif status:
@@ -1048,6 +1050,8 @@ async def list_tasks(status: Optional[str] = None, agent: Optional[str] = None, 
 
 @app.get("/projects")
 async def list_projects():
+    if db_pool is None:
+        return []
     rows = await db_fetch("SELECT * FROM projects ORDER BY created_at DESC")
     return [dict(r) for r in rows]
 
@@ -1063,6 +1067,8 @@ async def create_project(req: ProjectCreate):
 
 @app.get("/logs")
 async def get_logs(level: Optional[str] = None, limit: int = 100, offset: int = 0):
+    if db_pool is None:
+        return []
     if level:
         rows = await db_fetch("SELECT * FROM logs WHERE level=$1 ORDER BY timestamp DESC LIMIT $2 OFFSET $3", level, limit, offset)
     else:
@@ -1072,22 +1078,72 @@ async def get_logs(level: Optional[str] = None, limit: int = 100, offset: int = 
 
 @app.get("/analytics")
 async def get_analytics():
-    total = await db_fetchrow("SELECT COUNT(*) as n FROM tasks")
-    success = await db_fetchrow("SELECT COUNT(*) as n FROM tasks WHERE status='completed'")
-    failed = await db_fetchrow("SELECT COUNT(*) as n FROM tasks WHERE status='failed'")
-    by_agent = await db_fetch(
-        "SELECT agent_name, COUNT(*) as calls FROM tasks GROUP BY agent_name ORDER BY calls DESC LIMIT 10"
+    total_n = completed_n = failed_n = today_n = 0
+    by_agent_rows: List[Dict[str, Any]] = []
+    audit_total = audit_rejected = 0
+    db_available = db_pool is not None
+
+    if db_available:
+        try:
+            total = await db_fetchrow("SELECT COUNT(*) as n FROM tasks")
+            success = await db_fetchrow("SELECT COUNT(*) as n FROM tasks WHERE status='completed'")
+            failed = await db_fetchrow("SELECT COUNT(*) as n FROM tasks WHERE status='failed'")
+            today = await db_fetchrow(
+                "SELECT COUNT(*) as n FROM tasks WHERE created_at > NOW() - INTERVAL '24 hours'"
+            )
+            by_agent = await db_fetch(
+                "SELECT agent_name, COUNT(*) as calls FROM tasks GROUP BY agent_name ORDER BY calls DESC LIMIT 10"
+            )
+            audit_stats = await db_fetchrow(
+                "SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE approved = false) as rejected FROM audit"
+            )
+
+            total_n = int(total["n"] or 0)
+            completed_n = int(success["n"] or 0)
+            failed_n = int(failed["n"] or 0)
+            today_n = int(today["n"] or 0)
+            by_agent_rows = [dict(r) for r in by_agent]
+            if audit_stats:
+                audit_total = int(audit_stats["total"] or 0)
+                audit_rejected = int(audit_stats["rejected"] or 0)
+        except Exception as e:
+            logger.warning(f"Analytics DB fallback: {e}")
+            db_available = False
+
+    agents = [a.status_dict() for a in AGENT_REGISTRY.values()]
+    total_agents = len(agents)
+    active_agents = sum(1 for a in agents if a.get("status") == "running")
+    error_agents = sum(1 for a in agents if a.get("status") == "error")
+    security_agents = [a for a in agents if a.get("division") == "Security"]
+    security_errors = sum(1 for a in security_agents if a.get("status") == "error")
+
+    success_rate = round(completed_n / max(total_n, 1) * 100, 1) if total_n else 100.0
+    agent_coverage = min(100.0, total_agents / 22 * 100) if total_agents else 0.0
+    runtime_health = 100.0 - (error_agents / max(total_agents, 1) * 30)
+    db_health = 100.0 if db_available else 75.0
+    project_health = round(
+        max(0.0, min(100.0, agent_coverage * 0.35 + runtime_health * 0.30 + success_rate * 0.25 + db_health * 0.10))
     )
-    today = await db_fetchrow(
-        "SELECT COUNT(*) as n FROM tasks WHERE created_at > NOW() - INTERVAL '24 hours'"
-    )
+
+    security_agent_health = 100.0
+    if security_agents:
+        security_agent_health = 100.0 - (security_errors / len(security_agents) * 35)
+    audit_health = 100.0 - (audit_rejected / max(audit_total, 1) * 30) if audit_total else 100.0
+    security_score = round(max(0.0, min(100.0, security_agent_health * 0.55 + audit_health * 0.30 + runtime_health * 0.15)))
+
     return {
-        "total_tasks": total["n"],
-        "completed": success["n"],
-        "failed": failed["n"],
-        "tasks_today": today["n"],
-        "success_rate": round(success["n"] / max(total["n"], 1) * 100, 1),
-        "by_agent": [dict(r) for r in by_agent],
+        "total_tasks": total_n,
+        "completed": completed_n,
+        "failed": failed_n,
+        "tasks_today": today_n,
+        "success_rate": success_rate,
+        "by_agent": by_agent_rows,
+        "project_health": project_health,
+        "security_score": security_score,
+        "active_agents": active_agents,
+        "total_agents": total_agents,
+        "error_agents": error_agents,
+        "db_available": db_available,
     }
 
 
@@ -1108,6 +1164,8 @@ async def security_scan(req: SecurityScanRequest):
 
 @app.get("/audit")
 async def get_audit(limit: int = 50):
+    if db_pool is None:
+        return []
     rows = await db_fetch("SELECT * FROM audit ORDER BY timestamp DESC LIMIT $1", limit)
     return [dict(r) for r in rows]
 
