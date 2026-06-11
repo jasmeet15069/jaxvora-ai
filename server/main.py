@@ -1297,21 +1297,27 @@ async def ws_chat(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_text()
-            msg = json.loads(data).get("message", "")
-            if not msg:
+            try:
+                msg = json.loads(data).get("message", "")
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "message": "Invalid JSON payload."})
                 continue
-            await ws_manager.send_chat(ws, {"type": "thinking", "message": "Orchestrator is planning..."})
+            if not msg:
+                await ws.send_json({"type": "error", "message": "Message is required."})
+                continue
+            await ws.send_json({"type": "thinking", "message": "Orchestrator is planning..."})
 
             async def stream(event):
-                await ws_manager.send_chat(ws, event)
+                await ws.send_json(event)
 
             result = await orchestrator.process(msg, stream_fn=stream)
-            await ws_manager.send_chat(ws, {"type": "response", "message": result["response"], "plan": result["plan"], "agents": result["agents"]})
+            await ws.send_json({"type": "response", "message": result["response"], "plan": result["plan"], "agents": result["agents"]})
     except WebSocketDisconnect:
         ws_manager.chat_ws.discard(ws)
     except Exception as e:
+        logger.warning(f"WebSocket chat error: {e}")
         try:
-            await ws_manager.send_chat(ws, {"type": "error", "message": str(e)})
+            await ws.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
         ws_manager.chat_ws.discard(ws)
