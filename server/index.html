@@ -353,6 +353,7 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 .setting-desc { font-size: 11px; color: var(--text2); margin-top: 2px; font-family: var(--mono); }
 .key-status { display: flex; align-items: center; gap: 6px; font-size: 12px; font-family: var(--mono); }
 .key-status.ok { color: var(--teal); }
+.key-status.partial { color: var(--yellow); }
 .key-status.missing { color: var(--red); }
 
 /* ── Modal ── */
@@ -668,7 +669,7 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
       <!-- Email Notifications -->
       <div class="card mb-16">
         <div class="card-header"><div class="card-title">✉ Email Notifications</div></div>
-        <div style="font-size:11px;color:var(--text2);margin-bottom:12px">Jaxvora sends bug reports, security alerts, and task results to your email via snipymart@gmail.com</div>
+        <div id="email-config-help" style="font-size:11px;color:var(--text2);margin-bottom:12px">Checking email delivery configuration...</div>
         <div style="display:flex;gap:8px;margin-bottom:12px">
           <input type="email" id="notify-email" placeholder="Your email address (e.g. you@gmail.com)" style="flex:1;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
           <button class="btn btn-primary btn-sm" onclick="saveNotifyEmail()">Save</button>
@@ -1201,28 +1202,58 @@ function clearAttachment() {
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
+function setKeyStatus(key, state, text) {
+  const el = document.getElementById('key-' + key);
+  if (!el) return;
+  el.className = 'key-status ' + state;
+  el.textContent = text;
+}
+
 function loadSettings() {
   const keys = [
     { key: 'OPENROUTER_API_KEY', label: 'OpenRouter', desc: 'DeepSeek V3, Dolphin, Kimi models' },
     { key: 'GROQ_API_KEY', label: 'Groq', desc: 'Llama 3.3 70B — Chief Orchestrator, Code Review & Architecture' },
     { key: 'DATABASE_URL', label: 'PostgreSQL', desc: 'Neon — tasks, logs, memory, audit' },
-    { key: 'GMAIL_SENDER', label: 'Gmail Sender', desc: 'snipymart@gmail.com — email notifications' },
+    { key: 'EMAIL_DELIVERY', label: 'Gmail SMTP', desc: 'Sender + app password for email notifications' },
   ];
   document.getElementById('api-key-status').innerHTML = keys.map(k => `
     <div class="setting-row">
       <div><div class="setting-label">${k.label}</div><div class="setting-desc">${k.desc}</div></div>
       <div class="key-status" id="key-${k.key}"><span>Checking...</span></div>
     </div>`).join('');
-  fetch('/agents').then(r => r.json()).then(() => {
+  fetch('/settings/status').then(r => r.json()).then(status => {
+    const keyStatus = status.keys || {};
     keys.forEach(k => {
-      const el = document.getElementById('key-' + k.key);
-      if (el) { el.className = 'key-status ok'; el.innerHTML = '✓ Connected'; }
+      const item = keyStatus[k.key] || {};
+      if (k.key === 'DATABASE_URL') {
+        if (item.connected) setKeyStatus(k.key, 'ok', 'Connected');
+        else if (item.configured) setKeyStatus(k.key, 'partial', 'Configured, not connected');
+        else setKeyStatus(k.key, 'missing', 'Missing');
+        return;
+      }
+      if (k.key === 'EMAIL_DELIVERY') {
+        if (item.configured) setKeyStatus(k.key, 'ok', 'Connected');
+        else if (item.partial) setKeyStatus(k.key, 'partial', 'Partial: missing ' + (item.missing || []).join(', '));
+        else setKeyStatus(k.key, 'missing', 'Missing sender + app password');
+        return;
+      }
+      setKeyStatus(k.key, item.configured ? 'ok' : 'missing', item.configured ? 'Connected' : 'Missing');
     });
+
+    const email = status.email || {};
+    const help = document.getElementById('email-config-help');
+    if (help) {
+      if (email.delivery_configured) {
+        help.innerHTML = 'Jaxvora sends bug reports, security alerts, and task results via <strong>' + escHtml(email.sender || 'configured Gmail sender') + '</strong>.';
+      } else {
+        help.innerHTML = '<span style="color:var(--yellow)">Email delivery is not ready.</span> Missing server env: <strong>' + escHtml((email.missing || ['GMAIL_SENDER', 'GMAIL_APP_PASSWORD']).join(', ')) + '</strong>.';
+      }
+    }
+    if (email.notification_email) document.getElementById('notify-email').value = email.notification_email;
   }).catch(() => {
-    keys.forEach(k => {
-      const el = document.getElementById('key-' + k.key);
-      if (el) { el.className = 'key-status missing'; el.innerHTML = '✗ Unknown'; }
-    });
+    keys.forEach(k => setKeyStatus(k.key, 'missing', 'Status unavailable'));
+    const help = document.getElementById('email-config-help');
+    if (help) help.innerHTML = '<span style="color:var(--red)">Could not read email delivery configuration.</span>';
   });
   fetch('/tools').then(r => r.json()).then(tools => {
     document.getElementById('tools-list').innerHTML = tools.map(t => `
@@ -1231,9 +1262,6 @@ function loadSettings() {
         <div class="key-status ok">✓ Active</div>
       </div>`).join('');
   });
-  fetch('/settings/notification-email').then(r => r.json()).then(d => {
-    if (d.email) document.getElementById('notify-email').value = d.email;
-  }).catch(()=>{});
   fetch('/settings/ssh').then(r => r.json()).then(d => {
     if (d.host) document.getElementById('ssh-host').value = d.host;
     if (d.port) document.getElementById('ssh-port').value = d.port;

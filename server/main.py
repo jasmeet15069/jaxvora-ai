@@ -216,6 +216,12 @@ CREATE TABLE IF NOT EXISTS knowledge_base (
 
 CREATE INDEX IF NOT EXISTS knowledge_base_fts ON knowledge_base USING GIN(search_vector);
 CREATE INDEX IF NOT EXISTS knowledge_base_trgm ON knowledge_base USING GIN(content gin_trgm_ops);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 async def get_db() -> asyncpg.Pool:
@@ -1016,8 +1022,11 @@ class SendEmailRequest(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def frontend():
-    with open(Path(__file__).parent / "index.html") as f:
-        return f.read()
+    app_dir = Path(__file__).parent
+    for index_path in (app_dir / "index.html", app_dir / "server" / "index.html"):
+        if index_path.exists():
+            return index_path.read_text(encoding="utf-8")
+    raise HTTPException(status_code=500, detail="Frontend index.html is missing")
 
 
 @app.post("/chat")
@@ -1196,10 +1205,55 @@ async def get_notification_email():
     return {"email": NOTIFICATION_EMAIL}
 
 
+@app.get("/settings/status")
+async def get_settings_status():
+    gmail_sender_ready = bool(GMAIL_SENDER)
+    gmail_password_ready = bool(GMAIL_APP_PASSWORD)
+    gmail_ready = gmail_sender_ready and gmail_password_ready
+    gmail_missing = []
+    if not gmail_sender_ready:
+        gmail_missing.append("GMAIL_SENDER")
+    if not gmail_password_ready:
+        gmail_missing.append("GMAIL_APP_PASSWORD")
+
+    return {
+        "keys": {
+            "OPENROUTER_API_KEY": {"configured": bool(OPENROUTER_API_KEY)},
+            "GROQ_API_KEY": {"configured": bool(GROQ_API_KEY)},
+            "DATABASE_URL": {"configured": bool(DATABASE_URL), "connected": bool(db_pool)},
+            "EMAIL_DELIVERY": {
+                "configured": gmail_ready,
+                "partial": bool(gmail_sender_ready or gmail_password_ready) and not gmail_ready,
+                "missing": gmail_missing,
+            },
+        },
+        "email": {
+            "notification_email": NOTIFICATION_EMAIL,
+            "sender": GMAIL_SENDER,
+            "sender_configured": gmail_sender_ready,
+            "app_password_configured": gmail_password_ready,
+            "delivery_configured": gmail_ready,
+            "missing": gmail_missing,
+        },
+    }
+
+
 @app.post("/settings/notification-email")
 async def set_notification_email(req: NotificationEmailRequest):
     global NOTIFICATION_EMAIL
     NOTIFICATION_EMAIL = req.email
+    if db_pool:
+        try:
+            await db_execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES ('notification_email', $1, NOW())
+                ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()
+                """,
+                NOTIFICATION_EMAIL,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist notification email: {e}")
     return {"email": NOTIFICATION_EMAIL, "status": "saved"}
 
 
@@ -1326,7 +1380,7 @@ async def ws_chat(ws: WebSocket):
 # === SECTION 11: Startup / Shutdown Events ====================================
 
 async def startup():
-    global db_pool
+    global db_pool, NOTIFICATION_EMAIL
 
     # Init DB
     if DATABASE_URL:
@@ -1340,6 +1394,18 @@ async def startup():
                             await conn.execute(stmt)
                         except Exception as e:
                             logger.warning(f"Schema stmt skipped: {e}")
+                row = await conn.fetchrow("SELECT value FROM app_settings WHERE key='notification_email'")
+                if row and row["value"]:
+                    NOTIFICATION_EMAIL = row["value"]
+                elif NOTIFICATION_EMAIL:
+                    await conn.execute(
+                        """
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES ('notification_email', $1, NOW())
+                        ON CONFLICT (key) DO NOTHING
+                        """,
+                        NOTIFICATION_EMAIL,
+                    )
             logger.info("✓ PostgreSQL connected and schema ready")
         except Exception as e:
             logger.error(f"✗ PostgreSQL connection failed: {e}")
