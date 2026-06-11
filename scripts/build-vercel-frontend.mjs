@@ -19,6 +19,34 @@ html = html.replace(
   "</head>",
   '<meta name="description" content="Jaxvora autonomous multi-agent AI command center" />\n</head>',
 );
+html = html.replace(
+  `  connectChatWs();
+  connectLogsWs();
+  connectAgentsWs();
+  connectTasksWs();
+  loadDashboard();
+  loadAgents();
+
+  // Poll dashboard every 30s
+  setInterval(loadDashboard, 30000);
+  setInterval(loadApprovals, 15000);`,
+  `  const isVercelFrontend = location.hostname.endsWith('.vercel.app');
+  if (!isVercelFrontend) {
+    connectChatWs();
+    connectLogsWs();
+    connectAgentsWs();
+    connectTasksWs();
+  } else {
+    document.getElementById('sys-status').textContent = 'online';
+  }
+  loadDashboard();
+  loadAgents();
+
+  // Vercel proxies HTTP to the VM backend; poll where WebSocket upgrades are unavailable.
+  setInterval(loadDashboard, 30000);
+  setInterval(loadAgents, 15000);
+  setInterval(loadApprovals, 15000);`,
+);
 
 writeFileSync(outputHtml, html);
 writeFileSync(resolve(outputDir, "robots.txt"), "User-agent: *\nAllow: /\n");
