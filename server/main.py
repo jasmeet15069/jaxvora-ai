@@ -1038,7 +1038,13 @@ async def _doctor_http_check(name: str, path: str, method: str = "GET", expected
         async with httpx.AsyncClient(timeout=12) as client:
             response = await client.request(method, url)
         ok = response.status_code == expected_status
-        return _doctor_check(name, ok, f"{method} {path} -> {response.status_code}", response.text[:1200])
+        content_type = response.headers.get("content-type", "")
+        content_length = response.headers.get("content-length", str(len(response.content)))
+        detail = f"{method} {path} -> {response.status_code}"
+        if content_type:
+            detail += f" ({content_type}, {content_length} bytes)"
+        output = "" if not content_type.startswith(("application/json", "text/")) else response.text[:1200]
+        return _doctor_check(name, ok, detail, output)
     except Exception as exc:
         return _doctor_check(name, False, f"{method} {path} failed: {type(exc).__name__}: {exc}")
 
