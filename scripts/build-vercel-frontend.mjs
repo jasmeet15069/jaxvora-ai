@@ -1,9 +1,10 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHtml = resolve(rootDir, "server", "index.html");
+const sourceAssets = resolve(rootDir, "server", "assets");
 const outputDir = resolve(rootDir, "frontend", "dist");
 const outputHtml = resolve(outputDir, "index.html");
 
@@ -54,5 +55,8 @@ writeFileSync(
   resolve(outputDir, "_headers"),
   "/\n  Cache-Control: public, max-age=0, must-revalidate\n",
 );
+for (const assetName of ["favicon.ico", "favicon.png", "apple-touch-icon.png"]) {
+  copyFileSync(resolve(sourceAssets, assetName), resolve(outputDir, assetName));
+}
 
 console.log(`Built Vercel frontend from ${sourceHtml}`);

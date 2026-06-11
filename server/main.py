@@ -27,7 +27,7 @@ from email.mime.image import MIMEImage
 from email import encoders
 import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Form, Header
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1840,6 +1840,30 @@ class GmailActionRequest(BaseModel):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/favicon.ico")
+async def favicon_ico():
+    icon_path = _resolve_app_resource("", "assets", "favicon.ico")
+    if not icon_path:
+        raise HTTPException(status_code=404, detail="favicon.ico is missing")
+    return FileResponse(icon_path, media_type="image/x-icon")
+
+
+@app.get("/favicon.png")
+async def favicon_png():
+    icon_path = _resolve_app_resource("", "assets", "favicon.png")
+    if not icon_path:
+        raise HTTPException(status_code=404, detail="favicon.png is missing")
+    return FileResponse(icon_path, media_type="image/png")
+
+
+@app.get("/apple-touch-icon.png")
+async def apple_touch_icon():
+    icon_path = _resolve_app_resource("", "assets", "apple-touch-icon.png")
+    if not icon_path:
+        raise HTTPException(status_code=404, detail="apple-touch-icon.png is missing")
+    return FileResponse(icon_path, media_type="image/png")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def frontend():
