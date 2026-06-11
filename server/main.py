@@ -55,6 +55,7 @@ SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 SSH_USER = os.environ.get("SSH_USER", "")
 SSH_PASSWORD = os.environ.get("SSH_PASSWORD", "")
 SSH_KEY = os.environ.get("SSH_KEY", "")
+SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "")
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat-v3-0324"
@@ -805,6 +806,8 @@ class SSHTool(MCPTool):
             }
             if password:
                 conn_kwargs["password"] = password
+            elif SSH_KEY_PATH:
+                conn_kwargs["client_keys"] = [SSH_KEY_PATH]
             elif SSH_KEY:
                 import io
                 conn_kwargs["client_keys"] = [asyncssh.import_private_key(SSH_KEY)]
