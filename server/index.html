@@ -864,6 +864,21 @@ body.chat-view #content { overflow: hidden; }
         <div id="email-status" style="font-size:11px;font-family:var(--mono);color:var(--text2)"></div>
       </div>
 
+      <!-- Gmail Automation -->
+      <div class="card mb-16">
+        <div class="card-header">
+          <div class="card-title">Gmail Automation</div>
+          <div class="key-status" id="gmail-automation-badge">Checking...</div>
+        </div>
+        <div id="gmail-automation-help" style="font-size:11px;color:var(--text2);margin-bottom:12px">Checking snipymart mailbox automation...</div>
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-bottom:12px">
+          <input type="text" id="gmail-query" placeholder="Gmail search query, e.g. newer_than:7d from:customer@example.com" value="newer_than:7d" style="min-width:0;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+          <button class="btn btn-teal btn-sm" onclick="testGmailSearch()">Search Mail</button>
+        </div>
+        <div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-bottom:10px">Agent mutations require confirm=true: send, archive, trash, labels, filters, and permanent delete.</div>
+        <div id="gmail-results" style="font-size:11px;color:var(--text2);font-family:var(--mono)"></div>
+      </div>
+
       <!-- SSH Server -->
       <div class="card mb-16">
         <div class="card-header"><div class="card-title">🖥 SSH Server Connection</div></div>
@@ -1472,6 +1487,7 @@ function loadSettings() {
     { key: 'OPENROUTER_API_KEY', label: 'OpenRouter', desc: 'DeepSeek V3, Dolphin, Kimi models' },
     { key: 'GROQ_API_KEY', label: 'Groq', desc: 'Llama 3.3 70B — Chief Orchestrator, Code Review & Architecture' },
     { key: 'DATABASE_URL', label: 'PostgreSQL', desc: 'Neon — tasks, logs, memory, audit' },
+    { key: 'GMAIL_AUTOMATION', label: 'Gmail Automation', desc: 'OAuth Gmail API for the snipymart mailbox agent' },
     { key: 'EMAIL_DELIVERY', label: 'Gmail SMTP', desc: 'Sender + app password for email notifications' },
   ];
   document.getElementById('api-key-status').innerHTML = keys.map(k => `
@@ -1489,6 +1505,12 @@ function loadSettings() {
         else setKeyStatus(k.key, 'missing', 'Missing');
         return;
       }
+      if (k.key === 'GMAIL_AUTOMATION') {
+        if (item.configured) setKeyStatus(k.key, 'ok', 'Connected: ' + (item.user || 'Gmail'));
+        else if (item.partial) setKeyStatus(k.key, 'partial', 'Partial: missing ' + (item.missing || []).join(', '));
+        else setKeyStatus(k.key, 'missing', 'Missing OAuth');
+        return;
+      }
       if (k.key === 'EMAIL_DELIVERY') {
         if (item.configured) setKeyStatus(k.key, 'ok', 'Connected');
         else if (item.partial) setKeyStatus(k.key, 'partial', 'Partial: missing ' + (item.missing || []).join(', '));
@@ -1497,6 +1519,7 @@ function loadSettings() {
       }
       setKeyStatus(k.key, item.configured ? 'ok' : 'missing', item.configured ? 'Connected' : 'Missing');
     });
+    renderGmailAutomation(status.gmail_automation || {});
 
     const email = status.email || {};
     const help = document.getElementById('email-config-help');
@@ -1512,6 +1535,7 @@ function loadSettings() {
     keys.forEach(k => setKeyStatus(k.key, 'missing', 'Status unavailable'));
     const help = document.getElementById('email-config-help');
     if (help) help.innerHTML = '<span style="color:var(--red)">Could not read email delivery configuration.</span>';
+    renderGmailAutomation({ configured: false, missing: ['status unavailable'] });
   });
   fetch('/tools').then(r => r.json()).then(tools => {
     document.getElementById('tools-list').innerHTML = tools.map(t => `
@@ -1526,6 +1550,90 @@ function loadSettings() {
     if (d.user) document.getElementById('ssh-user').value = d.user;
     if (d.configured) document.getElementById('ssh-status').innerHTML = '<span style="color:var(--teal)">✓ SSH connection configured</span>';
   }).catch(()=>{});
+}
+
+function renderGmailAutomation(gmail) {
+  const badge = document.getElementById('gmail-automation-badge');
+  const help = document.getElementById('gmail-automation-help');
+  const results = document.getElementById('gmail-results');
+  if (!badge || !help) return;
+  if (gmail.configured) {
+    badge.className = 'key-status ok';
+    badge.textContent = 'Connected';
+    help.innerHTML = 'Gmail API agent is ready for <strong>' + escHtml(gmail.user || 'snipymart@gmail.com') + '</strong>. Safe actions can search/read/list, and mutations require explicit confirmation.';
+    if (results && !results.innerHTML) results.textContent = 'Run a safe search to verify live mailbox access.';
+  } else {
+    const missing = gmail.missing || ['GMAIL_CLIENT_ID', 'GMAIL_CLIENT_SECRET', 'GMAIL_REFRESH_TOKEN'];
+    badge.className = 'key-status missing';
+    badge.textContent = 'OAuth missing';
+    help.innerHTML = '<span style="color:var(--yellow)">Gmail automation is not connected yet.</span> Missing server env: <strong>' + escHtml(missing.join(', ')) + '</strong>.';
+    if (results) results.innerHTML = '<span style="color:var(--text3)">Add OAuth credentials for snipymart@gmail.com, then restart the server and test again.</span>';
+  }
+}
+
+async function testGmailSearch() {
+  const el = document.getElementById('gmail-results');
+  const q = (document.getElementById('gmail-query').value || 'newer_than:7d').trim();
+  if (!el) return;
+  el.textContent = 'Searching Gmail...';
+  try {
+    const data = await fetch('/gmail/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'search', query: q, max_results: 5 })
+    }).then(r => r.json());
+    if (!data.ok) {
+      el.innerHTML = '<span style="color:var(--red)">' + escHtml(data.error || 'Gmail search failed') + '</span>' +
+        (data.missing ? '<div style="margin-top:6px;color:var(--text3)">Missing: ' + escHtml(data.missing.join(', ')) + '</div>' : '');
+      return;
+    }
+    const messages = data.messages || [];
+    if (!messages.length) {
+      el.textContent = 'No messages matched: ' + q;
+      return;
+    }
+    el.innerHTML = messages.map(m => `
+      <div style="padding:10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;background:rgba(0,0,0,0.16)">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
+          <div style="min-width:0">
+            <div style="color:var(--text);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(m.subject || '(no subject)')}</div>
+            <div style="color:var(--text2);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">From: ${escHtml(m.from || 'unknown')}</div>
+            <div style="color:var(--text3);margin-top:4px">${escHtml(m.date || '')}</div>
+          </div>
+          <button class="btn btn-sm" data-gmail-id="${escHtml(m.id)}" onclick="readGmailMessage(this.dataset.gmailId)">Read</button>
+        </div>
+        <div style="margin-top:8px;color:var(--text2);white-space:normal">${escHtml(m.snippet || '')}</div>
+      </div>`).join('');
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--red)">Gmail search error: ' + escHtml(e.message) + '</span>';
+  }
+}
+
+async function readGmailMessage(messageId) {
+  const el = document.getElementById('gmail-results');
+  if (!el || !messageId) return;
+  const previous = el.innerHTML;
+  el.innerHTML = previous + '<div style="color:var(--text3);margin:8px 0">Reading message ' + escHtml(messageId) + '...</div>';
+  try {
+    const data = await fetch('/gmail/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'read', message_id: messageId })
+    }).then(r => r.json());
+    if (!data.ok) {
+      el.innerHTML = previous + '<div style="color:var(--red);margin-top:8px">' + escHtml(data.error || 'Read failed') + '</div>';
+      return;
+    }
+    const m = data.message || {};
+    el.innerHTML = previous + `
+      <div style="padding:12px;border:1px solid rgba(0,212,170,0.35);border-radius:8px;margin-top:10px;background:rgba(0,212,170,0.06)">
+        <div style="color:var(--teal);font-weight:700;margin-bottom:6px">Opened: ${escHtml(m.subject || '(no subject)')}</div>
+        <div style="color:var(--text2);margin-bottom:8px">From: ${escHtml(m.from || '')}</div>
+        <pre style="white-space:pre-wrap;max-height:260px;overflow:auto;color:var(--text);font-size:11px;line-height:1.5;margin:0">${escHtml((m.body || m.snippet || '').slice(0, 4000))}</pre>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = previous + '<div style="color:var(--red);margin-top:8px">Read error: ' + escHtml(e.message) + '</div>';
+  }
 }
 
 async function saveNotifyEmail() {

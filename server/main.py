@@ -39,6 +39,17 @@ PORT = int(os.environ.get("PORT", 8080))
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL", "")
+GMAIL_AUTOMATION_USER = os.environ.get("GMAIL_AUTOMATION_USER", os.environ.get("GMAIL_USER", "snipymart@gmail.com"))
+GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
+GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+GMAIL_SCOPES = os.environ.get(
+    "GMAIL_SCOPES",
+    "https://www.googleapis.com/auth/gmail.modify "
+    "https://www.googleapis.com/auth/gmail.send "
+    "https://www.googleapis.com/auth/gmail.compose "
+    "https://www.googleapis.com/auth/gmail.settings.basic",
+)
 
 SSH_HOST = os.environ.get("SSH_HOST", "")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
@@ -150,6 +161,334 @@ async def send_gmail(to_email: str, subject: str, body: str, attachment_name: st
     except Exception as e:
         logger.error(f"Gmail error: {e}")
         return f"[Gmail error: {e}]"
+
+
+GMAIL_SAFE_ACTIONS = {
+    "status",
+    "search",
+    "read",
+    "list_labels",
+    "list_drafts",
+}
+GMAIL_GUARDED_ACTIONS = {
+    "draft",
+    "send",
+    "send_draft",
+    "archive",
+    "trash",
+    "delete",
+    "delete_forever",
+    "mark_important",
+    "unmark_important",
+    "star",
+    "unstar",
+    "mark_read",
+    "mark_unread",
+    "create_label",
+    "apply_label",
+    "remove_label",
+    "create_filter",
+}
+GMAIL_ACTIONS = GMAIL_SAFE_ACTIONS | GMAIL_GUARDED_ACTIONS
+
+
+def gmail_automation_status() -> Dict[str, Any]:
+    missing = []
+    if not GMAIL_CLIENT_ID:
+        missing.append("GMAIL_CLIENT_ID")
+    if not GMAIL_CLIENT_SECRET:
+        missing.append("GMAIL_CLIENT_SECRET")
+    if not GMAIL_REFRESH_TOKEN:
+        missing.append("GMAIL_REFRESH_TOKEN")
+    return {
+        "configured": not missing,
+        "user": GMAIL_AUTOMATION_USER or "me",
+        "missing": missing,
+        "safe_actions": sorted(GMAIL_SAFE_ACTIONS),
+        "guarded_actions": sorted(GMAIL_GUARDED_ACTIONS),
+        "required_scopes": GMAIL_SCOPES.split(),
+        "policy": "Safe actions can run directly. Mailbox mutations require confirm=true; permanent delete also requires confirm_text='DELETE FOREVER'.",
+    }
+
+
+def _gmail_decode_b64url(value: str) -> str:
+    if not value:
+        return ""
+    padded = value + ("=" * (-len(value) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _gmail_payload_text(payload: Dict[str, Any]) -> str:
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+
+    def walk(part: Dict[str, Any]):
+        mime_type = part.get("mimeType", "")
+        data = (part.get("body") or {}).get("data", "")
+        if data and mime_type == "text/plain":
+            plain_parts.append(_gmail_decode_b64url(data))
+        elif data and mime_type == "text/html":
+            html_parts.append(re.sub(r"<[^>]+>", " ", _gmail_decode_b64url(data)))
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload or {})
+    text = "\n".join(p.strip() for p in plain_parts if p.strip())
+    if not text:
+        text = "\n".join(re.sub(r"\s+", " ", p).strip() for p in html_parts if p.strip())
+    return text[:12000]
+
+
+def _gmail_headers(payload: Dict[str, Any]) -> Dict[str, str]:
+    headers = {}
+    for item in (payload or {}).get("headers") or []:
+        name = item.get("name", "").lower()
+        if name:
+            headers[name] = item.get("value", "")
+    return headers
+
+
+def _gmail_message_summary(message: Dict[str, Any], include_body: bool = False) -> Dict[str, Any]:
+    payload = message.get("payload") or {}
+    headers = _gmail_headers(payload)
+    summary = {
+        "id": message.get("id", ""),
+        "thread_id": message.get("threadId", ""),
+        "label_ids": message.get("labelIds", []),
+        "snippet": message.get("snippet", ""),
+        "subject": headers.get("subject", ""),
+        "from": headers.get("from", ""),
+        "to": headers.get("to", ""),
+        "date": headers.get("date", ""),
+    }
+    if include_body:
+        summary["body"] = _gmail_payload_text(payload)
+    return summary
+
+
+def _gmail_raw_message(params: Dict[str, Any]) -> str:
+    to = (params.get("to") or "").strip()
+    subject = params.get("subject") or ""
+    body = params.get("body") or params.get("text") or ""
+    if not to:
+        raise ValueError("Recipient 'to' is required")
+    msg = MIMEMultipart()
+    msg["To"] = to
+    msg["From"] = GMAIL_AUTOMATION_USER or "me"
+    msg["Subject"] = subject
+    if params.get("cc"):
+        msg["Cc"] = params.get("cc")
+    if params.get("bcc"):
+        msg["Bcc"] = params.get("bcc")
+    msg.attach(MIMEText(body, "html" if params.get("html") else "plain", "utf-8"))
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+
+def _as_list(value: Any) -> List[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v)]
+    return [str(value)]
+
+
+async def _gmail_access_token() -> str:
+    status = gmail_automation_status()
+    if not status["configured"]:
+        raise RuntimeError("Gmail automation is not configured. Missing: " + ", ".join(status["missing"]))
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GMAIL_CLIENT_ID,
+                "client_secret": GMAIL_CLIENT_SECRET,
+                "refresh_token": GMAIL_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Google token refresh failed ({response.status_code}): {response.text[:400]}")
+    data = response.json()
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError("Google token refresh did not return an access token")
+    return token
+
+
+async def _gmail_request(method: str, path: str, token: str, **kwargs) -> Dict[str, Any]:
+    user = GMAIL_AUTOMATION_USER or "me"
+    url = f"https://gmail.googleapis.com/gmail/v1/users/{user}{path}"
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.request(method, url, headers=headers, **kwargs)
+    if response.status_code == 204:
+        return {"ok": True}
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text[:1000]}
+    if response.status_code >= 400:
+        raise RuntimeError(f"Gmail API error ({response.status_code}): {data}")
+    return data
+
+
+async def run_gmail_automation(params: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(params.get("action", "status")).strip().lower()
+    if action not in GMAIL_ACTIONS:
+        return {"ok": False, "error": f"Unknown Gmail action '{action}'", "available_actions": sorted(GMAIL_ACTIONS)}
+    status = gmail_automation_status()
+    if action == "status":
+        return {"ok": status["configured"], **status}
+    if not status["configured"]:
+        return {
+            "ok": False,
+            "error": "Gmail automation is not configured",
+            "missing": status["missing"],
+            "user": status["user"],
+            "setup_hint": "Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REFRESH_TOKEN for the snipymart Gmail OAuth client.",
+        }
+    if action in GMAIL_GUARDED_ACTIONS and not bool(params.get("confirm")):
+        return {
+            "ok": False,
+            "error": f"Gmail action '{action}' requires confirm=true",
+            "policy": status["policy"],
+        }
+    if action == "delete_forever" and params.get("confirm_text") != "DELETE FOREVER":
+        return {"ok": False, "error": "Permanent delete requires confirm_text='DELETE FOREVER'"}
+
+    try:
+        token = await _gmail_access_token()
+        if action == "search":
+            max_results = max(1, min(int(params.get("max_results") or params.get("limit") or 10), 25))
+            list_params: Dict[str, Any] = {"maxResults": max_results}
+            if params.get("query"):
+                list_params["q"] = params.get("query")
+            labels = _as_list(params.get("label_ids") or params.get("labelIds"))
+            if labels:
+                list_params["labelIds"] = labels
+            data = await _gmail_request("GET", "/messages", token, params=list_params)
+            messages = []
+            for item in data.get("messages", [])[:max_results]:
+                msg = await _gmail_request(
+                    "GET",
+                    f"/messages/{item['id']}",
+                    token,
+                    params=[
+                        ("format", "metadata"),
+                        ("metadataHeaders", "Subject"),
+                        ("metadataHeaders", "From"),
+                        ("metadataHeaders", "To"),
+                        ("metadataHeaders", "Date"),
+                    ],
+                )
+                messages.append(_gmail_message_summary(msg))
+            return {"ok": True, "action": action, "query": params.get("query", ""), "messages": messages}
+
+        if action == "read":
+            message_id = params.get("message_id") or params.get("id")
+            if not message_id:
+                return {"ok": False, "error": "message_id is required"}
+            msg = await _gmail_request("GET", f"/messages/{message_id}", token, params={"format": "full"})
+            return {"ok": True, "action": action, "message": _gmail_message_summary(msg, include_body=True)}
+
+        if action == "list_labels":
+            labels = await _gmail_request("GET", "/labels", token)
+            return {"ok": True, "action": action, "labels": labels.get("labels", [])}
+
+        if action == "list_drafts":
+            drafts = await _gmail_request("GET", "/drafts", token, params={"maxResults": min(int(params.get("max_results") or 10), 25)})
+            return {"ok": True, "action": action, "drafts": drafts.get("drafts", [])}
+
+        if action == "draft":
+            data = await _gmail_request("POST", "/drafts", token, json={"message": {"raw": _gmail_raw_message(params)}})
+            return {"ok": True, "action": action, "draft_id": data.get("id"), "message_id": (data.get("message") or {}).get("id")}
+
+        if action == "send":
+            data = await _gmail_request("POST", "/messages/send", token, json={"raw": _gmail_raw_message(params)})
+            return {"ok": True, "action": action, "message_id": data.get("id"), "thread_id": data.get("threadId")}
+
+        if action == "send_draft":
+            draft_id = params.get("draft_id") or params.get("id")
+            if not draft_id:
+                return {"ok": False, "error": "draft_id is required"}
+            data = await _gmail_request("POST", "/drafts/send", token, json={"id": draft_id})
+            return {"ok": True, "action": action, "message_id": data.get("id"), "thread_id": data.get("threadId")}
+
+        message_id = params.get("message_id") or params.get("id")
+        if action in {"archive", "trash", "delete", "delete_forever", "mark_important", "unmark_important", "star", "unstar", "mark_read", "mark_unread", "apply_label", "remove_label"} and not message_id:
+            return {"ok": False, "error": "message_id is required"}
+
+        if action == "archive":
+            data = await _gmail_request("POST", f"/messages/{message_id}/modify", token, json={"removeLabelIds": ["INBOX"]})
+            return {"ok": True, "action": action, "message": _gmail_message_summary(data)}
+
+        if action in {"trash", "delete"}:
+            data = await _gmail_request("POST", f"/messages/{message_id}/trash", token)
+            return {"ok": True, "action": "trash", "message": _gmail_message_summary(data)}
+
+        if action == "delete_forever":
+            await _gmail_request("DELETE", f"/messages/{message_id}", token)
+            return {"ok": True, "action": action, "message_id": message_id}
+
+        label_ops = {
+            "mark_important": (["IMPORTANT"], []),
+            "unmark_important": ([], ["IMPORTANT"]),
+            "star": (["STARRED"], []),
+            "unstar": ([], ["STARRED"]),
+            "mark_read": ([], ["UNREAD"]),
+            "mark_unread": (["UNREAD"], []),
+            "apply_label": (_as_list(params.get("label_ids") or params.get("label_id")), []),
+            "remove_label": ([], _as_list(params.get("label_ids") or params.get("label_id"))),
+        }
+        if action in label_ops:
+            add_labels, remove_labels = label_ops[action]
+            data = await _gmail_request(
+                "POST",
+                f"/messages/{message_id}/modify",
+                token,
+                json={"addLabelIds": add_labels, "removeLabelIds": remove_labels},
+            )
+            return {"ok": True, "action": action, "message": _gmail_message_summary(data)}
+
+        if action == "create_label":
+            name = (params.get("label_name") or params.get("name") or "").strip()
+            if not name:
+                return {"ok": False, "error": "label_name is required"}
+            data = await _gmail_request(
+                "POST",
+                "/labels",
+                token,
+                json={
+                    "name": name,
+                    "labelListVisibility": params.get("label_list_visibility", "labelShow"),
+                    "messageListVisibility": params.get("message_list_visibility", "show"),
+                },
+            )
+            return {"ok": True, "action": action, "label": data}
+
+        if action == "create_filter":
+            criteria = dict(params.get("criteria") or {})
+            for src, dest in (("from_email", "from"), ("to_email", "to"), ("subject", "subject"), ("query", "query")):
+                if params.get(src):
+                    criteria[dest] = params.get(src)
+            filter_action = dict(params.get("filter_action") or params.get("mail_action") or {})
+            if params.get("add_label_ids"):
+                filter_action["addLabelIds"] = _as_list(params.get("add_label_ids"))
+            if params.get("remove_label_ids"):
+                filter_action["removeLabelIds"] = _as_list(params.get("remove_label_ids"))
+            if not criteria or not filter_action:
+                return {"ok": False, "error": "create_filter requires criteria and filter_action/add_label_ids/remove_label_ids"}
+            data = await _gmail_request("POST", "/settings/filters", token, json={"criteria": criteria, "action": filter_action})
+            return {"ok": True, "action": action, "filter": data}
+
+        return {"ok": False, "error": f"Action '{action}' is declared but not implemented"}
+    except Exception as e:
+        logger.error(f"Gmail automation error: {e}")
+        return {"ok": False, "action": action, "error": str(e)}
 
 
 # === SECTION 2: Database Layer ================================================
@@ -394,6 +733,18 @@ class EmailNotificationTool(MCPTool):
         subject = params.get("subject", "Jaxvora Alert")
         body = params.get("body", "")
         return await send_gmail(to, subject, body)
+
+
+class GmailAutomationTool(MCPTool):
+    def __init__(self):
+        super().__init__(
+            "gmail_automation",
+            "Governed Gmail API automation for snipymart: search, read, draft, send, archive, delete, labels, and filters",
+        )
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        result = await run_gmail_automation(params)
+        return json.dumps(result, indent=2, default=str)
 
 
 class SSHTool(MCPTool):
@@ -1198,6 +1549,33 @@ class SendEmailRequest(BaseModel):
     body: str
 
 
+class GmailActionRequest(BaseModel):
+    action: str = "status"
+    query: Optional[str] = ""
+    max_results: Optional[int] = 10
+    message_id: Optional[str] = None
+    draft_id: Optional[str] = None
+    label_id: Optional[str] = None
+    label_ids: Optional[Any] = None
+    label_name: Optional[str] = None
+    to: Optional[str] = None
+    cc: Optional[str] = None
+    bcc: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    html: Optional[bool] = False
+    criteria: Optional[Dict[str, Any]] = None
+    filter_action: Optional[Dict[str, Any]] = None
+    mail_action: Optional[Dict[str, Any]] = None
+    add_label_ids: Optional[Any] = None
+    remove_label_ids: Optional[Any] = None
+    confirm: bool = False
+    confirm_text: Optional[str] = ""
+
+    class Config:
+        extra = "allow"
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -1369,6 +1747,17 @@ async def list_tools():
     return tool_registry.list_tools()
 
 
+@app.get("/gmail/status")
+async def gmail_status():
+    status = gmail_automation_status()
+    return {"ok": status["configured"], **status}
+
+
+@app.post("/gmail/action")
+async def gmail_action(req: GmailActionRequest):
+    return await run_gmail_automation(req.dict())
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """Accept file upload and return its text content for agent context."""
@@ -1400,12 +1789,19 @@ async def get_settings_status():
         gmail_missing.append("GMAIL_SENDER")
     if not gmail_password_ready:
         gmail_missing.append("GMAIL_APP_PASSWORD")
+    gmail_api_status = gmail_automation_status()
 
     return {
         "keys": {
             "OPENROUTER_API_KEY": {"configured": bool(OPENROUTER_API_KEY)},
             "GROQ_API_KEY": {"configured": bool(GROQ_API_KEY)},
             "DATABASE_URL": {"configured": bool(DATABASE_URL), "connected": bool(db_pool)},
+            "GMAIL_AUTOMATION": {
+                "configured": gmail_api_status["configured"],
+                "partial": bool(gmail_api_status["missing"]) and bool(GMAIL_CLIENT_ID or GMAIL_CLIENT_SECRET or GMAIL_REFRESH_TOKEN),
+                "missing": gmail_api_status["missing"],
+                "user": gmail_api_status["user"],
+            },
             "EMAIL_DELIVERY": {
                 "configured": gmail_ready,
                 "partial": bool(gmail_sender_ready or gmail_password_ready) and not gmail_ready,
@@ -1420,6 +1816,7 @@ async def get_settings_status():
             "delivery_configured": gmail_ready,
             "missing": gmail_missing,
         },
+        "gmail_automation": gmail_api_status,
     }
 
 
@@ -1607,6 +2004,7 @@ async def startup():
     tool_registry.register(SecurityScannerTool())
     tool_registry.register(CodeFormatterTool())
     tool_registry.register(EmailNotificationTool())
+    tool_registry.register(GmailAutomationTool())
     tool_registry.register(SSHTool())
 
     logger.info(f"✓ {len(AGENT_REGISTRY)} agents registered")
