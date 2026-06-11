@@ -136,6 +136,18 @@ async def send_gmail(to_email: str, subject: str, body: str, attachment_name: st
         return "[Gmail not configured — set GMAIL_SENDER and GMAIL_APP_PASSWORD]"
     if not to_email:
         return "[No recipient email — set NOTIFICATION_EMAIL in Settings]"
+    if not attachment_data and not attachment_name and gmail_automation_status().get("configured"):
+        api_result = await run_gmail_automation({
+            "action": "send",
+            "to": to_email,
+            "subject": subject,
+            "body": body,
+            "confirm": True,
+        })
+        if api_result.get("ok"):
+            logger.info(f"✉ Email sent via Gmail API to {to_email}: {subject}")
+            return f"Email sent to {to_email} via Gmail API"
+        logger.warning(f"Gmail API send failed, falling back to SMTP: {api_result.get('error')}")
     try:
         msg = MIMEMultipart()
         msg["Subject"] = subject
