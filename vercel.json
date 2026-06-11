@@ -5,6 +5,7 @@
   "rewrites": [
     { "source": "/chat", "destination": "http://172.105.41.151:8090/chat" },
     { "source": "/agents", "destination": "http://172.105.41.151:8090/agents" },
+    { "source": "/organization", "destination": "http://172.105.41.151:8090/organization" },
     { "source": "/tasks", "destination": "http://172.105.41.151:8090/tasks" },
     { "source": "/projects", "destination": "http://172.105.41.151:8090/projects" },
     { "source": "/logs", "destination": "http://172.105.41.151:8090/logs" },

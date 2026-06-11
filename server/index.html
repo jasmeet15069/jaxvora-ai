@@ -48,7 +48,15 @@ button { cursor: pointer; font-family: var(--sans); }
 input, textarea { font-family: var(--sans); }
 
 /* ── Layout ── */
-#app { display: flex; height: 100vh; }
+#app { display: flex; height: 100vh; position: relative; }
+#sidebar-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(2px);
+  z-index: 850;
+}
 
 /* ── Sidebar ── */
 #sidebar {
@@ -59,6 +67,7 @@ input, textarea { font-family: var(--sans); }
   flex-direction: column;
   flex-shrink: 0;
   backdrop-filter: blur(20px);
+  transition: width 0.2s ease, transform 0.2s ease;
 }
 .logo {
   padding: 20px 16px 16px;
@@ -133,7 +142,24 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 }
 #topbar h1 { font-size: 16px; font-weight: 600; }
 #topbar .meta { font-size: 12px; color: var(--text2); font-family: var(--mono); }
+.topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .topbar-right { display: flex; gap: 8px; align-items: center; }
+.sidebar-toggle {
+  width: 38px; height: 38px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--glass);
+  color: var(--text);
+  flex-shrink: 0;
+}
+.sidebar-toggle-lines { display: flex; flex-direction: column; gap: 4px; }
+.sidebar-toggle-lines span {
+  width: 16px; height: 2px;
+  background: currentColor;
+  border-radius: 2px;
+  display: block;
+}
 .pill {
   padding: 4px 10px; border-radius: 20px;
   font-size: 11px; font-weight: 500; font-family: var(--mono);
@@ -388,10 +414,86 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
   background: rgba(108,99,255,0.15); color: var(--violet2);
   margin-right: 4px; margin-bottom: 4px;
 }
+
+.org-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.org-card {
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.18);
+  border-radius: 10px;
+  padding: 14px;
+}
+.org-card-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.org-title { font-size: 13px; font-weight: 700; }
+.org-lead { font-size: 10px; color: var(--teal); font-family: var(--mono); }
+.org-agents { display: flex; flex-wrap: wrap; gap: 6px; }
+.org-agent-pill {
+  border: 1px solid rgba(108,99,255,0.22);
+  background: rgba(108,99,255,0.08);
+  color: var(--text2);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 10px;
+  font-family: var(--mono);
+}
+.agent-collab { font-size: 10px; color: var(--teal); font-family: var(--mono); margin-top: 6px; }
+
+@media (min-width: 901px) {
+  body.sidebar-collapsed #sidebar { width: 72px; }
+  body.sidebar-collapsed .logo-text,
+  body.sidebar-collapsed .logo-sub,
+  body.sidebar-collapsed .nav-section,
+  body.sidebar-collapsed .nav-item:not(.active) span:not(.icon),
+  body.sidebar-collapsed .nav-item.active span:not(.icon),
+  body.sidebar-collapsed .sidebar-footer { display: none; }
+  body.sidebar-collapsed .logo { padding: 16px 12px; }
+  body.sidebar-collapsed .logo-mark { justify-content: center; }
+  body.sidebar-collapsed nav { padding: 12px 8px; }
+  body.sidebar-collapsed .nav-item { justify-content: center; padding: 10px 8px; gap: 0; font-size: 0; }
+  body.sidebar-collapsed .nav-item .icon { width: auto; font-size: 15px; }
+  body.sidebar-collapsed .nav-badge { display: none; }
+}
+
+@media (max-width: 900px) {
+  html { font-size: 13px; }
+  body { height: 100dvh; }
+  #app { height: 100dvh; width: 100vw; overflow: hidden; }
+  #sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(84vw, 320px);
+    transform: translateX(-105%);
+    z-index: 900;
+    box-shadow: 18px 0 40px rgba(0,0,0,0.35);
+  }
+  body.sidebar-open #sidebar { transform: translateX(0); }
+  body.sidebar-open #sidebar-backdrop { display: block; }
+  #main { min-width: 0; width: 100%; }
+  #topbar { padding: 12px 14px; gap: 10px; }
+  #topbar h1 { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #topbar .meta { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 48vw; }
+  .topbar-left { flex: 1; min-width: 0; }
+  .topbar-right { gap: 6px; flex-shrink: 0; }
+  .topbar-right .pill { padding: 4px 8px; font-size: 10px; }
+  #content { padding: 14px; overflow-x: hidden; }
+  .section-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .grid-2, .grid-3, .grid-4, .task-columns { grid-template-columns: 1fr; gap: 12px; }
+  .agent-grid, .org-grid { grid-template-columns: 1fr; }
+  .card { padding: 16px; border-radius: 10px; }
+  .stat-value { font-size: 24px; }
+  #chat-messages { height: min(52dvh, 460px); min-height: 300px; padding: 12px; }
+  .msg { max-width: 100%; }
+  .chat-input-row { flex-wrap: wrap; }
+  .chat-input-row input { min-width: 0; flex: 1 1 calc(100% - 58px); }
+  .chat-input-row .btn-primary { flex: 1 0 100%; }
+  .setting-row { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .modal { width: calc(100vw - 28px); max-width: calc(100vw - 28px); padding: 18px; }
+  #log-container { height: 55dvh; }
+}
 </style>
 </head>
 <body>
 <div id="app">
+<div id="sidebar-backdrop" onclick="setSidebarOpen(false)"></div>
 
 <!-- ── Sidebar ── -->
 <aside id="sidebar">
@@ -428,9 +530,14 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 <!-- ── Main ── -->
 <div id="main">
   <div id="topbar">
-    <div>
-      <h1 id="page-title">Dashboard</h1>
-      <div class="meta" id="page-meta">Autonomous multi-agent platform</div>
+    <div class="topbar-left">
+      <button id="sidebar-toggle" class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar" aria-expanded="true">
+        <span class="sidebar-toggle-lines"><span></span><span></span><span></span></span>
+      </button>
+      <div style="min-width:0">
+        <h1 id="page-title">Dashboard</h1>
+        <div class="meta" id="page-meta">Autonomous multi-agent platform</div>
+      </div>
     </div>
     <div class="topbar-right">
       <div class="pill green" id="active-agents-pill">0 active</div>
@@ -562,6 +669,14 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
           <div class="section-sub">Live status of all 22 specialist agents</div>
         </div>
         <button class="btn btn-teal btn-sm" onclick="loadAgents()">↻ Refresh</button>
+      </div>
+      <div class="card mb-16">
+        <div class="card-header">
+          <div class="card-title">Company Organization</div>
+          <div class="key-status ok" id="org-mode-label">Parallel company mode</div>
+        </div>
+        <div id="org-summary" style="font-size:11px;color:var(--text2);font-family:var(--mono);margin-bottom:12px">Loading organization graph...</div>
+        <div class="org-grid" id="org-grid"></div>
       </div>
       <div class="agent-grid" id="agent-grid"></div>
     </div>
@@ -802,13 +917,34 @@ function updateDashboardRings() {
 const sections = {
   dashboard: { title: 'Dashboard', meta: 'Real-time platform health', load: loadDashboard },
   chat: { title: 'Chat', meta: 'Chief Orchestrator — Llama 3.3 70B', load: null },
-  agents: { title: 'Agent Monitor', meta: '22 specialist agents', load: loadAgents },
+  agents: { title: 'Agent Monitor', meta: 'Company graph + 22 specialist agents', load: loadAgentSection },
   tasks: { title: 'Task Queue', meta: 'Live task management', load: loadTasks },
   logs: { title: 'Live Logs', meta: 'Real-time log stream', load: null },
   approval: { title: 'Decision Log', meta: 'AI-powered auto-decisions', load: loadApprovals },
   analytics: { title: 'Analytics', meta: 'Productivity metrics', load: loadAnalytics },
   settings: { title: 'Settings', meta: 'API keys and tools', load: loadSettings },
 };
+
+function isMobileLayout() {
+  return window.matchMedia('(max-width: 900px)').matches;
+}
+
+function setSidebarOpen(open) {
+  document.body.classList.toggle('sidebar-open', Boolean(open));
+  const toggle = document.getElementById('sidebar-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', String(Boolean(open)));
+}
+
+function toggleSidebar() {
+  if (isMobileLayout()) {
+    setSidebarOpen(!document.body.classList.contains('sidebar-open'));
+  } else {
+    document.body.classList.toggle('sidebar-collapsed');
+    const expanded = !document.body.classList.contains('sidebar-collapsed');
+    const toggle = document.getElementById('sidebar-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(expanded));
+  }
+}
 
 document.querySelectorAll('.nav-item').forEach(el => {
   el.addEventListener('click', () => {
@@ -820,7 +956,12 @@ document.querySelectorAll('.nav-item').forEach(el => {
     document.getElementById('page-title').textContent = sections[sec].title;
     document.getElementById('page-meta').textContent = sections[sec].meta;
     if (sections[sec].load) sections[sec].load();
+    if (isMobileLayout()) setSidebarOpen(false);
   });
+});
+
+window.addEventListener('resize', () => {
+  if (!isMobileLayout()) setSidebarOpen(false);
 });
 
 // ── WebSockets ─────────────────────────────────────────────────────────────
@@ -834,7 +975,9 @@ function connectChatWs() {
   chatWs.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.type === 'thinking') appendMsg('bot thinking', d.message);
-    else if (d.type === 'agent_start') appendMsg('bot', `⚡ Running ${d.agent}...`);
+    else if (d.type === 'company_start') appendMsg('bot thinking', `Company mode: ${d.agents.length} agents working in parallel...`);
+    else if (d.type === 'agent_start') appendMsg('bot', `Running ${d.agent}...`);
+    else if (d.type === 'agent_done') appendMsg('bot', `${d.success ? 'Done' : 'Failed'}: ${d.agent}`);
     else if (d.type === 'response') {
       removeThinking();
       appendMsg('bot', d.message, d.agents);
@@ -979,10 +1122,47 @@ function renderAgents(agents) {
         <div class="status-indicator ${a.status}"></div>
       </div>
       <div class="agent-model">${modelLabel(a.model)}</div>
-      <div class="agent-task">${a.current_task || 'Waiting for task...'}</div>`;
+      <div class="agent-task">${a.current_task || 'Waiting for task...'}</div>
+      <div class="agent-collab">${a.division_lead ? 'Division lead' : 'Collaborates'} with ${(a.collaborators || []).length} agents</div>`;
     grid.appendChild(card);
   });
   updateDashboardRings();
+}
+
+async function loadOrganization() {
+  const summary = document.getElementById('org-summary');
+  const grid = document.getElementById('org-grid');
+  if (!summary || !grid) return;
+  try {
+    const org = await fetch('/organization').then(r => {
+      if (!r.ok) throw new Error('organization request failed: ' + r.status);
+      return r.json();
+    });
+    summary.textContent = `${org.divisions.length} divisions, ${org.links.length} collaboration links, up to ${org.max_parallel_agents} agents run in parallel per task.`;
+    document.getElementById('org-mode-label').textContent = org.mode.replace('_', ' ');
+    grid.innerHTML = org.divisions.map(d => `
+      <div class="org-card">
+        <div class="org-card-top">
+          <div>
+            <div class="org-title">${escHtml(d.name)}</div>
+            <div class="org-lead">Lead: ${escHtml(d.lead || 'Rotating')}</div>
+          </div>
+          <div class="pill violet">${d.agents.length}</div>
+        </div>
+        <div class="org-agents">
+          ${d.agents.map(a => `<span class="org-agent-pill">${escHtml(a.name)}</span>`).join('')}
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    summary.textContent = 'Organization graph unavailable: ' + e.message;
+    grid.innerHTML = '';
+  }
+}
+
+function loadAgentSection() {
+  loadOrganization();
+  return loadAgents();
 }
 
 function updateAgentCard(d) {

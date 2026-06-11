@@ -571,7 +571,9 @@ class BaseAgent:
         return {
             "name": self.name, "model": self.model,
             "division": self.division, "description": self.description,
-            "status": self._status, "current_task": self._current_task
+            "status": self._status, "current_task": self._current_task,
+            "division_lead": DIVISION_LEADS.get(self.division) == self.name,
+            "collaborators": AGENT_NETWORK.get(self.name, []),
         }
 
 
@@ -839,8 +841,19 @@ or {"decision": "REJECT", "reason": "one-sentence explanation"}"""
 
 
 AGENT_REGISTRY: Dict[str, BaseAgent] = {}
+AGENT_NETWORK: Dict[str, List[str]] = {}
+MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "6"))
+DIVISION_LEADS = {
+    "Engineering": "Architecture",
+    "Security": "Cybersecurity",
+    "Data": "Data Engineer",
+    "Career": "Career Coach",
+    "Product": "Product Manager",
+    "Executive": "Project Intelligence",
+}
 
 def build_registry():
+    global AGENT_NETWORK
     agents = [
         AIEngineerAgent(), SoftwareEngineerAgent(), DebugAgent(), QATestAgent(),
         CodeReviewAgent(), ArchitectureAgent(), DatabaseAgent(), DevOpsAgent(),
@@ -852,6 +865,47 @@ def build_registry():
     ]
     for a in agents:
         AGENT_REGISTRY[a.name] = a
+    by_division: Dict[str, List[str]] = {}
+    for a in agents:
+        by_division.setdefault(a.division, []).append(a.name)
+    network: Dict[str, List[str]] = {}
+    for a in agents:
+        division_peers = [name for name in by_division.get(a.division, []) if name != a.name]
+        cross_functional = [
+            lead for division, lead in DIVISION_LEADS.items()
+            if lead != a.name and lead in AGENT_REGISTRY and division != a.division
+        ]
+        network[a.name] = (division_peers[:3] + cross_functional[:3])[:6]
+    AGENT_NETWORK = network
+
+
+def organization_snapshot() -> Dict[str, Any]:
+    divisions: Dict[str, Dict[str, Any]] = {}
+    for agent in AGENT_REGISTRY.values():
+        division = divisions.setdefault(agent.division, {
+            "name": agent.division,
+            "lead": DIVISION_LEADS.get(agent.division, ""),
+            "agents": [],
+        })
+        division["agents"].append({
+            "name": agent.name,
+            "model": agent.model,
+            "status": agent._status,
+            "description": agent.description,
+            "collaborators": AGENT_NETWORK.get(agent.name, []),
+        })
+    links = [
+        {"from": name, "to": peer}
+        for name, peers in AGENT_NETWORK.items()
+        for peer in peers
+    ]
+    return {
+        "mode": "parallel_company",
+        "max_parallel_agents": MAX_PARALLEL_AGENTS,
+        "division_leads": DIVISION_LEADS,
+        "divisions": list(divisions.values()),
+        "links": links,
+    }
 
 
 # === SECTION 7: Chief Orchestrator ============================================
@@ -878,6 +932,137 @@ Always respond in this JSON format:
   "response": "Your synthesised response to the user"
 }"""
 
+    KEYWORD_ROUTES = [
+        (("bug", "debug", "fix", "error", "crash", "issue"), ["Debug Agent", "Software Engineer", "QA/Test Agent", "Code Review"]),
+        (("mobile", "ui", "frontend", "responsive", "css", "design"), ["Software Engineer", "Product Manager", "QA/Test Agent", "Code Review"]),
+        (("security", "vulnerability", "audit", "secret", "attack"), ["Cybersecurity", "Red Team", "Compliance", "Code Review"]),
+        (("database", "postgres", "sql", "schema", "query", "neon"), ["Database", "Data Engineer", "Software Engineer"]),
+        (("deploy", "server", "docker", "ci", "cd", "vercel", "vm", "ssh"), ["DevOps", "Architecture", "QA/Test Agent"]),
+        (("data", "etl", "analytics", "dashboard", "power bi", "kpi"), ["Data Analyst", "Data Engineer", "BI Agent", "ML Engineer"]),
+        (("resume", "interview", "career", "job"), ["Resume Agent", "Interview Coach", "Career Coach"]),
+        (("prd", "document", "docs", "roadmap", "feature", "product"), ["Product Manager", "Documentation", "Research"]),
+        (("architecture", "system", "scale", "performance"), ["Architecture", "Project Intelligence", "DevOps", "Database"]),
+    ]
+
+    def _normalise_agents(self, names: List[str]) -> List[str]:
+        selected = []
+        for name in names or []:
+            if not isinstance(name, str):
+                continue
+            exact = name.strip()
+            if exact in AGENT_REGISTRY and exact not in selected:
+                selected.append(exact)
+                continue
+            lowered = exact.lower()
+            for registered in AGENT_REGISTRY:
+                if registered.lower() == lowered and registered not in selected:
+                    selected.append(registered)
+                    break
+        return selected
+
+    def _keyword_agents(self, user_input: str) -> List[str]:
+        text = user_input.lower()
+        selected: List[str] = []
+        for keywords, agents in self.KEYWORD_ROUTES:
+            if any(keyword in text for keyword in keywords):
+                selected.extend(agents)
+        if not selected:
+            selected = ["Project Intelligence", "Product Manager", "Research"]
+        return self._normalise_agents(selected)
+
+    def _build_company_squad(self, user_input: str, planned_agents: List[str]) -> List[str]:
+        selected = self._normalise_agents(planned_agents)
+        for agent in self._keyword_agents(user_input):
+            if agent not in selected:
+                selected.append(agent)
+        if "Project Intelligence" not in selected:
+            selected.insert(0, "Project Intelligence")
+
+        expanded = list(selected)
+        for agent in selected:
+            for peer in AGENT_NETWORK.get(agent, [])[:2]:
+                if peer not in expanded:
+                    expanded.append(peer)
+
+        priority = ["Project Intelligence", "Architecture", "Product Manager", "Software Engineer", "Debug Agent", "QA/Test Agent", "Code Review"]
+        ordered = sorted(expanded, key=lambda name: priority.index(name) if name in priority else len(priority))
+        return ordered[:max(1, MAX_PARALLEL_AGENTS)]
+
+    async def _run_parallel_squad(self, user_input: str, plan: Dict[str, Any], squad: List[str], stream_fn=None) -> List[Dict[str, Any]]:
+        if not squad:
+            return []
+
+        if stream_fn:
+            await stream_fn({
+                "type": "company_start",
+                "agents": squad,
+                "message": f"Launching {len(squad)} agents in parallel company mode.",
+            })
+
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_AGENTS)
+        plan_text = plan.get("plan", "Collaborate and return a concise specialist brief.")
+
+        async def run_one(agent_name: str) -> Dict[str, Any]:
+            agent = AGENT_REGISTRY.get(agent_name)
+            if not agent:
+                return {"agent": agent_name, "success": False, "output": "Agent not registered.", "task_id": ""}
+            collaborator_text = ", ".join(AGENT_NETWORK.get(agent_name, [])[:4]) or "Chief Orchestrator"
+            task = (
+                f"Company request:\n{user_input}\n\n"
+                f"Chief plan:\n{plan_text}\n\n"
+                f"You are {agent_name} in the {agent.division} division. "
+                f"Your collaborators are: {collaborator_text}. "
+                "Work in parallel, focus on your specialty, and return a concise executive-ready brief with concrete next actions."
+            )
+            async with semaphore:
+                if stream_fn:
+                    await stream_fn({"type": "agent_start", "agent": agent_name, "division": agent.division})
+                result = await agent.run(task)
+                result_dict = result.to_dict()
+                if stream_fn:
+                    await stream_fn({
+                        "type": "agent_done",
+                        "agent": agent_name,
+                        "division": agent.division,
+                        "success": result.success,
+                        "output": result.output[:240],
+                    })
+                return result_dict
+
+        tasks = [asyncio.create_task(run_one(agent_name)) for agent_name in squad]
+        results: List[Dict[str, Any]] = []
+        for task in asyncio.as_completed(tasks):
+            try:
+                results.append(await task)
+            except Exception as e:
+                results.append({"agent": "Unknown", "success": False, "output": f"Agent execution error: {e}", "task_id": ""})
+        return results
+
+    async def _synthesise_company_response(self, user_input: str, plan: Dict[str, Any], results: List[Dict[str, Any]]) -> str:
+        if not results:
+            return plan.get("response", "Task completed.")
+        briefs = "\n\n".join(
+            f"{idx + 1}. {r['agent']} ({'success' if r.get('success') else 'failed'}): {str(r.get('output', ''))[:900]}"
+            for idx, r in enumerate(results)
+        )
+        synthesis_prompt = f"""User request:
+{user_input}
+
+Chief plan:
+{plan.get('plan', '')}
+
+Parallel agent briefs:
+{briefs}
+
+Write one polished final answer. Do not dump raw traces. Mention the agents that contributed only when useful."""
+        response = await call_groq(
+            "You are Jaxvora's Chief Orchestrator. Synthesize parallel department work into a concise, decisive company response.",
+            synthesis_prompt,
+        )
+        if response.startswith("["):
+            return plan.get("response", "Task completed.") + "\n\n" + response
+        return response
+
     async def process(self, user_input: str, stream_fn=None) -> Dict:
         try:
             raw = await call_groq(self.SYSTEM, user_input)
@@ -894,17 +1079,8 @@ Always respond in this JSON format:
                 "response": f"I'll help you with that. {user_input[:100]}... (Orchestrator note: {e})"
             }
 
-        # Run assigned agents
-        results = []
-        for agent_name in plan.get("agents", [])[:3]:
-            agent = AGENT_REGISTRY.get(agent_name)
-            if agent:
-                if stream_fn:
-                    await stream_fn({"type": "agent_start", "agent": agent_name})
-                result = await agent.run(user_input)
-                results.append(result.to_dict())
-                if stream_fn:
-                    await stream_fn({"type": "agent_done", "agent": agent_name, "output": result.output[:200]})
+        squad = self._build_company_squad(user_input, plan.get("agents", []))
+        results = await self._run_parallel_squad(user_input, plan, squad, stream_fn=stream_fn)
 
         # Log to audit and auto-decide
         try:
@@ -917,13 +1093,17 @@ Always respond in this JSON format:
         except Exception:
             pass
 
-        final = plan.get("response", "Task completed.")
-        if results:
-            final += "\n\n---\n**Agent Results:**\n"
-            for r in results:
-                final += f"\n**{r['agent']}**: {r['output'][:300]}...\n"
-
-        return {"plan": plan.get("plan", ""), "agents": plan.get("agents", []), "response": final, "results": results}
+        final = await self._synthesise_company_response(user_input, plan, results)
+        return {
+            "plan": plan.get("plan", ""),
+            "agents": squad,
+            "response": final,
+            "results": results,
+            "organization": {
+                "mode": "parallel_company",
+                "max_parallel_agents": MAX_PARALLEL_AGENTS,
+            },
+        }
 
 
 orchestrator = ChiefOrchestrator()
@@ -1038,6 +1218,11 @@ async def chat(req: ChatRequest):
 @app.get("/agents")
 async def list_agents():
     return [a.status_dict() for a in AGENT_REGISTRY.values()]
+
+
+@app.get("/organization")
+async def get_organization():
+    return organization_snapshot()
 
 
 @app.get("/tasks")
