@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import hmac
 import html
+import sys
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Set
 from contextlib import asynccontextmanager
@@ -1003,6 +1004,146 @@ class MCPToolRegistry:
 tool_registry = MCPToolRegistry()
 
 
+def _doctor_check(name: str, ok: bool, detail: str, output: str = "") -> Dict[str, Any]:
+    return {
+        "name": name,
+        "ok": bool(ok),
+        "detail": detail,
+        "output": str(output or "")[:2000],
+    }
+
+
+async def _doctor_subprocess_check(name: str, command: List[str], timeout_seconds: int = 25) -> Dict[str, Any]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+        output = (stdout or b"").decode("utf-8", errors="ignore")
+        err = (stderr or b"").decode("utf-8", errors="ignore")
+        combined = (output + ("\n" + err if err else "")).strip()
+        return _doctor_check(name, proc.returncode == 0, f"exit={proc.returncode}", combined)
+    except asyncio.TimeoutError:
+        return _doctor_check(name, False, f"Timed out after {timeout_seconds}s")
+    except Exception as exc:
+        return _doctor_check(name, False, f"{type(exc).__name__}: {exc}")
+
+
+async def _doctor_http_check(name: str, path: str, method: str = "GET", expected_status: int = 200) -> Dict[str, Any]:
+    url = f"http://127.0.0.1:{PORT}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.request(method, url)
+        ok = response.status_code == expected_status
+        return _doctor_check(name, ok, f"{method} {path} -> {response.status_code}", response.text[:1200])
+    except Exception as exc:
+        return _doctor_check(name, False, f"{method} {path} failed: {type(exc).__name__}: {exc}")
+
+
+async def _run_jaxvora_doctor_iteration(iteration: int) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    app_dir = Path(__file__).resolve().parent
+
+    py_targets = [str(app_dir / "main.py")]
+    server_main = app_dir / "server" / "main.py"
+    if server_main.exists():
+        py_targets.append(str(server_main))
+    checks.append(await _doctor_subprocess_check("Python compile", [sys.executable, "-m", "py_compile", *py_targets]))
+
+    checks.append(_doctor_check("Database pool", db_pool is not None, "PostgreSQL pool is available" if db_pool else "PostgreSQL pool is not available"))
+    checks.append(_doctor_check("Agent registry", len(AGENT_REGISTRY) >= 20, f"{len(AGENT_REGISTRY)} agents registered"))
+    checks.append(_doctor_check("Tool registry", len(tool_registry.list_tools()) >= 8, f"{len(tool_registry.list_tools())} MCP tools registered"))
+
+    checks.append(await _doctor_http_check("Settings API", "/settings/status"))
+    checks.append(await _doctor_http_check("Agents API", "/agents"))
+    checks.append(await _doctor_http_check("Analytics API", "/analytics"))
+    checks.append(await _doctor_http_check("Gmail status API", "/gmail/status"))
+    checks.append(await _doctor_http_check("Favicon asset", "/favicon.png"))
+
+    gmail_status = gmail_automation_status()
+    checks.append(_doctor_check(
+        "Gmail automation",
+        gmail_status.get("configured") and gmail_status.get("action_api_ready"),
+        f"user={gmail_status.get('user')} missing={','.join(gmail_status.get('missing') or []) or 'none'}",
+    ))
+
+    index_path = app_dir / "index.html"
+    if not index_path.exists():
+        index_path = app_dir / "server" / "index.html"
+    index_text = index_path.read_text(encoding="utf-8", errors="ignore") if index_path.exists() else ""
+    checks.append(_doctor_check(
+        "Chat renderer",
+        "renderRichText" in index_text and "md-content" in index_text,
+        "Structured chat renderer is installed" if "renderRichText" in index_text else "Structured chat renderer is missing",
+    ))
+
+    if SSH_HOST and SSH_USER:
+        ssh_output = await SSHTool().run({"command": "printf 'SSH_OK\\n'; hostname; pwd; uptime"})
+        checks.append(_doctor_check("SSH tool", "SSH_OK" in ssh_output, f"{SSH_USER}@{SSH_HOST}:{SSH_PORT}", ssh_output))
+    else:
+        checks.append(_doctor_check("SSH tool", False, "SSH_HOST or SSH_USER is missing"))
+
+    failed = [check for check in checks if not check["ok"]]
+    return {"iteration": iteration, "ok": not failed, "failed": failed, "checks": checks}
+
+
+def _format_doctor_report(iterations: List[Dict[str, Any]]) -> str:
+    final = iterations[-1] if iterations else {"ok": False, "checks": [], "failed": []}
+    status = "stable" if final.get("ok") else "issues found"
+    lines = [
+        f"## Jaxvora Doctor: {status}",
+        "",
+        f"**Iterations:** {len(iterations)}",
+        f"**Final result:** {'All checks passed' if final.get('ok') else str(len(final.get('failed') or [])) + ' check(s) failed'}",
+        "",
+        "### Checks",
+    ]
+    for check in final.get("checks", []):
+        marker = "PASS" if check.get("ok") else "FAIL"
+        lines.append(f"- **{marker}** `{check.get('name')}` - {check.get('detail')}")
+
+    if final.get("failed"):
+        lines.extend(["", "### Required fixes"])
+        for check in final["failed"]:
+            lines.append(f"- `{check['name']}`: {check['detail']}")
+    else:
+        lines.extend([
+            "",
+            "### Result",
+            "- Runtime APIs are responding.",
+            "- Gmail automation is connected.",
+            "- SSH tool is connected and executing safe diagnostics.",
+            "- Chat markdown renderer is installed.",
+        ])
+
+    ssh_check = next((check for check in final.get("checks", []) if check.get("name") == "SSH tool"), None)
+    if ssh_check and ssh_check.get("output"):
+        lines.extend(["", "### SSH diagnostic output", "```text", ssh_check["output"].strip(), "```"])
+    return "\n".join(lines)
+
+
+async def run_jaxvora_doctor(max_iterations: int = 2) -> Dict[str, Any]:
+    iterations: List[Dict[str, Any]] = []
+    max_iterations = max(1, min(int(max_iterations or 1), 3))
+    for iteration in range(1, max_iterations + 1):
+        result = await _run_jaxvora_doctor_iteration(iteration)
+        iterations.append(result)
+        if result["ok"]:
+            break
+        await asyncio.sleep(0.6)
+
+    final = iterations[-1]
+    report = _format_doctor_report(iterations)
+    try:
+        await log_to_db("INFO" if final["ok"] else "WARN", f"Jaxvora Doctor run: {'stable' if final['ok'] else 'issues found'}")
+    except Exception:
+        pass
+    return {"ok": final["ok"], "iterations": iterations, "report": report, "failed": final.get("failed", [])}
+
+
 # === SECTION 4: Memory Manager ================================================
 
 class MemoryManager:
@@ -1506,6 +1647,7 @@ Always respond in this JSON format:
     GMAIL_READ_WORDS = ("read", "show", "list", "check", "search", "latest", "recent", "unread", "open")
     SSH_INTENT_WORDS = ("ssh", "server", "vm", "remote")
     SSH_COMMAND_WORDS = ("run", "execute", "exec", "command", "cmd", "shell", "terminal")
+    DOCTOR_INTENT_WORDS = ("doctor", "debug", "bug", "bugs", "fix all", "monitor jaxvora", "until fixed", "diagnose", "stability", "regression")
 
     def _is_gmail_chat_intent(self, user_input: str) -> bool:
         text = user_input.lower()
@@ -1516,6 +1658,32 @@ Always respond in this JSON format:
         if "ssh" in text:
             return True
         return ("server" in text or "vm" in text or "remote" in text) and any(word in text for word in ("access", "connect", "status", "uptime", "shell"))
+
+    def _is_doctor_chat_intent(self, user_input: str) -> bool:
+        text = user_input.lower()
+        if "jaxvora" in text and any(word in text for word in ("monitor", "diagnose", "debug", "stability", "health")):
+            return True
+        return any(word in text for word in self.DOCTOR_INTENT_WORDS) and any(word in text for word in ("jaxvora", "app", "system", "all", "bug", "bugs", "test", "tests"))
+
+    async def _handle_doctor_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
+        if not self._is_doctor_chat_intent(user_input):
+            return None
+        iterations = 3 if any(word in user_input.lower() for word in ("until fixed", "loop", "continuously", "monitor")) else 2
+        result = await run_jaxvora_doctor(max_iterations=iterations)
+        agents = ["Chief Orchestrator", "Debug Agent", "QA/Test Agent", "DevOps", "Cybersecurity"]
+        return {
+            "plan": "Run the concrete Jaxvora Doctor diagnostics loop and report real pass/fail results.",
+            "agents": agents,
+            "response": result["report"],
+            "results": [
+                {
+                    "agent": "Debug Agent",
+                    "success": result["ok"],
+                    "output": f"{len(result.get('failed') or [])} failed check(s); {len((result.get('iterations') or [{}])[-1].get('checks', []))} checks executed.",
+                }
+            ],
+            "organization": {"mode": "jaxvora_doctor"},
+        }
 
     def _ssh_command_from_chat(self, user_input: str) -> str:
         fenced = re.search(r"```(?:bash|sh|shell)?\s*([\s\S]*?)```", user_input, re.IGNORECASE)
@@ -1795,6 +1963,9 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         ssh_result = await self._handle_ssh_chat(user_input)
         if ssh_result:
             return ssh_result
+        doctor_result = await self._handle_doctor_chat(user_input)
+        if doctor_result:
+            return doctor_result
 
         try:
             raw = await call_groq(self.SYSTEM, user_input)
@@ -2123,6 +2294,11 @@ async def get_analytics():
         "error_agents": error_agents,
         "db_available": db_available,
     }
+
+
+@app.post("/doctor/run")
+async def doctor_run(max_iterations: int = 2):
+    return await run_jaxvora_doctor(max_iterations=max_iterations)
 
 
 @app.get("/memory/search")

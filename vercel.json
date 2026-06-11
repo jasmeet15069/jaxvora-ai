@@ -10,6 +10,7 @@
     { "source": "/projects", "destination": "http://172.105.41.151:8090/projects" },
     { "source": "/logs", "destination": "http://172.105.41.151:8090/logs" },
     { "source": "/analytics", "destination": "http://172.105.41.151:8090/analytics" },
+    { "source": "/doctor/:path*", "destination": "http://172.105.41.151:8090/doctor/:path*" },
     { "source": "/memory/search", "destination": "http://172.105.41.151:8090/memory/search" },
     { "source": "/security/scan", "destination": "http://172.105.41.151:8090/security/scan" },
     { "source": "/audit", "destination": "http://172.105.41.151:8090/audit" },
