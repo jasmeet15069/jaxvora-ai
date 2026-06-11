@@ -169,6 +169,7 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 .pill.green { color: var(--teal); border-color: rgba(0,212,170,0.3); }
 .pill.violet { color: var(--violet2); border-color: rgba(108,99,255,0.3); }
 #content { flex: 1; overflow-y: auto; padding: 24px; }
+body.chat-view #content { overflow: hidden; }
 
 /* ── Section visibility ── */
 .section { display: none; }
@@ -251,8 +252,21 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 }
 
 /* ── Chat ── */
+#section-chat.active {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 12px;
+}
+#section-chat .section-header,
+#section-chat .chat-chips,
+#section-chat #chat-messages {
+  margin-bottom: 0;
+}
 #chat-messages {
-  height: 400px;
+  height: auto;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -261,7 +275,6 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
   background: rgba(0,0,0,0.2);
   border-radius: 10px;
   border: 1px solid var(--border);
-  margin-bottom: 12px;
   font-family: var(--mono);
   font-size: 12px;
 }
@@ -536,7 +549,7 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
   .agent-grid, .org-grid { grid-template-columns: 1fr; }
   .card { padding: 16px; border-radius: 10px; }
   .stat-value { font-size: 24px; }
-  #chat-messages { height: min(52dvh, 460px); min-height: 300px; padding: 12px; }
+  #chat-messages { padding: 12px; }
   .msg { max-width: 100%; }
   .chat-input-row { flex-wrap: wrap; gap: 8px; }
   .chat-input-row input { min-width: 0; flex: 1 1 calc(100% - 64px); }
@@ -1004,6 +1017,10 @@ function toggleSidebar() {
   }
 }
 
+function setActiveChrome(sectionName) {
+  document.body.classList.toggle('chat-view', sectionName === 'chat');
+}
+
 document.querySelectorAll('.nav-item').forEach(el => {
   el.addEventListener('click', () => {
     const sec = el.dataset.section;
@@ -1013,6 +1030,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     document.getElementById('section-' + sec).classList.add('active');
     document.getElementById('page-title').textContent = sections[sec].title;
     document.getElementById('page-meta').textContent = sections[sec].meta;
+    setActiveChrome(sec);
     if (sections[sec].load) sections[sec].load();
     if (isMobileLayout()) setSidebarOpen(false);
   });
