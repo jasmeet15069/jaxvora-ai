@@ -40,7 +40,7 @@ PORT = int(os.environ.get("PORT", 8080))
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL", "")
-GMAIL_AUTOMATION_USER = os.environ.get("GMAIL_AUTOMATION_USER", os.environ.get("GMAIL_USER", "snipymart@gmail.com"))
+GMAIL_AUTOMATION_USER = os.environ.get("GMAIL_AUTOMATION_USER", os.environ.get("GMAIL_USER", "jaxvora@gmail.com"))
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
@@ -152,10 +152,27 @@ async def send_gmail(to_email: str, subject: str, body: str, attachment_name: st
             part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
             msg.attach(part)
         ctx = ssl_lib.create_default_context()
+        smtp_password = GMAIL_APP_PASSWORD.replace(" ", "")
         def _send():
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as srv:
-                srv.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-                srv.sendmail(GMAIL_SENDER, to_email, msg.as_string())
+            errors = []
+            try:
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=8, context=ctx) as srv:
+                    srv.login(GMAIL_SENDER, smtp_password)
+                    srv.sendmail(GMAIL_SENDER, to_email, msg.as_string())
+                    return
+            except Exception as exc:
+                errors.append(f"SMTP SSL 465: {type(exc).__name__}: {exc}")
+            try:
+                with smtplib.SMTP("smtp.gmail.com", 587, timeout=8) as srv:
+                    srv.ehlo()
+                    srv.starttls(context=ctx)
+                    srv.ehlo()
+                    srv.login(GMAIL_SENDER, smtp_password)
+                    srv.sendmail(GMAIL_SENDER, to_email, msg.as_string())
+                    return
+            except Exception as exc:
+                errors.append(f"SMTP STARTTLS 587: {type(exc).__name__}: {exc}")
+            raise RuntimeError("; ".join(errors))
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _send)
         logger.info(f"✉ Email sent to {to_email}: {subject}")
@@ -361,7 +378,7 @@ async def run_gmail_automation(params: Dict[str, Any]) -> Dict[str, Any]:
             "error": "Gmail automation is not configured",
             "missing": status["missing"],
             "user": status["user"],
-            "setup_hint": "Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REFRESH_TOKEN for the snipymart Gmail OAuth client.",
+            "setup_hint": "Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REFRESH_TOKEN for the Jaxvora Gmail OAuth client.",
         }
     if action in GMAIL_GUARDED_ACTIONS and not bool(params.get("confirm")):
         return {
@@ -751,7 +768,7 @@ class GmailAutomationTool(MCPTool):
     def __init__(self):
         super().__init__(
             "gmail_automation",
-            "Governed Gmail API automation for snipymart: search, read, draft, send, archive, delete, labels, and filters",
+            "Governed Gmail API automation for Jaxvora Gmail: search, read, draft, send, archive, delete, labels, and filters",
         )
 
     async def run(self, params: Dict[str, Any]) -> str:

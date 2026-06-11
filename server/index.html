@@ -870,7 +870,7 @@ body.chat-view #content { overflow: hidden; }
           <div class="card-title">Gmail Automation</div>
           <div class="key-status" id="gmail-automation-badge">Checking...</div>
         </div>
-        <div id="gmail-automation-help" style="font-size:11px;color:var(--text2);margin-bottom:12px">Checking snipymart mailbox automation...</div>
+        <div id="gmail-automation-help" style="font-size:11px;color:var(--text2);margin-bottom:12px">Checking Jaxvora mailbox automation...</div>
         <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-bottom:12px">
           <input type="text" id="gmail-query" placeholder="Gmail search query, e.g. newer_than:7d from:customer@example.com" value="newer_than:7d" style="min-width:0;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
           <button class="btn btn-teal btn-sm" onclick="testGmailSearch()">Search Mail</button>
@@ -1491,7 +1491,7 @@ function loadSettings() {
     { key: 'OPENROUTER_API_KEY', label: 'OpenRouter', desc: 'DeepSeek V3, Dolphin, Kimi models' },
     { key: 'GROQ_API_KEY', label: 'Groq', desc: 'Llama 3.3 70B — Chief Orchestrator, Code Review & Architecture' },
     { key: 'DATABASE_URL', label: 'PostgreSQL', desc: 'Neon — tasks, logs, memory, audit' },
-    { key: 'GMAIL_AUTOMATION', label: 'Gmail Automation', desc: 'OAuth Gmail API for the snipymart mailbox agent' },
+    { key: 'GMAIL_AUTOMATION', label: 'Gmail Automation', desc: 'OAuth Gmail API for the Jaxvora mailbox agent' },
     { key: 'EMAIL_DELIVERY', label: 'Gmail SMTP', desc: 'Sender + app password for email notifications' },
   ];
   document.getElementById('api-key-status').innerHTML = keys.map(k => `
@@ -1567,7 +1567,7 @@ function renderGmailAutomation(gmail) {
   if (gmail.configured) {
     badge.className = gmail.api_guard_configured ? 'key-status ok' : 'key-status partial';
     badge.textContent = gmail.api_guard_configured ? 'Connected' : 'API locked';
-    help.innerHTML = 'Gmail API agent is ready for <strong>' + escHtml(gmail.user || 'snipymart@gmail.com') + '</strong>. ' +
+    help.innerHTML = 'Gmail API agent is ready for <strong>' + escHtml(gmail.user || 'jaxvora@gmail.com') + '</strong>. ' +
       (gmail.api_guard_configured ? 'Enter the admin token to run live public UI actions.' : 'Set GMAIL_AUTOMATION_API_TOKEN before allowing public UI actions.') +
       ' Agent mutations require explicit confirmation.';
     if (results && !results.innerHTML) results.textContent = 'Run a safe search to verify live mailbox access.';
@@ -1576,7 +1576,7 @@ function renderGmailAutomation(gmail) {
     badge.className = 'key-status missing';
     badge.textContent = 'OAuth missing';
     help.innerHTML = '<span style="color:var(--yellow)">Gmail automation is not connected yet.</span> Missing server env: <strong>' + escHtml(missing.join(', ')) + '</strong>.';
-    if (results) results.innerHTML = '<span style="color:var(--text3)">Add OAuth credentials for snipymart@gmail.com, then restart the server and test again.</span>';
+    if (results) results.innerHTML = '<span style="color:var(--text3)">Add OAuth credentials for jaxvora@gmail.com, then restart the server and test again.</span>';
   }
 }
 
