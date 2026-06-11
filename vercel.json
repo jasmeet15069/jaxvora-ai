@@ -1,5 +1,22 @@
 {
-  "installCommand": "pnpm install --no-frozen-lockfile",
-  "buildCommand": "pnpm --filter ./frontend build",
-  "outputDirectory": "frontend/dist"
+  "installCommand": "node --version",
+  "buildCommand": "node scripts/build-vercel-frontend.mjs",
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    { "source": "/chat", "destination": "http://172.105.41.151:8090/chat" },
+    { "source": "/agents", "destination": "http://172.105.41.151:8090/agents" },
+    { "source": "/tasks", "destination": "http://172.105.41.151:8090/tasks" },
+    { "source": "/projects", "destination": "http://172.105.41.151:8090/projects" },
+    { "source": "/logs", "destination": "http://172.105.41.151:8090/logs" },
+    { "source": "/analytics", "destination": "http://172.105.41.151:8090/analytics" },
+    { "source": "/memory/search", "destination": "http://172.105.41.151:8090/memory/search" },
+    { "source": "/security/scan", "destination": "http://172.105.41.151:8090/security/scan" },
+    { "source": "/audit", "destination": "http://172.105.41.151:8090/audit" },
+    { "source": "/tools", "destination": "http://172.105.41.151:8090/tools" },
+    { "source": "/upload", "destination": "http://172.105.41.151:8090/upload" },
+    { "source": "/settings/:path*", "destination": "http://172.105.41.151:8090/settings/:path*" },
+    { "source": "/send-email/:path*", "destination": "http://172.105.41.151:8090/send-email/:path*" },
+    { "source": "/ws/:path*", "destination": "http://172.105.41.151:8090/ws/:path*" },
+    { "source": "/:path*", "destination": "/index.html" }
+  ]
 }
