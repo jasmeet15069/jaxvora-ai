@@ -9,6 +9,7 @@ import logging
 import re
 import subprocess
 import tempfile
+import hmac
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Set
 from contextlib import asynccontextmanager
@@ -23,7 +24,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import base64
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Form, Header
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -43,6 +44,7 @@ GMAIL_AUTOMATION_USER = os.environ.get("GMAIL_AUTOMATION_USER", os.environ.get("
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+GMAIL_AUTOMATION_API_TOKEN = os.environ.get("GMAIL_AUTOMATION_API_TOKEN", os.environ.get("JAXVORA_ADMIN_TOKEN", ""))
 GMAIL_SCOPES = os.environ.get(
     "GMAIL_SCOPES",
     "https://www.googleapis.com/auth/gmail.modify "
@@ -204,11 +206,21 @@ def gmail_automation_status() -> Dict[str, Any]:
         "configured": not missing,
         "user": GMAIL_AUTOMATION_USER or "me",
         "missing": missing,
+        "api_guard_configured": bool(GMAIL_AUTOMATION_API_TOKEN),
+        "action_api_ready": not missing and bool(GMAIL_AUTOMATION_API_TOKEN),
         "safe_actions": sorted(GMAIL_SAFE_ACTIONS),
         "guarded_actions": sorted(GMAIL_GUARDED_ACTIONS),
         "required_scopes": GMAIL_SCOPES.split(),
-        "policy": "Safe actions can run directly. Mailbox mutations require confirm=true; permanent delete also requires confirm_text='DELETE FOREVER'.",
+        "policy": "Public Gmail actions require X-Jaxvora-Admin-Token when OAuth is configured. Mailbox mutations also require confirm=true; permanent delete requires confirm_text='DELETE FOREVER'.",
     }
+
+
+def _gmail_action_authorized(provided_token: Optional[str]) -> bool:
+    return bool(
+        GMAIL_AUTOMATION_API_TOKEN
+        and provided_token
+        and hmac.compare_digest(str(provided_token), str(GMAIL_AUTOMATION_API_TOKEN))
+    )
 
 
 def _gmail_decode_b64url(value: str) -> str:
@@ -1754,8 +1766,24 @@ async def gmail_status():
 
 
 @app.post("/gmail/action")
-async def gmail_action(req: GmailActionRequest):
-    return await run_gmail_automation(req.dict())
+async def gmail_action(req: GmailActionRequest, x_jaxvora_admin_token: Optional[str] = Header(None)):
+    payload = req.dict()
+    action = str(payload.get("action", "status")).strip().lower()
+    status = gmail_automation_status()
+    if status["configured"] and action != "status":
+        if not GMAIL_AUTOMATION_API_TOKEN:
+            return {
+                "ok": False,
+                "error": "Gmail automation API is locked because GMAIL_AUTOMATION_API_TOKEN is not configured",
+                "policy": status["policy"],
+            }
+        if not _gmail_action_authorized(x_jaxvora_admin_token):
+            return {
+                "ok": False,
+                "error": "Gmail automation requires X-Jaxvora-Admin-Token",
+                "policy": status["policy"],
+            }
+    return await run_gmail_automation(payload)
 
 
 @app.post("/upload")
@@ -1801,6 +1829,8 @@ async def get_settings_status():
                 "partial": bool(gmail_api_status["missing"]) and bool(GMAIL_CLIENT_ID or GMAIL_CLIENT_SECRET or GMAIL_REFRESH_TOKEN),
                 "missing": gmail_api_status["missing"],
                 "user": gmail_api_status["user"],
+                "api_guard_configured": gmail_api_status["api_guard_configured"],
+                "action_api_ready": gmail_api_status["action_api_ready"],
             },
             "EMAIL_DELIVERY": {
                 "configured": gmail_ready,

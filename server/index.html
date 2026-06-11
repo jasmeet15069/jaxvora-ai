@@ -876,6 +876,10 @@ body.chat-view #content { overflow: hidden; }
           <button class="btn btn-teal btn-sm" onclick="testGmailSearch()">Search Mail</button>
         </div>
         <div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-bottom:10px">Agent mutations require confirm=true: send, archive, trash, labels, filters, and permanent delete.</div>
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-bottom:12px">
+          <input type="password" id="gmail-admin-token" placeholder="Admin token for live Gmail actions (kept in this browser session)" style="min-width:0;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+          <button class="btn btn-sm" onclick="saveGmailAdminToken()">Use Token</button>
+        </div>
         <div id="gmail-results" style="font-size:11px;color:var(--text2);font-family:var(--mono)"></div>
       </div>
 
@@ -1506,7 +1510,8 @@ function loadSettings() {
         return;
       }
       if (k.key === 'GMAIL_AUTOMATION') {
-        if (item.configured) setKeyStatus(k.key, 'ok', 'Connected: ' + (item.user || 'Gmail'));
+        if (item.configured && item.api_guard_configured) setKeyStatus(k.key, 'ok', 'Connected: ' + (item.user || 'Gmail'));
+        else if (item.configured) setKeyStatus(k.key, 'partial', 'OAuth ready, API token missing');
         else if (item.partial) setKeyStatus(k.key, 'partial', 'Partial: missing ' + (item.missing || []).join(', '));
         else setKeyStatus(k.key, 'missing', 'Missing OAuth');
         return;
@@ -1557,10 +1562,14 @@ function renderGmailAutomation(gmail) {
   const help = document.getElementById('gmail-automation-help');
   const results = document.getElementById('gmail-results');
   if (!badge || !help) return;
+  const tokenInput = document.getElementById('gmail-admin-token');
+  if (tokenInput && !tokenInput.value) tokenInput.value = sessionStorage.getItem('jaxvora_gmail_admin_token') || '';
   if (gmail.configured) {
-    badge.className = 'key-status ok';
-    badge.textContent = 'Connected';
-    help.innerHTML = 'Gmail API agent is ready for <strong>' + escHtml(gmail.user || 'snipymart@gmail.com') + '</strong>. Safe actions can search/read/list, and mutations require explicit confirmation.';
+    badge.className = gmail.api_guard_configured ? 'key-status ok' : 'key-status partial';
+    badge.textContent = gmail.api_guard_configured ? 'Connected' : 'API locked';
+    help.innerHTML = 'Gmail API agent is ready for <strong>' + escHtml(gmail.user || 'snipymart@gmail.com') + '</strong>. ' +
+      (gmail.api_guard_configured ? 'Enter the admin token to run live public UI actions.' : 'Set GMAIL_AUTOMATION_API_TOKEN before allowing public UI actions.') +
+      ' Agent mutations require explicit confirmation.';
     if (results && !results.innerHTML) results.textContent = 'Run a safe search to verify live mailbox access.';
   } else {
     const missing = gmail.missing || ['GMAIL_CLIENT_ID', 'GMAIL_CLIENT_SECRET', 'GMAIL_REFRESH_TOKEN'];
@@ -1568,6 +1577,27 @@ function renderGmailAutomation(gmail) {
     badge.textContent = 'OAuth missing';
     help.innerHTML = '<span style="color:var(--yellow)">Gmail automation is not connected yet.</span> Missing server env: <strong>' + escHtml(missing.join(', ')) + '</strong>.';
     if (results) results.innerHTML = '<span style="color:var(--text3)">Add OAuth credentials for snipymart@gmail.com, then restart the server and test again.</span>';
+  }
+}
+
+function gmailActionHeaders() {
+  const tokenInput = document.getElementById('gmail-admin-token');
+  const token = (tokenInput && tokenInput.value.trim()) || sessionStorage.getItem('jaxvora_gmail_admin_token') || '';
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['X-Jaxvora-Admin-Token'] = token;
+  return headers;
+}
+
+function saveGmailAdminToken() {
+  const tokenInput = document.getElementById('gmail-admin-token');
+  const el = document.getElementById('gmail-results');
+  const token = tokenInput ? tokenInput.value.trim() : '';
+  if (token) {
+    sessionStorage.setItem('jaxvora_gmail_admin_token', token);
+    if (el) el.innerHTML = '<span style="color:var(--teal)">Admin token saved for this browser tab.</span>';
+  } else {
+    sessionStorage.removeItem('jaxvora_gmail_admin_token');
+    if (el) el.innerHTML = '<span style="color:var(--text3)">Admin token cleared.</span>';
   }
 }
 
@@ -1579,7 +1609,7 @@ async function testGmailSearch() {
   try {
     const data = await fetch('/gmail/action', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: gmailActionHeaders(),
       body: JSON.stringify({ action: 'search', query: q, max_results: 5 })
     }).then(r => r.json());
     if (!data.ok) {
@@ -1617,7 +1647,7 @@ async function readGmailMessage(messageId) {
   try {
     const data = await fetch('/gmail/action', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: gmailActionHeaders(),
       body: JSON.stringify({ action: 'read', message_id: messageId })
     }).then(r => r.json());
     if (!data.ok) {
