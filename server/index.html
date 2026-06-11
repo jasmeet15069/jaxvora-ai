@@ -523,7 +523,7 @@ body.chat-view #content { overflow: hidden; }
 }
 
 @media (max-width: 900px) {
-  html { font-size: 13px; }
+  html { font-size: 16px; }
   body { height: 100dvh; }
   #app { height: 100dvh; width: 100vw; overflow: hidden; }
   #sidebar {
@@ -537,27 +537,63 @@ body.chat-view #content { overflow: hidden; }
   body.sidebar-open #sidebar { transform: translateX(0); }
   body.sidebar-open #sidebar-backdrop { display: block; }
   #main { min-width: 0; width: 100%; }
-  #topbar { padding: 12px 14px; gap: 10px; }
-  #topbar h1 { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #topbar .meta { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 48vw; }
+  #topbar { padding: 14px 16px; gap: 12px; min-height: 76px; }
+  #topbar h1 { font-size: 20px; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #topbar .meta { font-size: 13px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 48vw; }
   .topbar-left { flex: 1; min-width: 0; }
   .topbar-right { gap: 6px; flex-shrink: 0; }
-  .topbar-right .pill { padding: 4px 8px; font-size: 10px; }
-  #content { padding: 14px; overflow-x: hidden; }
+  .topbar-right .pill { padding: 7px 10px; font-size: 12px; }
+  #content { padding: 16px; overflow-x: hidden; }
+  .sidebar-toggle { width: 48px; height: 48px; border-radius: 14px; }
+  .sidebar-toggle span { width: 22px; height: 3px; }
   .section-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .section-title { font-size: 22px; line-height: 1.18; }
+  .section-sub { font-size: 14px; line-height: 1.45; }
   .grid-2, .grid-3, .grid-4, .task-columns { grid-template-columns: 1fr; gap: 12px; }
   .agent-grid, .org-grid { grid-template-columns: 1fr; }
   .card { padding: 16px; border-radius: 10px; }
   .stat-value { font-size: 24px; }
-  #chat-messages { padding: 12px; }
+  #chat-messages {
+    padding: 14px;
+    font-size: 15px;
+    line-height: 1.6;
+    gap: 14px;
+  }
   .msg { max-width: 100%; }
-  .chat-input-row { flex-wrap: wrap; gap: 8px; }
-  .chat-input-row input { min-width: 0; flex: 1 1 calc(100% - 64px); }
+  .msg-bubble { padding: 12px 14px; font-size: 15px; line-height: 1.65; border-radius: 12px; }
+  .msg-meta { font-size: 12px; }
+  .chat-chips { gap: 8px; margin-bottom: 14px; }
+  .chip { padding: 8px 12px; font-size: 13px; line-height: 1.25; }
+  .chat-input-row { flex-wrap: wrap; gap: 10px; }
+  .chat-input-row input {
+    min-width: 0;
+    flex: 1 1 calc(100% - 66px);
+    height: 56px;
+    padding: 0 16px;
+    font-size: 16px;
+    border-radius: 12px;
+  }
+  .chat-input-row input::placeholder { font-size: 16px; }
+  .chat-attach-btn { width: 56px; height: 56px; flex-basis: 56px; font-size: 20px; border-radius: 12px; }
   .file-preview.open { order: -1; flex: 1 1 100%; max-width: none; }
-  .chat-send-btn { flex: 1 0 100%; }
+  .chat-send-btn { flex: 1 0 100%; height: 56px; font-size: 16px; font-weight: 700; border-radius: 12px; }
+  .btn { font-size: 15px; }
   .setting-row { flex-direction: column; align-items: flex-start; gap: 8px; }
   .modal { width: calc(100vw - 28px); max-width: calc(100vw - 28px); padding: 18px; }
   #log-container { height: 55dvh; }
+}
+
+@media (max-width: 430px) {
+  #topbar { padding: 12px 14px; }
+  #topbar h1 { font-size: 19px; }
+  #topbar .meta { max-width: 54vw; font-size: 12px; }
+  .topbar-right .pill:last-child { display: none; }
+  #content { padding: 14px; }
+  .section-title { font-size: 21px; }
+  .section-sub { font-size: 13px; }
+  .chip { font-size: 12px; padding: 8px 11px; }
+  #chat-messages,
+  .msg-bubble { font-size: 15px; }
 }
 </style>
 </head>
