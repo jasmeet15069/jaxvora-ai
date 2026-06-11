@@ -1130,10 +1130,14 @@ function sendChat() {
   appendMsg('user', displayMsg);
   appendMsg('bot thinking', '⏳ Thinking...');
 
+  const adminToken = sessionStorage.getItem('jaxvora_gmail_admin_token') || '';
+  const chatPayload = { message: fullMsg };
+  if (adminToken) chatPayload.admin_token = adminToken;
+
   if (chatWs && chatWs.readyState === 1) {
-    chatWs.send(JSON.stringify({ message: fullMsg }));
+    chatWs.send(JSON.stringify(chatPayload));
   } else {
-    fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: fullMsg }) })
+    fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload) })
       .then(r => r.json()).then(d => { removeThinking(); appendMsg('bot', d.response, d.agents); })
       .catch(err => { removeThinking(); appendMsg('bot', 'Error: ' + err); });
   }

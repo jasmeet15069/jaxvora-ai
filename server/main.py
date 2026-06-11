@@ -1333,6 +1333,99 @@ Always respond in this JSON format:
         (("architecture", "system", "scale", "performance"), ["Architecture", "Project Intelligence", "DevOps", "Database"]),
     ]
 
+    GMAIL_INTENT_WORDS = ("gmail", "mail", "email", "inbox", "message", "messages")
+    GMAIL_READ_WORDS = ("read", "show", "list", "check", "search", "latest", "recent", "unread", "open")
+
+    def _is_gmail_chat_intent(self, user_input: str) -> bool:
+        text = user_input.lower()
+        return any(word in text for word in self.GMAIL_INTENT_WORDS) and any(word in text for word in self.GMAIL_READ_WORDS)
+
+    def _gmail_query_from_chat(self, user_input: str) -> str:
+        text = user_input.lower()
+        query_parts = []
+        if "unread" in text:
+            query_parts.append("is:unread")
+        if "today" in text:
+            query_parts.append("newer_than:1d")
+        elif "week" in text or "7 day" in text:
+            query_parts.append("newer_than:7d")
+        else:
+            query_parts.append("newer_than:30d")
+
+        from_match = re.search(r"\bfrom[:\s]+([^\s,]+@[^\s,]+)", user_input, re.IGNORECASE)
+        if from_match:
+            query_parts.append(f"from:{from_match.group(1)}")
+        subject_match = re.search(r"\bsubject[:\s]+['\"]?([^'\"]{2,80})", user_input, re.IGNORECASE)
+        if subject_match:
+            query_parts.append(f"subject:({subject_match.group(1).strip()})")
+        return " ".join(query_parts)
+
+    async def _handle_gmail_chat(self, user_input: str, admin_token: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if not self._is_gmail_chat_intent(user_input):
+            return None
+        if not gmail_automation_status().get("configured"):
+            return {
+                "plan": "Gmail chat access requested, but Gmail automation is not fully configured.",
+                "agents": ["Chief Orchestrator", "Gmail Automation"],
+                "response": "Gmail automation is not fully configured yet. Check Settings > Gmail Automation for the missing item.",
+                "results": [],
+                "organization": {"mode": "gmail_guard"},
+            }
+        if not _gmail_action_authorized(admin_token):
+            return {
+                "plan": "Gmail chat access requested; admin token required.",
+                "agents": ["Chief Orchestrator", "Gmail Automation"],
+                "response": "Gmail is connected, but chat-mode mailbox access needs the Gmail admin token saved in Settings > Gmail Automation. Open Settings, paste the token, click Use Token, then ask me again.",
+                "results": [],
+                "organization": {"mode": "gmail_guard"},
+            }
+
+        query = self._gmail_query_from_chat(user_input)
+        search = await run_gmail_automation({"action": "search", "query": query, "max_results": 5})
+        if not search.get("ok"):
+            return {
+                "plan": "Search Gmail from chat.",
+                "agents": ["Chief Orchestrator", "Gmail Automation"],
+                "response": f"I could not search Gmail: {search.get('error', 'unknown error')}",
+                "results": [],
+                "organization": {"mode": "gmail_tool"},
+            }
+
+        messages = search.get("messages") or []
+        if not messages:
+            return {
+                "plan": f"Search Gmail with query: {query}",
+                "agents": ["Chief Orchestrator", "Gmail Automation"],
+                "response": f"No Gmail messages matched `{query}`.",
+                "results": [{"agent": "Gmail Automation", "success": True, "output": "No messages found."}],
+                "organization": {"mode": "gmail_tool"},
+            }
+
+        wants_body = any(word in user_input.lower() for word in ("read", "open", "body", "content", "full"))
+        body_block = ""
+        if wants_body:
+            first = await run_gmail_automation({"action": "read", "message_id": messages[0].get("id")})
+            if first.get("ok"):
+                body = (first.get("message") or {}).get("body") or ""
+                if body:
+                    body_block = f"\n\nLatest message preview:\n{body[:1600]}"
+
+        lines = [f"I found {len(messages)} Gmail message(s) for `{query}`:"]
+        for idx, msg in enumerate(messages, 1):
+            lines.append(
+                f"{idx}. {msg.get('subject') or '(no subject)'}\n"
+                f"   From: {msg.get('from') or 'unknown'}\n"
+                f"   Date: {msg.get('date') or 'unknown'}\n"
+                f"   Snippet: {msg.get('snippet') or ''}"
+            )
+        return {
+            "plan": f"Search Gmail with query: {query}",
+            "agents": ["Chief Orchestrator", "Gmail Automation"],
+            "response": "\n\n".join(lines) + body_block,
+            "results": [{"agent": "Gmail Automation", "success": True, "output": f"Returned {len(messages)} message(s)."}],
+            "organization": {"mode": "gmail_tool"},
+        }
+
     def _normalise_agents(self, names: List[str]) -> List[str]:
         selected = []
         for name in names or []:
@@ -1452,7 +1545,11 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
             return plan.get("response", "Task completed.") + "\n\n" + response
         return response
 
-    async def process(self, user_input: str, stream_fn=None) -> Dict:
+    async def process(self, user_input: str, stream_fn=None, admin_token: Optional[str] = None) -> Dict:
+        gmail_result = await self._handle_gmail_chat(user_input, admin_token=admin_token)
+        if gmail_result:
+            return gmail_result
+
         try:
             raw = await call_groq(self.SYSTEM, user_input)
             # Extract JSON
@@ -1557,6 +1654,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class ChatRequest(BaseModel):
     message: str
     project_id: Optional[str] = None
+    admin_token: Optional[str] = None
 
 class ProjectCreate(BaseModel):
     name: str
@@ -1627,7 +1725,7 @@ async def frontend():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    result = await orchestrator.process(req.message)
+    result = await orchestrator.process(req.message, admin_token=req.admin_token)
     return result
 
 
@@ -1990,7 +2088,9 @@ async def ws_chat(ws: WebSocket):
         while True:
             data = await ws.receive_text()
             try:
-                msg = json.loads(data).get("message", "")
+                payload = json.loads(data)
+                msg = payload.get("message", "")
+                admin_token = payload.get("admin_token")
             except json.JSONDecodeError:
                 await ws.send_json({"type": "error", "message": "Invalid JSON payload."})
                 continue
@@ -2002,7 +2102,7 @@ async def ws_chat(ws: WebSocket):
             async def stream(event):
                 await ws.send_json(event)
 
-            result = await orchestrator.process(msg, stream_fn=stream)
+            result = await orchestrator.process(msg, stream_fn=stream, admin_token=admin_token)
             await ws.send_json({"type": "response", "message": result["response"], "plan": result["plan"], "agents": result["agents"]})
     except WebSocketDisconnect:
         ws_manager.chat_ws.discard(ws)
