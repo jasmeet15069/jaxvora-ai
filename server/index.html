@@ -292,9 +292,55 @@ body.chat-view #content { overflow: hidden; }
   word-break: break-word;
 }
 .msg.user .msg-bubble { background: rgba(108,99,255,0.2); border: 1px solid rgba(108,99,255,0.3); color: var(--text); }
-.msg.bot .msg-bubble { background: var(--glass2); border: 1px solid var(--border); color: var(--text); }
+.msg.bot .msg-bubble {
+  background: var(--glass2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: normal;
+}
+.msg.user .msg-bubble { white-space: pre-wrap; }
 .msg-meta { font-size: 10px; color: var(--text3); }
 .msg.thinking .msg-bubble { color: var(--text2); font-style: italic; }
+.md-content { display: flex; flex-direction: column; gap: 10px; }
+.md-content h3 {
+  margin: 0 0 2px;
+  font-size: 17px;
+  line-height: 1.35;
+  font-weight: 800;
+  color: #fff;
+}
+.md-content p { margin: 0; }
+.md-content ul,
+.md-content ol {
+  margin: 0;
+  padding-left: 22px;
+}
+.md-content li { margin: 4px 0; }
+.md-code {
+  margin: 2px 0 0;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(108,99,255,0.24);
+  background: rgba(0,0,0,0.34);
+  color: #f5f7ff;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-x: auto;
+  white-space: pre;
+}
+.md-inline-code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: rgba(108,99,255,0.16);
+  color: #d9d6ff;
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+.md-agent-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
 .chat-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .chip {
   padding: 6px 12px; border-radius: 20px;
@@ -564,6 +610,7 @@ body.chat-view #content { overflow: hidden; }
   }
   .msg { max-width: 100%; }
   .msg-bubble { padding: 12px 14px; font-size: 15px; line-height: 1.65; border-radius: 12px; }
+  .msg.bot .msg-bubble { font-size: 15px; }
   .msg-meta { font-size: 12px; }
   .chat-chips { gap: 8px; margin-bottom: 14px; }
   .chip { padding: 8px 12px; font-size: 13px; line-height: 1.25; }
@@ -1189,14 +1236,95 @@ function sendChip(msg) {
   setTimeout(sendChat, 100);
 }
 
+function renderInlineMarkdown(text) {
+  return escHtml(text)
+    .replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function renderTextSegment(segment) {
+  const lines = String(segment || '').replace(/\r\n/g, '\n').split('\n');
+  const parts = [];
+  let para = [];
+  let listItems = [];
+  let listType = 'ul';
+
+  function flushPara() {
+    if (!para.length) return;
+    parts.push('<p>' + para.map(renderInlineMarkdown).join('<br>') + '</p>');
+    para = [];
+  }
+
+  function flushList() {
+    if (!listItems.length) return;
+    parts.push('<' + listType + '>' + listItems.map(item => '<li>' + renderInlineMarkdown(item) + '</li>').join('') + '</' + listType + '>');
+    listItems = [];
+  }
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      flushPara();
+      flushList();
+      continue;
+    }
+    const heading = line.match(/^#{1,3}\s+(.+)$/);
+    if (heading) {
+      flushPara();
+      flushList();
+      parts.push('<h3>' + renderInlineMarkdown(heading[1]) + '</h3>');
+      continue;
+    }
+    const bullet = line.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      flushPara();
+      if (listItems.length && listType !== 'ul') flushList();
+      listType = 'ul';
+      listItems.push(bullet[1]);
+      continue;
+    }
+    const numbered = line.match(/^\d+\.\s+(.+)$/);
+    if (numbered) {
+      flushPara();
+      if (listItems.length && listType !== 'ol') flushList();
+      listType = 'ol';
+      listItems.push(numbered[1]);
+      continue;
+    }
+    flushList();
+    para.push(line);
+  }
+  flushPara();
+  flushList();
+  return parts.join('');
+}
+
+function renderRichText(text) {
+  const source = String(text || '').trim();
+  if (!source) return '';
+  const parts = [];
+  const codeRe = /```([a-zA-Z0-9_-]*)\s*\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = codeRe.exec(source)) !== null) {
+    if (match.index > lastIndex) parts.push(renderTextSegment(source.slice(lastIndex, match.index)));
+    parts.push(`<pre class="md-code"><code>${escHtml(match[2].trim())}</code></pre>`);
+    lastIndex = codeRe.lastIndex;
+  }
+  if (lastIndex < source.length) parts.push(renderTextSegment(source.slice(lastIndex)));
+  return `<div class="md-content">${parts.join('')}</div>`;
+}
+
 function appendMsg(role, text, agents) {
   const div = document.createElement('div');
   const isThinking = role === 'bot thinking';
+  if (isThinking) removeThinking();
   div.className = 'msg ' + (isThinking ? 'bot thinking' : role === 'user' ? 'user' : 'bot');
   if (isThinking) div.id = 'thinking-msg';
   let agentTags = '';
-  if (agents && agents.length) agentTags = '<div style="margin-top:6px">' + agents.map(a => `<span class="tag">${a}</span>`).join('') + '</div>';
-  div.innerHTML = `<div class="msg-bubble">${escHtml(text)}${agentTags}</div><div class="msg-meta">${new Date().toLocaleTimeString()}</div>`;
+  if (agents && agents.length) agentTags = '<div class="md-agent-tags">' + agents.map(a => `<span class="tag">${escHtml(a)}</span>`).join('') + '</div>';
+  const body = isThinking || role === 'user' ? escHtml(text) : renderRichText(text);
+  div.innerHTML = `<div class="msg-bubble">${body}${agentTags}</div><div class="msg-meta">${new Date().toLocaleTimeString()}</div>`;
   document.getElementById('chat-messages').appendChild(div);
   document.getElementById('chat-messages').scrollTop = 99999;
 }

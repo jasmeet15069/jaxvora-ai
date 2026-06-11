@@ -910,6 +910,42 @@ class GmailAutomationTool(MCPTool):
         return json.dumps(result, indent=2, default=str)
 
 
+SSH_BLOCKED_COMMAND_PATTERNS = [
+    r"\brm\s+-rf\s+/",
+    r"\bmkfs\b",
+    r"\bdd\s+if=",
+    r":\s*\(\s*\)\s*\{",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bpoweroff\b",
+    r"\bhalt\b",
+    r"\binit\s+[06]\b",
+    r"\bpasswd\b",
+    r"\buserdel\b",
+    r"\bdeluser\b",
+    r"\bchmod\s+-R\s+777\s+/",
+    r"\bchown\s+-R\b.*\s+/",
+    r"\bufw\s+(disable|reset)\b",
+    r"\biptables\b",
+    r"\bnft\s+flush\b",
+    r"\bcurl\b.*\|\s*(sh|bash)",
+    r"\bwget\b.*\|\s*(sh|bash)",
+]
+
+
+def validate_ssh_command(command: str) -> Dict[str, Any]:
+    cleaned = str(command or "").strip()
+    if not cleaned:
+        return {"allowed": False, "reason": "Command is empty."}
+    if len(cleaned) > 500:
+        return {"allowed": False, "reason": "Command is too long for direct chat execution."}
+    lowered = cleaned.lower()
+    for pattern in SSH_BLOCKED_COMMAND_PATTERNS:
+        if re.search(pattern, lowered):
+            return {"allowed": False, "reason": "Blocked by SSH safety policy because it can damage the server or security posture."}
+    return {"allowed": True, "reason": "Allowed by SSH safety policy."}
+
+
 class SSHTool(MCPTool):
     def __init__(self):
         super().__init__("ssh_exec", "Execute commands on a remote server via SSH for 24/7 monitoring and management")
@@ -922,6 +958,9 @@ class SSHTool(MCPTool):
         command = params.get("command", "")
         if not host or not user or not command:
             return "[SSH not configured — provide host, user, and command]"
+        policy = validate_ssh_command(command)
+        if not policy["allowed"]:
+            return f"[SSH command blocked: {policy['reason']}]"
         try:
             import asyncssh
             conn_kwargs: Dict[str, Any] = {
@@ -1432,6 +1471,9 @@ class ChiefOrchestrator:
 
     SYSTEM = """You are Jaxvora's Chief Orchestrator powered by Llama 3.3 70B.
 Your role: parse user intent, create execution plans, route to specialist agents, and synthesise results.
+Write user-facing responses in clean markdown with short headings, bullets, and fenced code blocks when useful.
+Do not return raw JSON, internal traces, or long unstructured paragraphs in the final response.
+Never say Jaxvora cannot use a configured tool; route tool-specific requests before giving generic advice.
 
 Available agents:
 Engineering: AI Engineer, Software Engineer, Debug Agent, QA/Test Agent, Code Review, Architecture, Database, DevOps
@@ -1462,10 +1504,84 @@ Always respond in this JSON format:
 
     GMAIL_INTENT_WORDS = ("gmail", "mail", "email", "inbox", "message", "messages")
     GMAIL_READ_WORDS = ("read", "show", "list", "check", "search", "latest", "recent", "unread", "open")
+    SSH_INTENT_WORDS = ("ssh", "server", "vm", "remote")
+    SSH_COMMAND_WORDS = ("run", "execute", "exec", "command", "cmd", "shell", "terminal")
 
     def _is_gmail_chat_intent(self, user_input: str) -> bool:
         text = user_input.lower()
         return any(word in text for word in self.GMAIL_INTENT_WORDS) and any(word in text for word in self.GMAIL_READ_WORDS)
+
+    def _is_ssh_chat_intent(self, user_input: str) -> bool:
+        text = user_input.lower()
+        if "ssh" in text:
+            return True
+        return ("server" in text or "vm" in text or "remote" in text) and any(word in text for word in ("access", "connect", "status", "uptime", "shell"))
+
+    def _ssh_command_from_chat(self, user_input: str) -> str:
+        fenced = re.search(r"```(?:bash|sh|shell)?\s*([\s\S]*?)```", user_input, re.IGNORECASE)
+        if fenced:
+            return fenced.group(1).strip()
+
+        text = user_input.strip()
+        patterns = [
+            r"\b(?:run|execute|exec)\s+(.+?)\s+(?:on|via|in)\s+(?:the\s+)?(?:ssh|server|vm|remote)\b",
+            r"\b(?:on|via|in)\s+(?:the\s+)?(?:ssh|server|vm|remote)\s+(?:run|execute|exec)\s+(.+)$",
+            r"\bssh\s+(?:server\s+)?(?:run|execute|exec)\s+(.+)$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(" .")
+
+        if any(word in text.lower() for word in ("uptime", "status")):
+            return "printf 'SSH_OK\\n'; hostname; pwd; uptime"
+        return "printf 'SSH_OK\\n'; hostname; pwd; uname -a; uptime"
+
+    async def _handle_ssh_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
+        if not self._is_ssh_chat_intent(user_input):
+            return None
+        if not SSH_HOST or not SSH_USER:
+            return {
+                "plan": "Check configured SSH access.",
+                "agents": ["Chief Orchestrator", "DevOps"],
+                "response": "## SSH server\n\nSSH is not configured yet. Add `SSH_HOST`, `SSH_USER`, and either `SSH_KEY_PATH`, `SSH_KEY`, or `SSH_PASSWORD` in server settings, then restart the service.",
+                "results": [],
+                "organization": {"mode": "ssh_tool"},
+            }
+
+        command = self._ssh_command_from_chat(user_input)
+        policy = validate_ssh_command(command)
+        if not policy["allowed"]:
+            return {
+                "plan": "Block unsafe SSH command.",
+                "agents": ["Chief Orchestrator", "DevOps", "Cybersecurity"],
+                "response": f"## SSH command blocked\n\nI did not run this command because it failed the server safety policy.\n\n**Reason:** {policy['reason']}\n\n```bash\n{command}\n```",
+                "results": [{"agent": "DevOps", "success": False, "output": policy["reason"]}],
+                "organization": {"mode": "ssh_tool"},
+            }
+
+        output = await SSHTool().run({"command": command})
+        ok = not output.startswith("[SSH error") and not output.startswith("[SSH not configured") and not output.startswith("[asyncssh")
+        status = "connected" if ok else "failed"
+        response = (
+            f"## SSH server {status}\n\n"
+            f"**Target:** `{SSH_USER}@{SSH_HOST}:{SSH_PORT}`\n\n"
+            "**Command ran:**\n"
+            f"```bash\n{command}\n```\n\n"
+            "**Output:**\n"
+            f"```text\n{output.strip()}\n```\n\n"
+        )
+        if ok:
+            response += "I can use the configured SSH server from chat for safe diagnostic commands."
+        else:
+            response += "The SSH tool was called, but the connection or command failed. Check Settings > SSH Server Connection and server logs."
+        return {
+            "plan": "Use the configured SSH tool and report the real command output.",
+            "agents": ["Chief Orchestrator", "DevOps"],
+            "response": response,
+            "results": [{"agent": "DevOps", "success": ok, "output": output}],
+            "organization": {"mode": "ssh_tool"},
+        }
 
     def _gmail_query_from_chat(self, user_input: str) -> str:
         text = user_input.lower()
@@ -1676,6 +1792,9 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         gmail_result = await self._handle_gmail_chat(user_input, admin_token=admin_token)
         if gmail_result:
             return gmail_result
+        ssh_result = await self._handle_ssh_chat(user_input)
+        if ssh_result:
+            return ssh_result
 
         try:
             raw = await call_groq(self.SYSTEM, user_input)
