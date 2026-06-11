@@ -10,6 +10,7 @@ import re
 import subprocess
 import tempfile
 import hmac
+import html
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Set
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ import ssl as ssl_lib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
 from email import encoders
 import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Form, Header
@@ -45,6 +47,9 @@ GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_AUTOMATION_API_TOKEN = os.environ.get("GMAIL_AUTOMATION_API_TOKEN", os.environ.get("JAXVORA_ADMIN_TOKEN", ""))
+GMAIL_TEMPLATE_FILE = os.environ.get("GMAIL_TEMPLATE_FILE", "")
+GMAIL_LOGO_FILE = os.environ.get("GMAIL_LOGO_FILE", "")
+GMAIL_LOGO_CID = "jaxvora-logo"
 GMAIL_SCOPES = os.environ.get(
     "GMAIL_SCOPES",
     "https://mail.google.com/",
@@ -131,10 +136,134 @@ async def call_groq(system: str, user: str) -> str:
     return await call_openrouter(system, user)
 
 
+def _resolve_app_resource(env_value: str, *relative_parts: str) -> Optional[Path]:
+    app_dir = Path(__file__).resolve().parent
+    candidates: List[Path] = []
+    if env_value:
+        configured = Path(env_value)
+        candidates.append(configured if configured.is_absolute() else app_dir / configured)
+    relative_path = Path(*relative_parts)
+    candidates.extend([app_dir / relative_path, app_dir / "server" / relative_path])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _plain_text_to_email_html(value: str) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return '<p style="margin:0 0 14px 0;">Jaxvora update generated successfully.</p>'
+    blocks = re.split(r"\n{2,}", text)
+    html_blocks = []
+    for block in blocks:
+        safe = html.escape(block.strip()).replace("\n", "<br>")
+        if safe:
+            html_blocks.append(f'<p style="margin:0 0 14px 0;">{safe}</p>')
+    return "\n".join(html_blocks)
+
+
+def _sanitize_email_html(value: str) -> str:
+    cleaned = str(value or "")
+    cleaned = re.sub(r"<\s*(script|style|iframe|object|embed)[^>]*>.*?</\s*\1\s*>", "", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"\son[a-z]+\s*=\s*(['\"]).*?\1", "", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"\s(href|src)\s*=\s*(['\"])\s*javascript:.*?\2", r' \1="#"', cleaned, flags=re.I | re.S)
+    return cleaned or '<p style="margin:0 0 14px 0;">Jaxvora update generated successfully.</p>'
+
+
+def _html_to_plain_text(value: str) -> str:
+    text = re.sub(r"(?i)<br\s*/?>", "\n", str(value or ""))
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _gmail_template_html(params: Dict[str, Any]) -> str:
+    subject = str(params.get("subject") or "Jaxvora notification")
+    body = str(params.get("body") or params.get("text") or "")
+    body_html = _sanitize_email_html(body) if params.get("html") else _plain_text_to_email_html(body)
+    preheader = str(params.get("preheader") or params.get("summary") or f"{subject} from Jaxvora AI")[:160]
+    sender = str(params.get("sender_label") or GMAIL_AUTOMATION_USER or GMAIL_SENDER or "Jaxvora AI")
+    template_path = _resolve_app_resource(GMAIL_TEMPLATE_FILE, "templates", "gmail_body_template.html")
+    if template_path:
+        template = template_path.read_text(encoding="utf-8")
+    else:
+        template = (
+            "<html><body>"
+            '<img src="cid:{{logo_cid}}" width="52" height="52" alt="Jaxvora">'
+            "<h1>{{subject}}</h1>{{body_html}}"
+            "<p>Sent by Jaxvora AI from {{sender}}.</p>"
+            "</body></html>"
+        )
+    replacements = {
+        "{{subject}}": html.escape(subject),
+        "{{preheader}}": html.escape(preheader),
+        "{{body_html}}": body_html,
+        "{{logo_cid}}": GMAIL_LOGO_CID,
+        "{{sender}}": html.escape(sender),
+        "{{year}}": str(datetime.utcnow().year),
+    }
+    for token, value in replacements.items():
+        template = template.replace(token, value)
+    return template
+
+
+def _gmail_logo_bytes() -> bytes:
+    logo_path = _resolve_app_resource(GMAIL_LOGO_FILE, "assets", "jaxvora-gmail-logo.png")
+    if not logo_path:
+        return b""
+    try:
+        return logo_path.read_bytes()
+    except Exception as exc:
+        logger.warning(f"Could not read Gmail logo asset: {exc}")
+        return b""
+
+
+def _gmail_mime_message(params: Dict[str, Any], attachments: Optional[List[MIMEBase]] = None) -> MIMEMultipart:
+    to = (params.get("to") or "").strip()
+    subject = str(params.get("subject") or "Jaxvora notification")
+    if not to:
+        raise ValueError("Recipient 'to' is required")
+
+    raw_body = str(params.get("body") or params.get("text") or "")
+    body_html = _gmail_template_html(params)
+    plain_text = _html_to_plain_text(raw_body) if params.get("html") else raw_body.strip()
+    if not plain_text:
+        plain_text = _html_to_plain_text(body_html) or subject
+
+    body_part = MIMEMultipart("related")
+    alternatives = MIMEMultipart("alternative")
+    alternatives.attach(MIMEText(plain_text, "plain", "utf-8"))
+    alternatives.attach(MIMEText(body_html, "html", "utf-8"))
+    body_part.attach(alternatives)
+
+    logo_bytes = _gmail_logo_bytes()
+    if logo_bytes:
+        logo = MIMEImage(logo_bytes, _subtype="png", name="jaxvora-gmail-logo.png")
+        logo.add_header("Content-ID", f"<{GMAIL_LOGO_CID}>")
+        logo.add_header("Content-Disposition", "inline", filename="jaxvora-gmail-logo.png")
+        body_part.attach(logo)
+
+    root: MIMEMultipart = body_part
+    if attachments:
+        root = MIMEMultipart("mixed")
+        root.attach(body_part)
+        for attachment in attachments:
+            root.attach(attachment)
+
+    root["To"] = to
+    root["From"] = params.get("from") or GMAIL_AUTOMATION_USER or GMAIL_SENDER or "me"
+    root["Subject"] = subject
+    if params.get("cc"):
+        root["Cc"] = str(params.get("cc"))
+    if params.get("bcc"):
+        root["Bcc"] = str(params.get("bcc"))
+    return root
+
+
 async def send_gmail(to_email: str, subject: str, body: str, attachment_name: str = "", attachment_data: bytes = b"") -> str:
-    """Send email via Gmail SMTP app password."""
-    if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
-        return "[Gmail not configured — set GMAIL_SENDER and GMAIL_APP_PASSWORD]"
+    """Send a branded Jaxvora email through Gmail API first, then SMTP fallback."""
     if not to_email:
         return "[No recipient email — set NOTIFICATION_EMAIL in Settings]"
     if not attachment_data and not attachment_name and gmail_automation_status().get("configured"):
@@ -149,18 +278,26 @@ async def send_gmail(to_email: str, subject: str, body: str, attachment_name: st
             logger.info(f"✉ Email sent via Gmail API to {to_email}: {subject}")
             return f"Email sent to {to_email} via Gmail API"
         logger.warning(f"Gmail API send failed, falling back to SMTP: {api_result.get('error')}")
+    if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
+        return "[Gmail not configured - set Gmail OAuth or GMAIL_SENDER and GMAIL_APP_PASSWORD]"
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = subject
-        msg["From"] = f"Jaxvora <{GMAIL_SENDER}>"
-        msg["To"] = to_email
-        msg.attach(MIMEText(body, "plain"))
+        attachments = []
         if attachment_data and attachment_name:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(attachment_data)
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
-            msg.attach(part)
+            attachments.append(part)
+        msg = _gmail_mime_message(
+            {
+                "to": to_email,
+                "subject": subject,
+                "body": body,
+                "from": f"Jaxvora <{GMAIL_SENDER}>",
+                "sender_label": GMAIL_SENDER,
+            },
+            attachments=attachments,
+        )
         ctx = ssl_lib.create_default_context()
         smtp_password = GMAIL_APP_PASSWORD.replace(" ", "")
         def _send():
@@ -309,20 +446,7 @@ def _gmail_message_summary(message: Dict[str, Any], include_body: bool = False) 
 
 
 def _gmail_raw_message(params: Dict[str, Any]) -> str:
-    to = (params.get("to") or "").strip()
-    subject = params.get("subject") or ""
-    body = params.get("body") or params.get("text") or ""
-    if not to:
-        raise ValueError("Recipient 'to' is required")
-    msg = MIMEMultipart()
-    msg["To"] = to
-    msg["From"] = GMAIL_AUTOMATION_USER or "me"
-    msg["Subject"] = subject
-    if params.get("cc"):
-        msg["Cc"] = params.get("cc")
-    if params.get("bcc"):
-        msg["Bcc"] = params.get("bcc")
-    msg.attach(MIMEText(body, "html" if params.get("html") else "plain", "utf-8"))
+    msg = _gmail_mime_message(params)
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
 
