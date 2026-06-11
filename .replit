@@ -1,0 +1,63 @@
+modules = ["nodejs-24", "python-3.11"]
+
+[deployment]
+router = "application"
+deploymentTarget = "autoscale"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Jaxvora"
+
+[[workflows.workflow]]
+name = "Jaxvora"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd jaxvora && /home/runner/workspace/.pythonlibs/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8099"
+waitForPort = 8099
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[[ports]]
+localPort = 8080
+externalPort = 8080
+
+[[ports]]
+localPort = 8081
+externalPort = 80
+
+[[ports]]
+localPort = 8099
+externalPort = 8099
+
+[nix]
+channel = "stable-25_05"
+packages = ["libsodium", "libxcrypt", "nettle", "openssh", "openssl", "postgresql"]
+
+[userenv]
+
+[userenv.shared]
+GMAIL_SENDER = "snipymart@gmail.com"
+GMAIL_APP_PASSWORD = "ssmz narv waxx trol"

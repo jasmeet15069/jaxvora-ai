@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""
+Test a Groq API key locally.
+
+PowerShell:
+  $env:GROQ_API_KEY="your_groq_key_here"
+  python .\test_groq_api_key.py
+
+CMD:
+  set GROQ_API_KEY=your_groq_key_here
+  python test_groq_api_key.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+TEST_MODELS = ("llama-3.1-8b-instant", "llama-3.3-70b-versatile")
+
+
+def mask_key(key: str) -> str:
+    if len(key) <= 14:
+        return "***"
+    return f"{key[:8]}...{key[-6:]}"
+
+
+def groq_request(method: str, path: str, api_key: str, payload: dict | None = None, timeout: int = 45) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        GROQ_BASE_URL + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenAI/Python 1.0 JazzAI-Groq-Key-Test",
+        },
+    )
+    started = time.time()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return {
+                "ok": 200 <= response.status < 300,
+                "status": response.status,
+                "latency_s": round(time.time() - started, 2),
+                "body": json.loads(body) if body else {},
+            }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            parsed = {"raw": body[:800]}
+        return {
+            "ok": False,
+            "status": exc.code,
+            "latency_s": round(time.time() - started, 2),
+            "body": parsed,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "latency_s": round(time.time() - started, 2),
+            "body": {"error": str(exc)},
+        }
+
+
+def main() -> int:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        print("ERROR: Set GROQ_API_KEY first.")
+        print('PowerShell example: $env:GROQ_API_KEY="your_groq_key_here"; python .\\test_groq_api_key.py')
+        return 2
+
+    print(f"Testing Groq key: {mask_key(api_key)}")
+
+    models_result = groq_request("GET", "/models", api_key)
+    print("\n/models result:")
+    print(json.dumps({
+        "ok": models_result["ok"],
+        "status": models_result["status"],
+        "latency_s": models_result["latency_s"],
+    }, indent=2))
+
+    if models_result["ok"]:
+        model_ids = [
+            item.get("id")
+            for item in models_result["body"].get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        llama_models = [model for model in model_ids if "llama" in model.lower()]
+        print("Llama models seen:")
+        for model in llama_models[:12]:
+            print(f"  - {model}")
+    else:
+        print("Model list error:")
+        print(json.dumps(models_result["body"], indent=2))
+
+    print("\nCompletion tests:")
+    all_ok = models_result["ok"]
+    for model in TEST_MODELS:
+        result = groq_request(
+            "POST",
+            "/chat/completions",
+            api_key,
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+                "max_completion_tokens": 8,
+                "temperature": 0,
+            },
+        )
+        content = ""
+        if isinstance(result.get("body"), dict):
+            content = (
+                result["body"]
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+        print(json.dumps({
+            "model": model,
+            "ok": result["ok"],
+            "status": result["status"],
+            "latency_s": result["latency_s"],
+            "content": content,
+            "error": result["body"].get("error") if isinstance(result.get("body"), dict) else None,
+        }, indent=2))
+        all_ok = all_ok and result["ok"]
+
+    print("\nFINAL:", "PASS" if all_ok else "FAIL")
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

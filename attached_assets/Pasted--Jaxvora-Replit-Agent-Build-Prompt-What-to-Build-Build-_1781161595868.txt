@@ -1,0 +1,334 @@
+# Jaxvora — Replit Agent Build Prompt
+
+---
+
+## What to Build
+
+Build **Jaxvora** — a production-ready, autonomous multi-agent AI platform for Engineering, Data, Security, Career, and Automation workflows.
+
+**V1 Output Files:**
+- `main.py` — Single-file FastAPI backend
+- `index.html` — Single-file frontend (pure HTML/CSS/JS, no frameworks)
+- `requirements.txt`
+- `.env.example`
+- `README.md`
+
+---
+
+## Replit-Specific Requirements
+
+- Bind the server to `host="0.0.0.0"` and `port=int(os.environ.get("PORT", 8080))`
+- Read all secrets from `os.environ` (not from a `.env` file)
+- Use **Neon PostgreSQL** (Replit's built-in): read from `os.environ["DATABASE_URL"]`
+- Use **Qdrant Cloud** free tier: read URL from `os.environ["QDRANT_URL"]` and key from `os.environ["QDRANT_API_KEY"]`
+- If any API key is missing, that agent must return a graceful mock/placeholder response — **never crash**
+- No Docker, no build tools, no React, no Next.js, no Vue
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Python FastAPI + WebSockets |
+| Primary Worker | DeepSeek V3 via `api.deepseek.com` |
+| Chief Orchestrator | Gemini 2.0 Flash via `google-generativeai` |
+| Architecture & Review | Llama 3.3 70B via Groq API |
+| Relational DB | PostgreSQL (Neon via `asyncpg`) |
+| Vector DB | Qdrant Cloud |
+| Real-time | WebSockets |
+| Frontend | Vanilla HTML/CSS/JS |
+
+---
+
+## Architecture: Single-File Backend (`main.py`)
+
+Structure `main.py` in clearly labelled sections so it can be modularly split later:
+
+```
+# === SECTION 1: Imports & Config ===
+# === SECTION 2: Database Layer (PostgreSQL + Qdrant) ===
+# === SECTION 3: MCP Tool Registry ===
+# === SECTION 4: Memory Manager ===
+# === SECTION 5: Agent Registry & Base Agent Class ===
+# === SECTION 6: Agent Implementations ===
+# === SECTION 7: Chief Orchestrator ===
+# === SECTION 8: WebSocket Manager ===
+# === SECTION 9: FastAPI App + REST Endpoints ===
+# === SECTION 10: WebSocket Endpoints ===
+# === SECTION 11: Startup / Shutdown Events ===
+```
+
+---
+
+## Agent Roster (V1)
+
+All agents share a `BaseAgent` class with `run(task: str) -> AgentResult`.
+
+### Executive Layer
+| Agent | Model | Role |
+|---|---|---|
+| Chief Orchestrator | Gemini 2.0 Flash | Task planning, agent routing, failure recovery |
+| Project Intelligence | Llama 3.3 70B via Groq | Dependency graph, architecture graph, impact analysis |
+
+### Engineering Division
+| Agent | Model | Role |
+|---|---|---|
+| AI Engineer | DeepSeek V3 | AI features, RAG systems, MCP integrations, LLM workflows |
+| Software Engineer | DeepSeek V3 | Backend/frontend dev, CRUD, API generation |
+| Debug Agent | DeepSeek V3 | Root-cause analysis, log investigation, automated bug fixing |
+| QA/Test Agent | DeepSeek V3 | Unit, integration, E2E, regression tests |
+| Code Review | Llama 3.3 70B via Groq | Code quality, best practices, risk & security review |
+| Architecture | Llama 3.3 70B via Groq | System design, scalability, technical debt |
+| Database | DeepSeek V3 | Query optimization, schema design, migrations |
+| DevOps | DeepSeek V3 | CI/CD, Docker configs, Kubernetes manifests, deployments |
+
+### Security Division
+| Agent | Model | Role |
+|---|---|---|
+| Cybersecurity | DeepSeek V3 | Vulnerability scanning, secret detection, hardening |
+| Red Team | DeepSeek V3 | Threat modeling, attack simulation |
+| Compliance | DeepSeek V3 | GDPR, SOC2, ISO27001 checklists |
+
+### Data Division
+| Agent | Model | Role |
+|---|---|---|
+| Data Analyst | DeepSeek V3 | SQL analysis, KPI tracking, business insights |
+| BI Agent | DeepSeek V3 | Power BI reports, DAX generation, semantic model analysis |
+| Data Engineer | DeepSeek V3 | ETL pipelines, data quality, warehouse optimization |
+| ML Engineer | DeepSeek V3 | Feature engineering, model training, evaluation pipelines |
+
+### Career Division
+| Agent | Model | Role |
+|---|---|---|
+| Resume Agent | DeepSeek V3 | ATS-optimized resume and portfolio generation |
+| Interview Coach | DeepSeek V3 | Technical, behavioral, and mock interview prep |
+| Career Coach | DeepSeek V3 | Learning plans, skill-gap analysis, career guidance |
+
+### Product & Docs
+| Agent | Model | Role |
+|---|---|---|
+| Product Manager | DeepSeek V3 | Roadmaps, feature planning, user stories |
+| Documentation | DeepSeek V3 | Technical docs, API docs, architecture docs |
+| Research | DeepSeek V3 | Technology research, framework comparison |
+
+---
+
+## Agent Communication Rules
+
+- Agents **never call each other directly**
+- All inter-agent tasks route through the **Chief Orchestrator**
+- Every action passes through: `Orchestrator → Approval Layer → Audit Layer`
+- Shared state via: `Event Bus`, `Shared Memory (PostgreSQL)`, `Task Queue`, `MCP Tool Registry`
+
+---
+
+## MCP Tool Registry
+
+Implement these as callable async tools registered in a central `MCPToolRegistry`:
+
+| Tool | Description |
+|---|---|
+| `file_system` | Read/write files in the workspace |
+| `terminal` | Run shell commands safely (sandboxed) |
+| `github` | GitHub API: repos, PRs, commits, issues |
+| `postgresql` | Execute SQL against the connected DB |
+| `qdrant` | Semantic search and upsert |
+| `browser` | Fetch and parse web pages |
+| `security_scanner` | Static analysis for secrets/vulnerabilities |
+| `code_formatter` | Lint and format code (ruff, black, prettier) |
+
+---
+
+## Memory Layer
+
+**PostgreSQL tables (auto-create on startup):**
+```sql
+projects (id, name, repo_url, metadata, created_at)
+tasks (id, project_id, agent_name, status, input, output, created_at, completed_at)
+logs (id, task_id, level, message, timestamp)
+audit (id, agent_name, action, payload, approved, timestamp)
+agent_history (id, agent_name, task_summary, outcome, timestamp)
+```
+
+**Qdrant collections (auto-create on startup):**
+- `architecture_knowledge` — system design decisions
+- `security_findings` — vulnerabilities, fixes
+- `code_fixes` — bug patterns and resolutions
+- `org_knowledge` — general organizational context
+
+---
+
+## FastAPI REST Endpoints
+
+```
+POST /chat                  — Natural language command → Orchestrator
+GET  /agents                — List all agents + status
+GET  /tasks                 — List tasks (filter: status, agent)
+POST /tasks/{id}/approve    — Approve a pending task
+POST /tasks/{id}/reject     — Reject a pending task
+GET  /projects              — List projects
+POST /projects              — Register a new project
+GET  /logs                  — Paginated logs
+GET  /analytics             — Agent productivity, cost, quality metrics
+GET  /memory/search         — Semantic search across Qdrant
+POST /security/scan         — Trigger a security scan
+```
+
+## WebSocket Endpoints
+
+```
+/ws/agents   — Live agent status updates
+/ws/tasks    — Task queue updates
+/ws/logs     — Real-time log stream
+/ws/chat     — Bidirectional chat with Orchestrator
+```
+
+---
+
+## Frontend: `index.html`
+
+**Design direction:** Dark command center. Background `#0a0b0f`, primary accent `#6c63ff` (electric violet), secondary `#00d4aa` (teal green). Font: `JetBrains Mono` for data/code, `Inter` for prose. Glassmorphism panels with `backdrop-filter: blur`. Thin violet gradient borders. Subtle scanline/grid texture on the background. The UI should feel like a mission control room for AI agents.
+
+**No React. No Vue. No build tools. Pure HTML/CSS/JS with WebSocket connections.**
+
+### Sections (Sidebar Navigation):
+
+#### 1. Dashboard (default view)
+- Project health score (ring chart — pure SVG)
+- Security score, Performance score, Test coverage
+- Active agents count, Tasks today, Issues found
+
+#### 2. Agent Monitor
+- Live grid of all agents showing: name, model, status (`idle` / `running` / `error`), current task
+- Status dots pulse green when active
+- Click agent → modal with last 5 task summaries
+
+#### 3. Chat Interface
+- Natural language input → sends to `POST /chat` and opens `/ws/chat`
+- Streaming response from Orchestrator
+- Quick-action chips:
+  - `Fix all bugs`
+  - `Analyze architecture`
+  - `Run security audit`
+  - `Generate Power BI dashboard`
+  - `Create ATS resume`
+  - `Optimize database queries`
+  - `Review code quality`
+
+#### 4. Live Logs
+- Real-time feed from `/ws/logs`
+- Colour-coded: INFO (grey), WARN (yellow), ERROR (red), SUCCESS (teal)
+- Filter by agent name or log level
+- Auto-scroll with pause-on-hover
+
+#### 5. Task Queue
+- Three columns: Pending / Running / Completed
+- Each task card shows: agent name, short description, elapsed time
+- Completed cards show outcome badge (success/failed/skipped)
+
+#### 6. Approval Center
+- Cards for tasks pending human approval
+- Each card shows: agent, proposed action, diff/output preview
+- Approve ✓ / Reject ✗ buttons → calls REST endpoints
+
+#### 7. Analytics
+- Agent call count per day (bar chart — pure SVG/Canvas)
+- Task success rate
+- Top agents by usage
+- Estimated time saved
+
+#### 8. Settings
+- API key status indicators (DeepSeek, Gemini, Groq, Qdrant)
+- Does NOT expose key values — only shows `✓ Connected` or `✗ Missing`
+
+---
+
+## Autonomous Workflow (Orchestrator Logic)
+
+When a task is received via `/chat`:
+
+1. Chief Orchestrator parses intent and creates an execution plan
+2. Project Intelligence Agent builds/updates project context
+3. Relevant agents are assigned subtasks in priority order
+4. Each agent runs its subtask using MCP tools as needed
+5. Code Review and Security agents validate outputs
+6. Results are logged to PostgreSQL and vectors stored in Qdrant
+7. If human approval is required, task is queued in `audit` table
+8. On approval, DevOps/Git actions are executed
+9. Outcomes are used to update semantic memory (learning loop)
+
+---
+
+## Startup Behaviour
+
+On `startup` event:
+1. Run all `CREATE TABLE IF NOT EXISTS` migrations
+2. Create Qdrant collections if they don't exist
+3. Register all agents in the agent registry
+4. Register all MCP tools
+5. Broadcast `system_ready` event to all WebSocket clients
+
+---
+
+## `.env.example`
+
+```env
+DATABASE_URL=postgresql+asyncpg://user:password@host/dbname
+QDRANT_URL=https://your-cluster.qdrant.io
+QDRANT_API_KEY=your_qdrant_api_key
+
+DEEPSEEK_API_KEY=your_deepseek_api_key
+GEMINI_API_KEY=your_gemini_api_key
+GROQ_API_KEY=your_groq_api_key
+
+GITHUB_TOKEN=your_github_token
+SECRET_KEY=your_random_secret_key
+ENVIRONMENT=development
+```
+
+---
+
+## `requirements.txt` (key packages)
+
+```
+fastapi
+uvicorn[standard]
+asyncpg
+sqlalchemy[asyncio]
+qdrant-client
+google-generativeai
+groq
+openai          # used for DeepSeek (OpenAI-compatible endpoint)
+websockets
+httpx
+python-dotenv
+pydantic-settings
+```
+
+---
+
+## Quality Rules
+
+- Every agent method must have a try/except — failures log to DB and return a structured error, never raise unhandled exceptions
+- All DB calls use async/await with connection pooling
+- WebSocket manager must handle disconnects gracefully
+- No hardcoded API keys anywhere in source code
+- All prompts to LLMs must include a system message that identifies the agent role
+- DeepSeek base URL: `https://api.deepseek.com` (OpenAI-compatible, use `openai` library with `base_url` override)
+
+---
+
+## README.md
+
+Include:
+- Project description
+- Architecture overview
+- Setup steps (Replit Secrets, Neon DB, Qdrant Cloud)
+- How to run: `uvicorn main:app --host 0.0.0.0 --port 8080 --reload`
+- Example chat commands
+- Agent directory
+
+---
+
+Build this now. Start with `main.py`, then `index.html`, then the support files.
