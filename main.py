@@ -47,10 +47,7 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_AUTOMATION_API_TOKEN = os.environ.get("GMAIL_AUTOMATION_API_TOKEN", os.environ.get("JAXVORA_ADMIN_TOKEN", ""))
 GMAIL_SCOPES = os.environ.get(
     "GMAIL_SCOPES",
-    "https://www.googleapis.com/auth/gmail.modify "
-    "https://www.googleapis.com/auth/gmail.send "
-    "https://www.googleapis.com/auth/gmail.compose "
-    "https://www.googleapis.com/auth/gmail.settings.basic",
+    "https://mail.google.com/",
 )
 
 SSH_HOST = os.environ.get("SSH_HOST", "")
