@@ -289,14 +289,70 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
   font-family: var(--mono);
 }
 .chip:hover { border-color: var(--violet); color: var(--violet2); background: rgba(108,99,255,0.08); }
-.chat-input-row { display: flex; gap: 8px; }
+.chat-input-row { display: flex; gap: 10px; align-items: center; }
 .chat-input-row input {
-  flex: 1; background: var(--glass2); border: 1px solid var(--border);
-  border-radius: 8px; padding: 10px 14px; color: var(--text);
+  flex: 1; min-width: 160px; height: 48px;
+  background: rgba(255,255,255,0.045); border: 1px solid var(--border);
+  border-radius: 10px; padding: 0 16px; color: var(--text);
   font-size: 13px; outline: none; transition: border-color 0.15s;
 }
 .chat-input-row input:focus { border-color: var(--violet); }
 .chat-input-row input::placeholder { color: var(--text3); }
+.chat-attach-btn {
+  width: 48px; height: 48px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--glass2);
+  border: 1px solid var(--border);
+  color: var(--text2);
+  border-radius: 10px;
+  font-size: 17px;
+  flex: 0 0 48px;
+}
+.chat-attach-btn.active {
+  color: var(--violet2);
+  border-color: rgba(139,133,255,0.65);
+  background: rgba(108,99,255,0.12);
+}
+.file-preview {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  max-width: 280px;
+  min-width: 0;
+  padding: 0 8px 0 12px;
+  background: rgba(108,99,255,0.10);
+  border: 1px solid rgba(139,133,255,0.36);
+  border-radius: 999px;
+  color: var(--violet2);
+  font-size: 11px;
+  font-family: var(--mono);
+  flex: 0 1 auto;
+}
+.file-preview.open { display: inline-flex; }
+.file-preview-icon { flex: 0 0 auto; opacity: 0.9; }
+.file-preview-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.file-clear {
+  width: 24px; height: 24px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255,77,106,0.12);
+  color: var(--red);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+  flex: 0 0 24px;
+}
+.file-clear:hover { background: rgba(255,77,106,0.22); }
+.chat-send-btn { height: 48px; min-width: 96px; border-radius: 10px; }
 .btn {
   padding: 8px 16px; border-radius: 8px; border: none;
   font-size: 13px; font-weight: 500; transition: all 0.15s;
@@ -482,9 +538,10 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
   .stat-value { font-size: 24px; }
   #chat-messages { height: min(52dvh, 460px); min-height: 300px; padding: 12px; }
   .msg { max-width: 100%; }
-  .chat-input-row { flex-wrap: wrap; }
-  .chat-input-row input { min-width: 0; flex: 1 1 calc(100% - 58px); }
-  .chat-input-row .btn-primary { flex: 1 0 100%; }
+  .chat-input-row { flex-wrap: wrap; gap: 8px; }
+  .chat-input-row input { min-width: 0; flex: 1 1 calc(100% - 64px); }
+  .file-preview.open { order: -1; flex: 1 1 100%; max-width: none; }
+  .chat-send-btn { flex: 1 0 100%; }
   .setting-row { flex-direction: column; align-items: flex-start; gap: 8px; }
   .modal { width: calc(100vw - 28px); max-width: calc(100vw - 28px); padding: 18px; }
   #log-container { height: 55dvh; }
@@ -649,15 +706,16 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
         <div class="chip" onclick="sendChip('Create an ETL pipeline for user analytics data')">⚡ ETL pipeline</div>
       </div>
       <div id="chat-messages"></div>
-      <div id="file-preview" style="display:none;padding:6px 12px;background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.3);border-radius:8px;margin-bottom:8px;font-size:11px;font-family:var(--mono);color:var(--violet2);display:flex;align-items:center;gap:8px">
-        <span>📎</span><span id="file-preview-name"></span>
-        <button onclick="clearAttachment()" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:12px;margin-left:auto">✕</button>
-      </div>
       <input type="file" id="file-input" style="display:none" onchange="handleFileSelect(this)">
       <div class="chat-input-row">
-        <button class="btn" onclick="document.getElementById('file-input').click()" title="Attach file" style="background:var(--glass2);border:1px solid var(--border);color:var(--text2);padding:8px 12px;font-size:16px;border-radius:8px;cursor:pointer;flex-shrink:0" id="clip-btn">📎</button>
+        <button class="chat-attach-btn" onclick="document.getElementById('file-input').click()" title="Attach file" id="clip-btn">📎</button>
+        <div id="file-preview" class="file-preview" aria-live="polite">
+          <span class="file-preview-icon">📎</span>
+          <span class="file-preview-name" id="file-preview-name"></span>
+          <button class="file-clear" onclick="clearAttachment()" title="Remove attachment">×</button>
+        </div>
         <input type="text" id="chat-input" placeholder="Ask Jaxvora anything... (Enter to send)" onkeydown="if(event.key==='Enter')sendChat()">
-        <button class="btn btn-primary" onclick="sendChat()">Send</button>
+        <button class="btn btn-primary chat-send-btn" onclick="sendChat()">Send</button>
       </div>
     </div>
 
@@ -1366,9 +1424,10 @@ function handleFileSelect(input) {
   const file = input.files[0];
   if (!file) return;
   const preview = document.getElementById('file-preview');
-  document.getElementById('file-preview-name').textContent = file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)';
-  preview.style.display = 'flex';
-  document.getElementById('clip-btn').style.color = 'var(--violet2)';
+  const size = file.size > 1024 * 1024 ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : (file.size / 1024).toFixed(1) + ' KB';
+  document.getElementById('file-preview-name').textContent = file.name + ' · ' + size;
+  preview.classList.add('open');
+  document.getElementById('clip-btn').classList.add('active');
   const reader = new FileReader();
   reader.onload = e => { attachedFile = { name: file.name, content: e.target.result }; };
   reader.readAsText(file, 'utf-8');
@@ -1377,8 +1436,9 @@ function handleFileSelect(input) {
 function clearAttachment() {
   attachedFile = null;
   document.getElementById('file-input').value = '';
-  document.getElementById('file-preview').style.display = 'none';
-  document.getElementById('clip-btn').style.color = '';
+  document.getElementById('file-preview').classList.remove('open');
+  document.getElementById('file-preview-name').textContent = '';
+  document.getElementById('clip-btn').classList.remove('active');
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
