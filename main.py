@@ -12,6 +12,7 @@ import tempfile
 import hmac
 import html
 import sys
+from io import BytesIO
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Set
 from contextlib import asynccontextmanager
@@ -66,6 +67,8 @@ SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat-v3-0324"
 LLAMA_MODEL = "llama-3.3-70b-versatile"
+MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+MAX_UPLOAD_TEXT_CHARS = 24000
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
 
@@ -1654,6 +1657,8 @@ Always respond in this JSON format:
     SSH_INTENT_WORDS = ("ssh", "server", "vm", "remote")
     SSH_COMMAND_WORDS = ("run", "execute", "exec", "command", "cmd", "shell", "terminal")
     DOCTOR_INTENT_WORDS = ("doctor", "debug", "bug", "bugs", "fix all", "monitor jaxvora", "until fixed", "diagnose", "stability", "regression")
+    ATTACHMENT_MARKER = "[Attachment extracted by Jaxvora]"
+    ATTACHMENT_ERROR_MARKER = "[Attachment could not be read by Jaxvora]"
 
     def _is_gmail_chat_intent(self, user_input: str) -> bool:
         text = user_input.lower()
@@ -1670,6 +1675,57 @@ Always respond in this JSON format:
         if "jaxvora" in text and any(word in text for word in ("monitor", "diagnose", "debug", "stability", "health")):
             return True
         return any(word in text for word in self.DOCTOR_INTENT_WORDS) and any(word in text for word in ("jaxvora", "app", "system", "all", "bug", "bugs", "test", "tests"))
+
+    def _has_raw_pdf_payload(self, user_input: str) -> bool:
+        sample = user_input[:12000]
+        return "%PDF" in sample or ("/Type /Catalog" in sample and "endobj" in sample and "stream" in sample)
+
+    async def _handle_attachment_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
+        if self.ATTACHMENT_ERROR_MARKER in user_input:
+            return {
+                "plan": "Stop because the attachment text extraction failed.",
+                "agents": ["Chief Orchestrator"],
+                "response": (
+                    "## I could not read that attachment\n\n"
+                    "The file was uploaded, but Jaxvora could not extract readable text from it. "
+                    "If it is a scanned PDF, export it with OCR or upload a text-based PDF."
+                ),
+                "results": [],
+                "organization": {"mode": "attachment_reader"},
+            }
+
+        if self._has_raw_pdf_payload(user_input) and self.ATTACHMENT_MARKER not in user_input:
+            return {
+                "plan": "Reject raw PDF bytes to prevent hallucinated document summaries.",
+                "agents": ["Chief Orchestrator"],
+                "response": (
+                    "## I received raw PDF bytes, not readable resume text\n\n"
+                    "I will not guess or invent details from PDF internals. Please refresh Jaxvora and upload the PDF again; "
+                    "the updated uploader extracts the text first and then I can read it accurately."
+                ),
+                "results": [],
+                "organization": {"mode": "attachment_reader"},
+            }
+
+        if self.ATTACHMENT_MARKER not in user_input:
+            return None
+
+        response = await call_groq(
+            (
+                "You are Jaxvora's document reader. Use only the extracted attachment text supplied by the user. "
+                "Never invent names, phone numbers, employers, dates, education, skills, or certifications. "
+                "If a requested detail is missing, say it is not found in the extracted text. "
+                "Return clean markdown with short headings and bullets."
+            ),
+            user_input,
+        )
+        return {
+            "plan": "Read the extracted attachment text and answer without fabricating missing details.",
+            "agents": ["Chief Orchestrator"],
+            "response": response,
+            "results": [{"agent": "Document Reader", "success": True, "output": "Answered from extracted attachment text only."}],
+            "organization": {"mode": "attachment_reader"},
+        }
 
     async def _handle_doctor_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
         if not self._is_doctor_chat_intent(user_input):
@@ -1963,6 +2019,9 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         return response
 
     async def process(self, user_input: str, stream_fn=None, admin_token: Optional[str] = None) -> Dict:
+        attachment_result = await self._handle_attachment_chat(user_input)
+        if attachment_result:
+            return attachment_result
         gmail_result = await self._handle_gmail_chat(user_input, admin_token=admin_token)
         if gmail_result:
             return gmail_result
@@ -2362,19 +2421,128 @@ async def gmail_action(req: GmailActionRequest, x_jaxvora_admin_token: Optional[
     return await run_gmail_automation(payload)
 
 
+def _clean_upload_text(text: str) -> str:
+    text = text.replace("\x00", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _looks_like_pdf_bytes(content: bytes, filename: str, content_type: str) -> bool:
+    return (
+        content.startswith(b"%PDF")
+        or filename.lower().endswith(".pdf")
+        or content_type.lower().startswith("application/pdf")
+    )
+
+
+def _extract_pdf_upload_text(content: bytes) -> Dict[str, Any]:
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"PDF parser is not installed: {type(exc).__name__}",
+            "content": "",
+            "pages": 0,
+            "truncated": False,
+        }
+
+    try:
+        reader = PdfReader(BytesIO(content))
+        page_texts: List[str] = []
+        for idx, page in enumerate(reader.pages):
+            try:
+                extracted = page.extract_text() or ""
+            except Exception as page_exc:
+                extracted = f"[Page {idx + 1} text extraction failed: {type(page_exc).__name__}]"
+            extracted = _clean_upload_text(extracted)
+            if extracted:
+                page_texts.append(f"--- Page {idx + 1} ---\n{extracted}")
+        text = _clean_upload_text("\n\n".join(page_texts))
+        truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
+        if truncated:
+            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
+        if not text:
+            return {
+                "ok": False,
+                "error": "No readable text could be extracted from this PDF. It may be scanned or image-only.",
+                "content": "",
+                "pages": len(reader.pages),
+                "truncated": False,
+            }
+        return {
+            "ok": True,
+            "error": "",
+            "content": text,
+            "pages": len(reader.pages),
+            "truncated": truncated,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"PDF extraction failed: {type(exc).__name__}: {exc}",
+            "content": "",
+            "pages": 0,
+            "truncated": False,
+        }
+
+
+def _extract_upload_text(content: bytes, filename: str, content_type: str) -> Dict[str, Any]:
+    if len(content) > MAX_UPLOAD_BYTES:
+        return {
+            "ok": False,
+            "error": f"File is too large. Maximum supported size is {MAX_UPLOAD_BYTES // 1024 // 1024} MB.",
+            "content": "",
+            "pages": 0,
+            "truncated": False,
+        }
+
+    if _looks_like_pdf_bytes(content, filename, content_type):
+        return _extract_pdf_upload_text(content)
+
+    text_types = (
+        "text/",
+        "application/json",
+        "application/xml",
+        "application/x-yaml",
+        "application/yaml",
+        "application/javascript",
+    )
+    if content_type.lower().startswith(text_types) or filename.lower().endswith((
+        ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".js", ".ts", ".py", ".html", ".css"
+    )):
+        text = _clean_upload_text(content.decode("utf-8", errors="replace"))
+        truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
+        if truncated:
+            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
+        return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
+
+    return {
+        "ok": False,
+        "error": f"Unsupported file type for text extraction: {content_type or 'unknown'}",
+        "content": "",
+        "pages": 0,
+        "truncated": False,
+    }
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """Accept file upload and return its text content for agent context."""
     content = await file.read()
-    try:
-        text = content.decode("utf-8", errors="replace")
-    except Exception:
-        text = base64.b64encode(content).decode()
+    content_type = file.content_type or ""
+    extracted = _extract_upload_text(content, file.filename or "attachment", content_type)
     return {
         "filename": file.filename,
         "size": len(content),
-        "content": text[:8000],
-        "truncated": len(text) > 8000,
+        "content_type": content_type,
+        "ok": extracted["ok"],
+        "error": extracted["error"],
+        "content": extracted["content"],
+        "text_length": len(extracted["content"]),
+        "pages": extracted["pages"],
+        "truncated": extracted["truncated"],
     }
 
 

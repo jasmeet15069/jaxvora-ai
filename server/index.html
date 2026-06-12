@@ -1226,17 +1226,45 @@ function connectTasksWs() {
 }
 
 // ── Chat ───────────────────────────────────────────────────────────────────
-function sendChat() {
+async function sendChat() {
   const input = document.getElementById('chat-input');
   let msg = input.value.trim();
   if (!msg && !attachedFile) return;
+  if (attachedFile && attachedFile.uploading) {
+    appendMsg('bot', 'The attachment is still being read. Please send again in a moment.');
+    return;
+  }
   input.value = '';
 
   let fullMsg = msg;
   let displayMsg = msg;
   if (attachedFile) {
-    fullMsg = (msg ? msg + '\n\n' : '') + `[Attached file: ${attachedFile.name}]\n\`\`\`\n${attachedFile.content.slice(0, 6000)}\n\`\`\``;
     displayMsg = (msg ? msg + ' ' : '') + `📎 ${attachedFile.name}`;
+    const prompt = msg || 'Can you read this attachment and summarize it accurately?';
+    if (attachedFile.ok) {
+      fullMsg = `${prompt}
+
+[Attachment extracted by Jaxvora]
+Filename: ${attachedFile.name}
+Content type: ${attachedFile.content_type || 'unknown'}
+Size: ${attachedFile.size || 0} bytes
+Pages: ${attachedFile.pages || 0}
+Text length: ${attachedFile.text_length || 0}
+Truncated: ${attachedFile.truncated ? 'yes' : 'no'}
+
+Extracted text:
+\`\`\`text
+${attachedFile.content || ''}
+\`\`\``;
+    } else {
+      fullMsg = `${prompt}
+
+[Attachment could not be read by Jaxvora]
+Filename: ${attachedFile.name}
+Content type: ${attachedFile.content_type || 'unknown'}
+Size: ${attachedFile.size || 0} bytes
+Error: ${attachedFile.error || 'Text extraction failed.'}`;
+    }
     clearAttachment();
   }
 
@@ -1663,9 +1691,37 @@ function handleFileSelect(input) {
   document.getElementById('file-preview-name').textContent = file.name + ' · ' + size;
   preview.classList.add('open');
   document.getElementById('clip-btn').classList.add('active');
-  const reader = new FileReader();
-  reader.onload = e => { attachedFile = { name: file.name, content: e.target.result }; };
-  reader.readAsText(file, 'utf-8');
+  const previewName = document.getElementById('file-preview-name');
+  previewName.textContent = file.name + ' - reading...';
+  attachedFile = { name: file.name, size: file.size, content_type: file.type, uploading: true, ok: false, content: '' };
+
+  const form = new FormData();
+  form.append('file', file);
+  fetch('/upload', { method: 'POST', body: form })
+    .then(r => {
+      if (!r.ok) throw new Error('Upload failed: ' + r.status);
+      return r.json();
+    })
+    .then(data => {
+      attachedFile = { ...data, name: data.filename || file.name, uploading: false };
+      const suffix = data.ok
+        ? `${size} - ${data.text_length || 0} chars${data.truncated ? ' - truncated' : ''}`
+        : `${size} - unreadable`;
+      previewName.textContent = file.name + ' - ' + suffix;
+    })
+    .catch(err => {
+      attachedFile = {
+        name: file.name,
+        size: file.size,
+        content_type: file.type,
+        uploading: false,
+        ok: false,
+        error: String(err.message || err),
+        content: '',
+      };
+      previewName.textContent = file.name + ' - upload failed';
+    });
+  return;
 }
 
 function clearAttachment() {
