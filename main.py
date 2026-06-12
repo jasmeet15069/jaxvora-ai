@@ -2423,6 +2423,13 @@ async def gmail_action(req: GmailActionRequest, x_jaxvora_admin_token: Optional[
 
 def _clean_upload_text(text: str) -> str:
     text = text.replace("\x00", "")
+    text = re.sub(r"/?envel\S{0,12}pe(?=[A-Za-z0-9._%+-]+@)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:\u2642|\u00b6|\?|/)?phone(?=\+?\d)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"/?ap-\S{0,16}arker-alt", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"/?gl\S{0,8}be(?=[A-Za-z0-9.-]+\.)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"/github(?=github\.com)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"/linkedin(?=linkedin\.com)", "", text, flags=re.IGNORECASE)
+    text = text.replace("\u2642", " ").replace("\u00b6", " ").replace("\u2322", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
