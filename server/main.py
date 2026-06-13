@@ -84,6 +84,15 @@ DEEPSEEK_V4_MODEL = "deepseek/deepseek-v4-flash:free"
 DEEPSEEK_V4_BASE = "https://openrouter.ai/api/v1"
 MAX_TOKENS = 8192
 DEEPSEEK_V4_MAX_TOKENS = 64000
+# Default output budget per LLM call. 64000 was wasteful (slow + free-tier rejections).
+# Keep it modest; callers that truly need more can pass a larger max_tokens.
+DEFAULT_MAX_TOKENS = int(os.environ.get("LLM_DEFAULT_MAX_TOKENS", "4096") or 4096)
+# Per-provider output caps — free tiers can't serve huge outputs (OpenRouter 402:
+# "you requested up to N tokens but can only serve fewer"; Groq/Zen TPM rate limits).
+ZEN_MAX_OUT = int(os.environ.get("ZEN_MAX_TOKENS", "8192") or 8192)
+GROQ_MAX_OUT = int(os.environ.get("GROQ_MAX_TOKENS", "8192") or 8192)
+DEEPSEEK_V4_MAX_OUT = int(os.environ.get("DEEPSEEK_V4_MAX_TOKENS_OUT", "2048") or 2048)
+OPENROUTER_MAX_OUT = int(os.environ.get("OPENROUTER_MAX_TOKENS", "1024") or 1024)
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_UPLOAD_TEXT_CHARS = 24000
 
@@ -165,14 +174,14 @@ async def _raw_zen(system: str, user: str, max_tokens: int) -> str:
     return await _post_chat(
         f"{OPENCODE_ZEN_BASE}/chat/completions",
         {"Authorization": f"Bearer {OPENCODE_ZEN_API_KEY}"},
-        OPENCODE_ZEN_MODEL, system, user, max_tokens, timeout=120)
+        OPENCODE_ZEN_MODEL, system, user, min(max_tokens, ZEN_MAX_OUT), timeout=120)
 
 
 async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
     return await _post_chat(
         "https://api.groq.com/openai/v1/chat/completions",
         {"Authorization": f"Bearer {GROQ_API_KEY}"},
-        LLAMA_MODEL, system, user, min(max_tokens, MAX_TOKENS), timeout=60)
+        LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60)
 
 
 async def _raw_deepseek_v4(system: str, user: str, max_tokens: int) -> str:
@@ -180,7 +189,7 @@ async def _raw_deepseek_v4(system: str, user: str, max_tokens: int) -> str:
         f"{DEEPSEEK_V4_BASE}/chat/completions",
         {"Authorization": f"Bearer {DEEPSEEK_V4_API_KEY}",
          "HTTP-Referer": "https://jaxvora.ai", "X-Title": "Jaxvora"},
-        DEEPSEEK_V4_MODEL, system, user, max_tokens, timeout=120)
+        DEEPSEEK_V4_MODEL, system, user, min(max_tokens, DEEPSEEK_V4_MAX_OUT), timeout=120)
 
 
 async def _raw_openrouter(system: str, user: str, max_tokens: int) -> str:
@@ -188,15 +197,17 @@ async def _raw_openrouter(system: str, user: str, max_tokens: int) -> str:
         f"{OPENROUTER_BASE}/chat/completions",
         {"Authorization": f"Bearer {OPENROUTER_API_KEY}",
          "HTTP-Referer": "https://jaxvora.ai", "X-Title": "Jaxvora"},
-        DEEPSEEK_MODEL, system, user, min(max_tokens, MAX_TOKENS), timeout=60)
+        DEEPSEEK_MODEL, system, user, min(max_tokens, OPENROUTER_MAX_OUT), timeout=60)
 
 
-# Registry: ordered identity + key predicate + single-attempt fn.
+# Registry: ordered identity + key predicate + single-attempt fn. `.strip()` so a
+# whitespace-only key (which causes "Missing Authentication header" 401s) counts as
+# not configured and the provider is skipped instead of failing every request.
 _PROVIDERS: Dict[str, Dict[str, Any]] = {
-    "zen": {"enabled": lambda: bool(OPENCODE_ZEN_API_KEY), "fn": _raw_zen},
-    "groq": {"enabled": lambda: bool(GROQ_API_KEY), "fn": _raw_groq},
-    "deepseek_v4": {"enabled": lambda: bool(DEEPSEEK_V4_API_KEY), "fn": _raw_deepseek_v4},
-    "openrouter": {"enabled": lambda: bool(OPENROUTER_API_KEY), "fn": _raw_openrouter},
+    "zen": {"enabled": lambda: bool((OPENCODE_ZEN_API_KEY or "").strip()), "fn": _raw_zen},
+    "groq": {"enabled": lambda: bool((GROQ_API_KEY or "").strip()), "fn": _raw_groq},
+    "deepseek_v4": {"enabled": lambda: bool((DEEPSEEK_V4_API_KEY or "").strip()), "fn": _raw_deepseek_v4},
+    "openrouter": {"enabled": lambda: bool((OPENROUTER_API_KEY or "").strip()), "fn": _raw_openrouter},
 }
 
 
@@ -248,7 +259,7 @@ async def _provider_attempt(name: str, system: str, user: str, max_tokens: int) 
 
 
 async def call_llm_failover(system: str, user: str,
-                            max_tokens: int = DEEPSEEK_V4_MAX_TOKENS,
+                            max_tokens: int = DEFAULT_MAX_TOKENS,
                             prefer: Optional[str] = None) -> str:
     """Single entrypoint every agent/tool uses. Walks the provider chain and
     returns the first working response, shifting providers on any failure."""
@@ -280,7 +291,7 @@ async def call_llm_failover(system: str, user: str,
 
 
 # ── Backwards-compatible wrappers (all route through the failover chain) ─────
-async def call_opencode_zen(system: str, user: str, max_tokens: int = DEEPSEEK_V4_MAX_TOKENS) -> str:
+async def call_opencode_zen(system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
     return await call_llm_failover(system, user, max_tokens, prefer="zen")
 
 
@@ -1608,7 +1619,7 @@ async def _run_parallel_team(role_name: str, task: str, parts: Any, project: str
         head_sys,
         f"Original task: {task}\n\nWorker submissions (parallel):\n\n{bundle}\n\n"
         "Produce the final merged, reviewed deliverable.",
-        max_tokens=DEEPSEEK_V4_MAX_TOKENS)
+        max_tokens=MAX_TOKENS)
     merge_ok = not str(merged).startswith("[All LLM providers failed")
     report["workers_succeeded"] = len(ok_workers)
     report["workers_total"] = len(results)
@@ -3122,6 +3133,17 @@ Rules:
             )
             response = await agent.call_llm(system, think_prompt)
             state.add_message("assistant", response)
+
+            # ── Fail fast: if every LLM provider is down/rate-limited, abort the
+            # loop immediately instead of grinding through all iterations (which
+            # turned a provider outage into a ~130s hang). Surface a clean message.
+            if response.startswith("[All LLM providers failed"):
+                state.add_step("error", agent.name, "LLM providers unavailable", response[:300], "error")
+                state.final_output = (
+                    "⚠️ All LLM providers are currently unavailable (rate-limited or out of "
+                    "credits), so I couldn't complete this request. Details: " + response[:300]
+                )
+                return state.final_output
 
             # ── Check for final answer ──
             final_match = re.search(r'<final_answer>(.*?)</final_answer>', response, re.DOTALL)
