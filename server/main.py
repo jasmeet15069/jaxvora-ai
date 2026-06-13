@@ -3037,9 +3037,30 @@ Do not return raw JSON, internal traces, or long unstructured paragraphs in the 
 Never say Jaxvora cannot use a configured tool; route tool-specific requests before giving generic advice.
 
 WORKSPACE EXECUTION — act like a coding agent (Codex / Claude Code style). When the user asks you to build, create, scaffold, write, edit, or run code, apps, websites, scripts, or files, ACTUALLY do it with tools instead of only describing it:
-- Create every file the project needs with the file_system tool (action=write). Put the project under its own folder when the user names one (e.g. jax-todolist/).
-- Run, build, and verify with the terminal tool (go, npm, node, python3, git, scp, curl, etc.). Tools run inside the workspace folder.
-- Then <finalize> with a short summary listing the files you created and the key command output.
+
+PROJECT SCAFFOLDING RULES:
+1. Create every file under workspace/<project-name>/ with the file_system tool (action=write).
+2. For static websites (HTML/CSS/JS only): write files, no build step needed.
+3. For Go projects: `go build -o <binary> .` in the project dir, then run via screen.
+4. For Python projects: run with `python3 main.py` or `python3 -m http.server <port>` via screen.
+5. For Node.js projects: run with `node server.js` or `npx serve static/ -p <port>` via screen.
+6. NEVER use Docker — it is NOT installed on the VM. Use screen for background processes.
+
+FAST PROJECT RUNNER: If the project is already built and just needs to be started/running,
+use the direct endpoint POST /run/{name} (no need for full agent dispatch):
+  curl -sS -X POST http://127.0.0.1:8090/run/jax-todolist
+This builds (if needed), starts via screen, registers in the app proxy, and returns the URL.
+The app is then accessible at /apps/{name}/.
+
+RUNNING A SERVER (after building / manual method):
+1. Kill any previous instance: `screen -S <name> -X quit 2>/dev/null`
+2. Start: `screen -dmS <name> bash -c "cd <project-dir> && ./<binary>"` (or python3/node equivalent)
+3. Wait 2 seconds, verify with `curl -sS http://127.0.0.1:<port>/`
+4. Register: `curl -sS -X POST http://127.0.0.1:8090/apps/register -H 'Content-Type: application/json' -d '{"name":"<project-name>","port":<port>,"directory":"<project-dir>"}'`
+5. The app becomes accessible at /apps/<project-name>/ through the Jaxvora proxy.
+
+PORT ALLOCATION: Use 8080 for the first project, 8081 for the second, 8082 for the third, etc.
+
 Example ACT blocks:
 <mcp_call tool="file_system" subtask_id="1">
   <parameter name="action">write</parameter>
@@ -3049,7 +3070,10 @@ Example ACT blocks:
 </parameter>
 </mcp_call>
 <mcp_call tool="terminal" subtask_id="2">
-  <parameter name="command">go build ./jax-todolist</parameter>
+  <parameter name="command">cd /root/jaxvora-ai/workspace/jax-todolist && go build -o jax-todolist .</parameter>
+</mcp_call>
+<mcp_call tool="terminal" subtask_id="3">
+  <parameter name="command">screen -dmS todolist bash -c "cd /root/jaxvora-ai/workspace/jax-todolist && ./jax-todolist" && sleep 2 && curl -sS -X POST http://127.0.0.1:8090/apps/register -H 'Content-Type: application/json' -d '{"name":"jax-todolist","port":8080,"directory":"jax-todolist"}'</parameter>
 </mcp_call>
 
 Available agents:
@@ -3072,7 +3096,7 @@ Always respond in this JSON format:
         (("mobile", "ui", "frontend", "responsive", "css", "design"), ["Software Engineer", "Product Manager", "QA/Test Agent", "Code Review"]),
         (("security", "vulnerability", "audit", "secret", "attack"), ["Cybersecurity", "Red Team", "Compliance", "Code Review"]),
         (("database", "postgres", "sql", "schema", "query", "neon"), ["Database", "Data Engineer", "Software Engineer"]),
-        (("deploy", "server", "docker", "ci", "cd", "vercel", "vm", "ssh"), ["DevOps", "Architecture", "QA/Test Agent"]),
+        (("deploy", "server", "ci", "cd", "vercel", "vm", "ssh", "background", "run", "host"), ["DevOps", "Architecture", "QA/Test Agent"]),
         (("data", "etl", "analytics", "dashboard", "power bi", "kpi"), ["Data Analyst", "Data Engineer", "BI Agent", "ML Engineer"]),
         (("resume", "interview", "career", "job"), ["Resume Agent", "Interview Coach", "Career Coach"]),
         (("prd", "document", "docs", "roadmap", "feature", "product"), ["Product Manager", "Documentation", "Research"]),
@@ -3754,6 +3778,79 @@ async def workspace_mkdir(req: dict):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ── App Registry (dynamic project proxy) ──────────────────────────────────────
+# Any project built in the workspace can register itself here and become
+# accessible at /apps/{name}/ via the Jaxvora proxy.
+
+APP_REGISTRY: Dict[str, Dict[str, Any]] = {}
+_next_port = [8081]
+
+
+def _alloc_port() -> int:
+    p = _next_port[0]
+    _next_port[0] = p + 1
+    return p
+
+
+async def _proxy_to_app(request: Request, app_name: str, path: str):
+    import httpx
+    info = APP_REGISTRY.get(app_name)
+    if not info:
+        return JSONResponse({"ok": False, "error": f"App '{app_name}' not registered"}, status_code=404)
+    port = info.get("port", 8080)
+    target = f"http://127.0.0.1:{port}/{path}" if path else f"http://127.0.0.1:{port}"
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.request(
+                method=request.method,
+                url=target,
+                headers=headers,
+                content=body if body else None,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+
+
+@app.post("/apps/register")
+async def app_register(req: dict):
+    name = req.get("name", "").strip()
+    port = req.get("port", 0)
+    directory = req.get("directory", "")
+    if not name:
+        return {"ok": False, "error": "name required"}
+    if not port:
+        port = _alloc_port()
+    info = {"name": name, "port": port, "directory": directory, "status": "running", "registered_at": datetime.now(timezone.utc).isoformat()}
+    APP_REGISTRY[name] = info
+    return {"ok": True, "app": info}
+
+
+@app.get("/apps")
+async def app_list():
+    return {"ok": True, "apps": list(APP_REGISTRY.values())}
+
+
+@app.delete("/apps/{name}")
+async def app_unregister(name: str):
+    if name not in APP_REGISTRY:
+        return {"ok": False, "error": f"App '{name}' not found"}
+    del APP_REGISTRY[name]
+    return {"ok": True, "deleted": name}
+
+
+@app.api_route("/apps/{name}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def app_proxy_root(request: Request, name: str):
+    return await _proxy_to_app(request, name, "")
+
+
+@app.api_route("/apps/{name}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def app_proxy_path(request: Request, name: str, path: str):
+    return await _proxy_to_app(request, name, path)
+
+
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -3850,6 +3947,94 @@ async def frontend():
         if index_path.exists():
             return index_path.read_text(encoding="utf-8")
     raise HTTPException(status_code=500, detail="Frontend index.html is missing")
+
+
+# ── Direct project runner ─────────────────────────────────────────────────────
+# Bypasses the TAOR loop. Builds and starts a workspace project, registers it
+# in the app proxy, and returns the access URL.
+
+
+async def _run_project(project: str) -> Dict[str, Any]:
+    """Build and start a workspace project, return app info."""
+    base = WORKSPACE_DIR.resolve() / project
+    if not base.is_dir():
+        return {"ok": False, "error": f"Project '{project}' not found in workspace"}
+
+    has_main_go = (base / "main.go").is_file()
+    has_package_json = (base / "package.json").is_file()
+    has_main_py = (base / "main.py").is_file() or (base / "app.py").is_file()
+    has_index_html = (base / "index.html").is_file() or (base / "static" / "index.html").is_file()
+
+    screen_name = project.replace(".", "_").replace("/", "_")
+    subprocess.run(["screen", "-S", screen_name, "-X", "quit"], capture_output=True, timeout=5)
+    await asyncio.sleep(0.5)
+
+    port = 8080
+    for i in range(8080, 8100):
+        if i not in [info["port"] for info in APP_REGISTRY.values()]:
+            port = i
+            break
+
+    cmd = ""
+    cwd = str(base)
+
+    if has_main_go:
+        binary = base / project
+        if not binary.exists():
+            ret = subprocess.run(["go", "build", "-o", project, "."], capture_output=True, text=True, timeout=60, cwd=cwd)
+            if ret.returncode != 0:
+                return {"ok": False, "error": f"Go build failed: {ret.stderr[:500]}"}
+        cmd = f"cd {cwd} && ./{project}"
+    elif has_main_py:
+        py_file = "main.py" if (base / "main.py").is_file() else "app.py"
+        cmd = f"cd {cwd} && python3 {py_file}"
+    elif has_package_json:
+        cmd = f"cd {cwd} && node server.js"
+    elif has_index_html:
+        static_path = (base / "static") if (base / "static").is_dir() else base
+        cmd = f"cd {cwd} && python3 -m http.server {port} --directory {static_path}"
+    else:
+        return {"ok": False, "error": f"Cannot determine how to run '{project}'"}
+
+    try:
+        subprocess.run(
+            ["screen", "-dmS", screen_name, "bash", "-c", cmd],
+            capture_output=True, timeout=10,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to start: {e}"}
+
+    await asyncio.sleep(2)
+
+    # Detect actual port the process is listening on (binary may use hardcoded port)
+    actual_port = port
+    for try_port in range(8080, 8100):
+        chk = subprocess.run(
+            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", f"http://127.0.0.1:{try_port}/"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if chk.stdout.strip() in ("200", "301", "302", "308"):
+            actual_port = try_port
+            break
+
+    info = {
+        "name": project, "port": actual_port, "directory": project,
+        "status": "running",
+        "url": f"/apps/{project}/",
+        "type": "go" if has_main_go else "python" if has_main_py else "node" if has_package_json else "static",
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+    }
+    APP_REGISTRY[project] = info
+
+    return {"ok": True, "app": info, "url": f"https://jaxvora.vercel.app/apps/{project}/"}
+
+
+@app.post("/run/{name}")
+async def run_project(name: str):
+    result = await _run_project(name)
+    if result.get("ok"):
+        return result
+    return JSONResponse(status_code=400, content=result)
 
 
 TODOLIST_BASE = "http://127.0.0.1:8080"

@@ -1221,10 +1221,20 @@ body.chat-view #content { overflow: hidden; }
     <canvas id="flow-canvas"></canvas>
     <div class="rs-empty" id="rs-empty">Chief idle · awaiting dispatch</div>
   </div>
-  <div class="rs-legend">
+  <div class="rs-legend" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:6px">
     <span><span class="rs-dot" style="background:var(--violet2)"></span> chief</span>
     <span><span class="rs-dot" style="background:var(--teal);animation:pulse 1.2s infinite"></span> working</span>
     <span><span class="rs-dot" style="background:var(--red)"></span> error</span>
+  </div>
+  <!-- Running Apps -->
+  <div style="padding:6px 14px 10px;flex-shrink:0">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <span style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono)">📦 Running Apps</span>
+      <span id="apps-count" style="font-size:9px;color:var(--teal);font-family:var(--mono)">0</span>
+    </div>
+    <div id="apps-list" style="display:flex;flex-direction:column;gap:4px;max-height:120px;overflow-y:auto">
+      <div style="font-size:11px;color:var(--text3);text-align:center;padding:8px 0">No apps running</div>
+    </div>
   </div>
 </aside>
 </div><!-- /app -->
@@ -2342,9 +2352,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   loadDashboard();
   loadAgents();
+  loadRunningApps();
 
   setInterval(loadDashboard, 30000);
   setInterval(loadAgents, 15000); // keeps the live Agent Flow graph in sync where WS is unavailable
+  setInterval(loadRunningApps, 5000); // poll running apps every 5s
 
   // The flow panel is docked on desktop; on small screens start it collapsed.
   if (window.matchMedia('(max-width: 1024px)').matches) {
@@ -2651,6 +2663,48 @@ function flowSyncFromAgents(list) {
   });
   flow.agents.forEach((n, name) => { if (!active.has(name) && !n.removing) flow.deactivate(name); });
   flow.setChief(active.size > 0 ? 'running' : 'idle', active.size > 0 ? 'orchestrating' : '');
+}
+
+// ── Running Apps ─────────────────────────────────────────────────────────────
+let _lastAppCount = 0;
+
+async function loadRunningApps() {
+  try {
+    const r = await fetch('/apps');
+    const d = await r.json();
+    const apps = (d && d.apps) || [];
+    const list = document.getElementById('apps-list');
+    const count = document.getElementById('apps-count');
+    if (!list || !count) return;
+
+    const n = apps.length;
+    count.textContent = String(n);
+
+    if (_lastAppCount === 0 && n > 0) {
+      // Auto-open sidebar when first app appears
+      const rs = document.getElementById('right-sidebar');
+      if (rs && rs.classList.contains('hidden')) {
+        rs.classList.remove('hidden');
+        document.body.classList.add('flow-open');
+        setTimeout(() => { if (flow && flow.resize) flow.resize(); }, 100);
+      }
+    }
+    _lastAppCount = n;
+
+    if (n === 0) {
+      list.innerHTML = '<div style="font-size:11px;color:var(--text3);text-align:center;padding:8px 0">No apps running</div>';
+      return;
+    }
+
+    list.innerHTML = apps.map(a => {
+      const url = a.url || '/apps/' + encodeURIComponent(a.name) + '/';
+      const badge = a.status === 'running' ? '<span style="color:var(--teal)">●</span>' : '<span style="color:var(--yellow)">●</span>';
+      return `<a href="${url}" target="_blank" style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;background:var(--glass);text-decoration:none;color:var(--text);font-size:12px">
+        ${badge} <span style="flex:1">${esc(a.name)}</span>
+        <span style="font-size:9px;color:var(--text3);font-family:var(--mono)">:${a.port || '?'}</span>
+      </a>`;
+    }).join('');
+  } catch (_) { /* ignore polling errors */ }
 }
 
 function switchKbTab(name) {
