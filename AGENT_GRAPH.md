@@ -26,7 +26,7 @@ flowchart TB
         FINAL --> U
     end
 
-    subgraph Divisions["6 Divisions · 36 Agents"]
+    subgraph Divisions["6 Divisions · 37 Agents"]
         direction TB
 
         subgraph ENG["🟢 Engineering · 10 agents"]
@@ -101,6 +101,11 @@ flowchart TB
         SSH["🔐 SSHTool\n⛔ critical"]
         WEB["🔎 WebSearchTool\n🟢 low"]
         INVOKE["🤝 AgentInvokeTool\n🟡 medium"]
+        SOCIAL["📱 SocialPost\n⛔ critical"]
+        CRUNNER["⚡ CodeRunner\n🟡 medium"]
+        PW["🎭 Playwright\n🟡 medium"]
+        FPREV["🖼️ FrontendPreview\n🟢 low"]
+        SRUNNER["🚀 ServerRunner\n🟡 medium"]
     end
 
     subgraph RAG["RAG Engine"]
@@ -154,7 +159,7 @@ flowchart TB
     THINK -.-> DISPATCH -.-> ACT
     ACT --> INVOKE
     INVOKE -.->|calls any agent| Divisions
-    ACT --> FS & TERM & PG & BR & SECTOOL & CODE & EMAIL & GMAIL & SSH & WEB
+    ACT --> FS & TERM & PG & BR & SECTOOL & CODE & EMAIL & GMAIL & SSH & WEB & SOCIAL & CRUNNER & PW & FPREV & SRUNNER
     WEB --> DDG
     GMAIL --> GMAIL_API
     SSH --> SSH_VM
@@ -197,7 +202,7 @@ flowchart TB
     class Resume,IC,CC,JobSearch,AppTracker career
     class PM,Docs,Research,UX,ReqAnalyst prod
     class PI,Doctor,Strategy,RiskPlan exec
-    class FS,TERM,PG,BR,SECTOOL,CODE,EMAIL,GMAIL,SSH,WEB,INVOKE tool
+    class FS,TERM,PG,BR,SECTOOL,CODE,EMAIL,GMAIL,SSH,WEB,INVOKE,SOCIAL,CRUNNER,PW,FPREV,SRUNNER tool
     class GROQ,OR_V3,OR_V4 llm
     class EMB,CHUNK,HYBRID,RAG rag
     class TASKS,AUDIT,AGENT_HIST,KB,RAG_DOCS,SESSIONS,SUBTASK_LOG,OP_LOG,SSH_AUDIT db

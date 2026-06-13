@@ -1723,6 +1723,112 @@ class PlaywrightTool(MCPTool):
     SANDBOX = Path("/root/jaxvora-ai/workspace")
 
 
+class FrontendPreviewTool(MCPTool):
+    def __init__(self):
+        super().__init__("frontend_preview",
+            "Serve a directory of static files as a live web preview. "
+            "params: directory (path under workspace, e.g. 'my-app/build'), name (preview name), port (optional, auto). "
+            "Starts an HTTP server in the background, registers in the app registry, returns the preview URL.",
+            risk_level="low")
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        directory = (params.get("directory") or "").strip()
+        name = (params.get("name") or directory.replace("/", "-")).strip()
+        base = Path("/root/jaxvora-ai/workspace")
+        serve_dir = base / directory
+        if not serve_dir.is_dir():
+            return f"frontend_preview error: directory '{serve_dir}' does not exist"
+
+        # Find free port
+        port = int(params.get("port", 0))
+        if port < 8080 or port > 8099:
+            for i in range(8080, 8100):
+                if i not in [info["port"] for info in APP_REGISTRY.values()]:
+                    port = i
+                    break
+        screen_name = f"preview_{name}"
+        cmd = f"cd {serve_dir} && python3 -m http.server {port} --directory {serve_dir}"
+
+        try:
+            subprocess.run(["screen", "-dmS", screen_name, "bash", "-c", cmd],
+                           capture_output=True, timeout=10)
+        except Exception as e:
+            return f"frontend_preview error: failed to start server: {e}"
+
+        await asyncio.sleep(2)
+
+        info = {
+            "name": name, "port": port, "directory": str(serve_dir),
+            "status": "running", "url": f"/apps/{name}/",
+            "type": "static_preview",
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        APP_REGISTRY[name] = info
+        return f"Serving '{directory}' at https://jaxvora.vercel.app/apps/{name}/ (port {port})"
+
+
+class ServerRunnerTool(MCPTool):
+    def __init__(self):
+        super().__init__("server_runner",
+            "Run any command as a background server and register it in the app proxy. "
+            "params: name (required, app name), command (required, shell command to run), "
+            "directory (optional, working dir under workspace), port (optional, hint). "
+            "Starts the command via screen, detects the listening port, registers it, returns the proxy URL.",
+            risk_level="medium", requires_confirmation=True)
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        name = (params.get("name") or "").strip()
+        command = (params.get("command") or "").strip()
+        if not name or not command:
+            return "server_runner error: 'name' and 'command' are required"
+
+        directory = (params.get("directory") or "").strip()
+        base = Path("/root/jaxvora-ai/workspace")
+        cwd = str(base / directory) if directory else str(base)
+
+        if not Path(cwd).is_dir():
+            return f"server_runner error: directory '{cwd}' does not exist"
+
+        # Find free port
+        port_hint = int(params.get("port", 0))
+        port = port_hint if 8080 <= port_hint <= 8099 else 8080
+        for i in range(8080, 8100):
+            if i not in [info["port"] for info in APP_REGISTRY.values()]:
+                port = i
+                break
+
+        screen_name = f"srv_{name}"
+        full_cmd = f"cd {cwd} && {command}"
+
+        try:
+            subprocess.run(["screen", "-dmS", screen_name, "bash", "-c", full_cmd],
+                           capture_output=True, timeout=10)
+        except Exception as e:
+            return f"server_runner error: failed to start: {e}"
+
+        await asyncio.sleep(2)
+
+        # Detect actual port
+        actual_port = port
+        for try_port in range(8080, 8100):
+            chk = subprocess.run(
+                ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", f"http://127.0.0.1:{try_port}/"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if chk.stdout.strip() in ("200", "301", "302", "308"):
+                actual_port = try_port
+                break
+
+        info = {
+            "name": name, "port": actual_port, "directory": cwd,
+            "status": "running", "url": f"/apps/{name}/",
+            "type": "server",
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        APP_REGISTRY[name] = info
+        return f"Server '{name}' running at https://jaxvora.vercel.app/apps/{name}/ (port {actual_port})"
+
+
 class MCPToolRegistry:
     def __init__(self):
         self._tools: Dict[str, MCPTool] = {}
@@ -5186,6 +5292,8 @@ async def startup():
     tool_registry.register(SocialMediaTool())
     tool_registry.register(CodeRunnerTool())
     tool_registry.register(PlaywrightTool())
+    tool_registry.register(FrontendPreviewTool())
+    tool_registry.register(ServerRunnerTool())
 
     logger.info(f"✓ {len(AGENT_REGISTRY)} agents registered")
     logger.info(f"✓ {len(tool_registry._tools)} MCP tools registered")
