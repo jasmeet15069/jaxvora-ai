@@ -16,7 +16,7 @@ import html
 import sys
 from io import BytesIO
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Callable
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1723,12 +1723,48 @@ class PlaywrightTool(MCPTool):
     SANDBOX = Path("/root/jaxvora-ai/workspace")
 
 
+def _http_health_check(port: int, timeout_s: float = 3) -> Optional[Dict]:
+    """Return dict with http_code, body (truncated) if port responds, else None."""
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "-o", "-", "-w", "\n%{http_code}", f"http://127.0.0.1:{port}/"],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+        parts = r.stdout.strip().rsplit("\n", 1)
+        if len(parts) == 2:
+            body, code = parts
+            return {"http_code": code, "body": body[:500]}
+        return None
+    except Exception:
+        return None
+
+
+def _verify_proxy_url(url_path: str, timeout_s: float = 5) -> Dict:
+    """Check if the jaxvora proxy URL responds with 200 (with retries)."""
+    full = f"http://127.0.0.1:8090{url_path}"
+    for attempt in range(3):
+        try:
+            r = subprocess.run(
+                ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", full],
+                capture_output=True, text=True, timeout=timeout_s,
+            )
+            code = r.stdout.strip()
+            if code in ("200", "301", "302"):
+                return {"status": "PASS", "proxy_url": full, "http_code": code}
+            if attempt < 2:
+                import time; time.sleep(1.5)
+        except Exception:
+            if attempt < 2:
+                import time; time.sleep(1.5)
+    return {"status": "FAIL", "proxy_url": full, "http_code": code if 'code' in dir() else '?'}
+
+
 class FrontendPreviewTool(MCPTool):
     def __init__(self):
         super().__init__("frontend_preview",
             "Serve a directory of static files as a live web preview. "
             "params: directory (path under workspace, e.g. 'my-app/build'), name (preview name), port (optional, auto). "
-            "Starts an HTTP server in the background, registers in the app registry, returns the preview URL.",
+            "Starts an HTTP server in the background and returns a structured verification report.",
             risk_level="low")
 
     async def run(self, params: Dict[str, Any]) -> str:
@@ -1736,97 +1772,270 @@ class FrontendPreviewTool(MCPTool):
         name = (params.get("name") or directory.replace("/", "-")).strip()
         base = Path("/root/jaxvora-ai/workspace")
         serve_dir = base / directory
-        if not serve_dir.is_dir():
-            return f"frontend_preview error: directory '{serve_dir}' does not exist"
+        report: Dict[str, Any] = {"tool": "frontend_preview", "params": params, "checks": []}
 
-        # Find free port
+        def add_check(label: str, status: str, detail: str):
+            report["checks"].append({"check": label, "status": status, "detail": detail})
+
+        # 1. Directory existence
+        if not serve_dir.is_dir():
+            add_check("Directory exists", "FAIL", f"'{serve_dir}' does not exist")
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
+        files = list(serve_dir.iterdir())
+        add_check("Directory exists", "PASS", f"{serve_dir} ({len(files)} entries)")
+
+        # 2. Find free port
         port = int(params.get("port", 0))
         if port < 8080 or port > 8099:
             for i in range(8080, 8100):
                 if i not in [info["port"] for info in APP_REGISTRY.values()]:
                     port = i
                     break
+        add_check("Port selected", "PASS" if port else "FAIL", str(port))
+
+        # 3. Start screen session and capture startup logs
         screen_name = f"preview_{name}"
         cmd = f"cd {serve_dir} && python3 -m http.server {port} --directory {serve_dir}"
-
+        start_logs = ""
         try:
-            subprocess.run(["screen", "-dmS", screen_name, "bash", "-c", cmd],
-                           capture_output=True, timeout=10)
+            r = subprocess.run(["screen", "-dmS", screen_name, "bash", "-c", cmd],
+                               capture_output=True, timeout=10)
+            start_logs += f"screen exit code: {r.returncode}\nstdout: {r.stdout.decode(errors='replace')[:300]}\n"
+            start_logs += f"stderr: {r.stderr.decode(errors='replace')[:300]}"
         except Exception as e:
-            return f"frontend_preview error: failed to start server: {e}"
+            add_check("Screen session start", "FAIL", f"exception: {e}")
+            report["startup_logs"] = start_logs
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
 
+        add_check("Screen session start", "PASS" if r.returncode == 0 else "FAIL",
+                  f"exit_code={r.returncode}")
+        report["startup_logs"] = start_logs
         await asyncio.sleep(2)
 
+        # 4. Verify process alive (screen session exists)
+        screen_check = subprocess.run(["screen", "-ls", screen_name],
+                                      capture_output=True, text=True, timeout=5)
+        pid = None
+        if screen_check.returncode == 0 and screen_name in screen_check.stdout:
+            pid_match = re.search(r'(\d+)\.' + re.escape(screen_name), screen_check.stdout)
+            pid = pid_match.group(1) if pid_match else "unknown"
+            add_check("Process alive", "PASS", f"screen PID {pid}")
+        else:
+            # Try pgrep as fallback
+            pg = subprocess.run(["pgrep", "-f", screen_name], capture_output=True, text=True, timeout=5)
+            if pg.stdout.strip():
+                pid = pg.stdout.strip().split("\n")[0]
+                add_check("Process alive (pgrep)", "PASS", f"PID {pid}")
+            else:
+                add_check("Process alive", "FAIL",
+                          f"screen session '{screen_name}' not found")
+                report["verdict"] = "FAIL"
+                return json.dumps(report, indent=2)
+        report["pid"] = pid
+
+        # 5. Verify port is listening
+        ss_check = subprocess.run(
+            ["ss", "-tlnp"], capture_output=True, text=True, timeout=5
+        )
+        port_listening = f":{port}" in ss_check.stdout
+        add_check("Port listening", "PASS" if port_listening else "FAIL",
+                  f"port {port} {'found' if port_listening else 'not found in ss output'}")
+
+        if not port_listening:
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
+
+        # 6. HTTP health check
+        health = _http_health_check(port, timeout_s=5)
+        if health:
+            http_ok = health["http_code"] in ("200", "301", "302", "308")
+            add_check("HTTP health check", "PASS" if http_ok else "FAIL",
+                      f"HTTP {health['http_code']}, body: {health['body'][:200]}")
+        else:
+            add_check("HTTP health check", "FAIL", "no response from port")
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
+
+        # 7. Register in app registry
         info = {
             "name": name, "port": port, "directory": str(serve_dir),
             "status": "running", "url": f"/apps/{name}/",
-            "type": "static_preview",
+            "type": "static_preview", "pid": pid,
             "registered_at": datetime.now(timezone.utc).isoformat(),
         }
         APP_REGISTRY[name] = info
-        return f"Serving '{directory}' at https://jaxvora.vercel.app/apps/{name}/ (port {port})"
+        add_check("App registry", "PASS", f"registered as '/apps/{name}/'")
+
+        # 8. Proxy URL verification — real check. Run in a worker thread so the
+        # event loop stays free to serve this same server's /apps/ route (a
+        # synchronous self-curl on the loop would deadlock).
+        proxy = await asyncio.to_thread(_verify_proxy_url, f"/apps/{name}/")
+        add_check("Proxy URL verification", proxy["status"],
+                  f"GET {proxy['proxy_url']} -> HTTP {proxy.get('http_code', '?')}")
+        if proxy["status"] != "PASS":
+            report["verdict"] = "FAIL"
+            report["reason"] = (
+                f"proxy route /apps/{name}/ did not respond "
+                f"(HTTP {proxy.get('http_code', '?')})"
+            )
+            return json.dumps(report, indent=2)
+
+        fails = [c for c in report["checks"] if c["status"] == "FAIL"]
+        report["verdict"] = "PASS" if not fails else "FAIL"
+        report["preview_url"] = f"https://jaxvora.vercel.app/apps/{name}/"
+        return json.dumps(report, indent=2)
 
 
 class ServerRunnerTool(MCPTool):
     def __init__(self):
         super().__init__("server_runner",
             "Run any command as a background server and register it in the app proxy. "
-            "params: name (required, app name), command (required, shell command to run), "
-            "directory (optional, working dir under workspace), port (optional, hint). "
-            "Starts the command via screen, detects the listening port, registers it, returns the proxy URL.",
+            "params: name (required), command (required), directory (optional), port (optional). "
+            "Returns a structured verification report with PASS/FAIL per step.",
             risk_level="medium", requires_confirmation=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
         name = (params.get("name") or "").strip()
         command = (params.get("command") or "").strip()
+        report: Dict[str, Any] = {"tool": "server_runner", "params": params, "checks": []}
+
+        def add_check(label: str, status: str, detail: str):
+            report["checks"].append({"check": label, "status": status, "detail": detail})
+
         if not name or not command:
-            return "server_runner error: 'name' and 'command' are required"
+            add_check("Parameters", "FAIL", "name and command are required")
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
 
         directory = (params.get("directory") or "").strip()
         base = Path("/root/jaxvora-ai/workspace")
         cwd = str(base / directory) if directory else str(base)
 
         if not Path(cwd).is_dir():
-            return f"server_runner error: directory '{cwd}' does not exist"
+            add_check("Directory exists", "FAIL", f"'{cwd}' does not exist")
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
+        add_check("Directory exists", "PASS", cwd)
 
-        # Find free port
+        # 1. Find free port
         port_hint = int(params.get("port", 0))
         port = port_hint if 8080 <= port_hint <= 8099 else 8080
         for i in range(8080, 8100):
             if i not in [info["port"] for info in APP_REGISTRY.values()]:
                 port = i
                 break
+        add_check("Port selected", "PASS", str(port))
 
+        # 2. Start screen session
         screen_name = f"srv_{name}"
         full_cmd = f"cd {cwd} && {command}"
-
+        start_logs = ""
         try:
-            subprocess.run(["screen", "-dmS", screen_name, "bash", "-c", full_cmd],
-                           capture_output=True, timeout=10)
+            r = subprocess.run(["screen", "-dmS", screen_name, "bash", "-c", full_cmd],
+                               capture_output=True, timeout=10)
+            start_logs += f"screen exit code: {r.returncode}\n"
+            start_logs += f"stdout: {r.stdout.decode(errors='replace')[:300]}\n"
+            start_logs += f"stderr: {r.stderr.decode(errors='replace')[:300]}"
         except Exception as e:
-            return f"server_runner error: failed to start: {e}"
+            add_check("Screen session start", "FAIL", f"exception: {e}")
+            report["startup_logs"] = start_logs
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
 
+        add_check("Screen session start", "PASS" if r.returncode == 0 else "FAIL",
+                  f"exit_code={r.returncode}")
+        report["startup_logs"] = start_logs
         await asyncio.sleep(2)
 
-        # Detect actual port
+        # 3. Verify process alive
+        screen_check = subprocess.run(["screen", "-ls", screen_name],
+                                      capture_output=True, text=True, timeout=5)
+        pid = None
+        if screen_check.returncode == 0 and screen_name in screen_check.stdout:
+            pid_match = re.search(r'(\d+)\.' + re.escape(screen_name), screen_check.stdout)
+            pid = pid_match.group(1) if pid_match else "unknown"
+            add_check("Process alive", "PASS", f"screen PID {pid}")
+        else:
+            pg = subprocess.run(["pgrep", "-f", screen_name], capture_output=True, text=True, timeout=5)
+            if pg.stdout.strip():
+                pid = pg.stdout.strip().split("\n")[0]
+                add_check("Process alive (pgrep)", "PASS", f"PID {pid}")
+            else:
+                add_check("Process alive", "FAIL",
+                          f"screen session '{screen_name}' not found")
+                report["verdict"] = "FAIL"
+                return json.dumps(report, indent=2)
+        report["pid"] = pid
+
+        # 4. Detect actual listening port
         actual_port = port
+        ports_found = []
         for try_port in range(8080, 8100):
             chk = subprocess.run(
                 ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", f"http://127.0.0.1:{try_port}/"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=3,
             )
-            if chk.stdout.strip() in ("200", "301", "302", "308"):
-                actual_port = try_port
-                break
+            code = chk.stdout.strip()
+            if code in ("200", "301", "302", "308"):
+                ports_found.append(try_port)
+                if actual_port == port:
+                    actual_port = try_port
+                    break
 
+        if not ports_found:
+            add_check("Port detection", "FAIL",
+                      "no listening port found in range 8080-8099")
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
+
+        # Also verify via ss
+        ss_check = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True, timeout=5)
+        port_confirmed = f":{actual_port}" in ss_check.stdout
+        add_check("Port listening", "PASS" if port_confirmed else "WARN",
+                  f"port {actual_port} detected (HTTP{' ' if port_confirmed else ' but ss disagrees'})")
+        report["detected_ports"] = ports_found
+
+        # 5. HTTP health check on detected port
+        health = _http_health_check(actual_port, timeout_s=5)
+        if health:
+            http_ok = health["http_code"] in ("200", "301", "302", "308")
+            add_check("HTTP health check", "PASS" if http_ok else "FAIL",
+                      f"HTTP {health['http_code']}, body: {health['body'][:200]}")
+        else:
+            add_check("HTTP health check", "FAIL", "no response from port")
+            report["verdict"] = "FAIL"
+            return json.dumps(report, indent=2)
+
+        # 6. Register in app registry
         info = {
             "name": name, "port": actual_port, "directory": cwd,
             "status": "running", "url": f"/apps/{name}/",
-            "type": "server",
+            "type": "server", "pid": pid,
             "registered_at": datetime.now(timezone.utc).isoformat(),
         }
         APP_REGISTRY[name] = info
-        return f"Server '{name}' running at https://jaxvora.vercel.app/apps/{name}/ (port {actual_port})"
+        add_check("App registry", "PASS", f"registered as '/apps/{name}/'")
+
+        # 7. Proxy URL verification — real check via a worker thread so the event
+        # loop stays free to serve this server's own /apps/ route (no deadlock).
+        proxy = await asyncio.to_thread(_verify_proxy_url, f"/apps/{name}/")
+        add_check("Proxy URL verification", proxy["status"],
+                  f"GET {proxy['proxy_url']} -> HTTP {proxy.get('http_code', '?')}")
+        if proxy["status"] != "PASS":
+            report["verdict"] = "FAIL"
+            report["reason"] = (
+                f"proxy route /apps/{name}/ did not respond "
+                f"(HTTP {proxy.get('http_code', '?')})"
+            )
+            return json.dumps(report, indent=2)
+
+        fails = [c for c in report["checks"] if c["status"] == "FAIL"]
+        report["verdict"] = "PASS" if not fails else "FAIL"
+        report["preview_url"] = f"https://jaxvora.vercel.app/apps/{name}/"
+
+        return json.dumps(report, indent=2)
 
 
 class MCPToolRegistry:
@@ -2372,8 +2581,10 @@ class BaseAgent:
 
 class AgentGraphState:
     """State for the THINK→ACT→OBSERVE→REFLECT loop (v1.0 protocol)."""
-    def __init__(self, task: str, system_prompt: str, max_iterations: int = 8):
+    def __init__(self, task: str, system_prompt: str, max_iterations: int = 8,
+                 cancel_flag: Optional[Callable[[], bool]] = None):
         self.task = task
+        self._cancel_flag = cancel_flag
         self.system_prompt = system_prompt
         self.messages: List[Dict[str, str]] = []
         self.tool_results: List[Dict[str, Any]] = []
@@ -2652,6 +2863,10 @@ Rules:
 
         for iteration in range(state.iteration, max_iterations):
             state.iteration = iteration
+            if getattr(state, '_cancel_flag', None) and state._cancel_flag():
+                state.final_output = "The task was cancelled by the user."
+                state.add_step("final", agent.name, "Cancelled by user", state.final_output[:500])
+                return state.final_output
 
             # ── THINK ──
             think_prompt = (
@@ -2748,7 +2963,10 @@ Rules:
                                 timeout=timeout_s,
                             )
                         except asyncio.TimeoutError:
-                            invoke_result = f"[AgentInvokeTool] {agent_name} timed out after {int(timeout_s)}s."
+                            invoke_result = (
+                                f"[AgentInvokeTool] {agent_name}: TIMED OUT after {int(timeout_s)}s "
+                                f"— Verification Incomplete (no success claimed)."
+                            )
                         except Exception as exc:
                             invoke_result = f"[AgentInvokeTool] {agent_name} failed: {exc}"
                     return dispatch, agent_name, invoke_result
@@ -3704,7 +3922,8 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
 
     async def process(self, user_input: str, stream_fn=None,
                       admin_token: Optional[str] = None,
-                      confirmation_response: Optional[str] = None) -> Dict:
+                      confirmation_response: Optional[str] = None,
+                      cancel_flag: Optional[Callable[[], bool]] = None) -> Dict:
         # Check if this is a confirmation response
         if confirmation_response and user_input.startswith("__CONFIRM_RESUME__:"):
             parts = user_input.split(":", 2)
@@ -3754,9 +3973,21 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         if _enhanced_input != user_input:
             logger.info(f"Prompt enhanced: {len(user_input)}→{len(_enhanced_input)} chars")
 
+        # Stop requested before we even start
+        if cancel_flag and cancel_flag():
+            return {
+                "plan": "Cancelled before execution",
+                "agents": [],
+                "response": "The request was cancelled before the TAOR loop began.",
+                "results": [],
+                "steps": [],
+                "organization": {"mode": "taor_v1", "cancelled": True},
+            }
+
         # ── TAOR Loop ──
         try:
-            _taor_state = AgentGraphState(_enhanced_input, self.SYSTEM, max_iterations=8)
+            _taor_state = AgentGraphState(_enhanced_input, self.SYSTEM, max_iterations=8,
+                                          cancel_flag=cancel_flag)
             _taor_state.add_message("user", _enhanced_input)
             loop_output = await AgentWorkflow.run(
                 ToolCallingAgent(
@@ -4049,6 +4280,38 @@ async def app_unregister(name: str):
     return {"ok": True, "deleted": name}
 
 
+@app.post("/apps/{name}/stop")
+async def app_stop(name: str):
+    info = APP_REGISTRY.get(name)
+    parts = []
+    if info:
+        port = info.get("port")
+        if port:
+            # Kill process on port
+            subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5)
+            parts.append(f"killed port {port}")
+        del APP_REGISTRY[name]
+        parts.append("deregistered")
+
+    # Kill matching screen session
+    for candidate in list(APP_REGISTRY.keys()) + [name]:
+        screen_name = candidate.replace(".", "_").replace("/", "_")
+        r = subprocess.run(["screen", "-S", screen_name, "-X", "quit"],
+                           capture_output=True, timeout=5)
+        if r.returncode == 0:
+            parts.append(f"screen '{candidate}' stopped")
+    # Also try exact name as screen name
+    screen_name = name.replace(".", "_").replace("/", "_")
+    subprocess.run(["screen", "-S", screen_name, "-X", "quit"], capture_output=True, timeout=5)
+
+    # Kill any lingering process
+    subprocess.run(["pkill", "-f", name], capture_output=True, timeout=5)
+
+    if not parts:
+        return {"ok": False, "error": f"No running app or process found for '{name}'"}
+    return {"ok": True, "stopped": name, "actions": parts}
+
+
 @app.api_route("/apps/{name}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def app_proxy_root(request: Request, name: str):
     return await _proxy_to_app(request, name, "")
@@ -4209,18 +4472,31 @@ async def chat(req: ChatRequest):
 
 
 async def _run_project(project: str) -> Dict[str, Any]:
-    """Build and start a workspace project, return app info."""
+    """Build and start a workspace project. Returns structured verification report."""
     base = WORKSPACE_DIR.resolve() / project
+    report: Dict[str, Any] = {"project": project, "checks": []}
+
+    def add_check(label: str, status: str, detail: str):
+        report["checks"].append({"check": label, "status": status, "detail": detail})
+
     if not base.is_dir():
-        return {"ok": False, "error": f"Project '{project}' not found in workspace"}
+        add_check("Project directory", "FAIL", f"'{project}' not found in workspace")
+        report["verdict"] = "FAIL"
+        return report
+
+    files = list(base.iterdir())
+    add_check("Project directory", "PASS", f"{base} ({len(files)} entries)")
 
     # Detect project type
     has_main_go = (base / "main.go").is_file()
     has_package_json = (base / "package.json").is_file()
     has_main_py = (base / "main.py").is_file() or (base / "app.py").is_file()
     has_index_html = (base / "index.html").is_file() or (base / "static" / "index.html").is_file()
-    binary_path = base / project  # Go binary named after project
+    binary_path = base / project
     static_dir = base / "static"
+
+    project_type = "go" if has_main_go else "python" if has_main_py else "node" if has_package_json else "static"
+    add_check("Project type", "PASS", project_type)
 
     # Kill old screen session
     screen_name = project.replace(".", "_").replace("/", "_")
@@ -4232,70 +4508,158 @@ async def _run_project(project: str) -> Dict[str, Any]:
         if i not in [info["port"] for info in APP_REGISTRY.values()]:
             port = i
             break
+    add_check("Port selected", "PASS", str(port))
 
+    build_logs = ""
     cmd = ""
     cwd = str(base)
 
     if has_main_go and binary_path.exists():
-        # Go binary already built
         cmd = f"cd {cwd} && ./{project}"
+        add_check("Build", "PASS", "binary already exists, skipping build")
     elif has_main_go:
-        # Build Go binary first
-        ret = subprocess.run(["go", "build", "-o", project, "."], capture_output=True, text=True, timeout=60, cwd=cwd)
+        ret = subprocess.run(
+            ["go", "build", "-o", project, "."],
+            capture_output=True, text=True, timeout=60, cwd=cwd,
+        )
+        build_logs = f"exit_code={ret.returncode}\nstdout: {ret.stdout[:500]}\nstderr: {ret.stderr[:500]}"
         if ret.returncode != 0:
-            return {"ok": False, "error": f"Go build failed: {ret.stderr[:500]}"}
+            add_check("Build", "FAIL", f"Go build failed (code {ret.returncode}): {ret.stderr[:300]}")
+            report["build_logs"] = build_logs
+            report["verdict"] = "FAIL"
+            return report
         cmd = f"cd {cwd} && ./{project}"
+        add_check("Build", "PASS", "Go build succeeded")
     elif has_main_py:
         py_file = "main.py" if (base / "main.py").is_file() else "app.py"
         cmd = f"cd {cwd} && python3 {py_file}"
+        add_check("Build", "PASS", "Python — no build required")
     elif has_package_json:
         cmd = f"cd {cwd} && node server.js"
+        add_check("Build", "PASS", "Node.js — no build required")
     elif has_index_html:
         static_path = static_dir if static_dir.is_dir() else base
         cmd = f"cd {cwd} && python3 -m http.server {port} --directory {static_path}"
+        add_check("Build", "PASS", "Static — no build required")
     else:
-        return {"ok": False, "error": f"Cannot determine how to run '{project}'"}
+        add_check("Build", "FAIL", "Cannot determine how to run this project")
+        report["verdict"] = "FAIL"
+        return report
+
+    report["run_command"] = cmd
+    report["build_logs"] = build_logs
 
     # Start in screen
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["screen", "-dmS", screen_name, "bash", "-c", cmd],
             capture_output=True, timeout=10,
         )
+        if r.returncode != 0:
+            add_check("Screen session start", "FAIL",
+                      f"exit_code={r.returncode}, stderr: {r.stderr.decode(errors='replace')[:200]}")
+            report["verdict"] = "FAIL"
+            return report
     except Exception as e:
-        return {"ok": False, "error": f"Failed to start: {e}"}
+        add_check("Screen session start", "FAIL", f"exception: {e}")
+        report["verdict"] = "FAIL"
+        return report
+    add_check("Screen session start", "PASS", "screen -dmS succeeded")
 
     await asyncio.sleep(2)
 
-    # Detect actual port the process is listening on (binary may use hardcoded port)
+    # Verify process alive
+    screen_check = subprocess.run(["screen", "-ls", screen_name],
+                                  capture_output=True, text=True, timeout=5)
+    pid = None
+    if screen_check.returncode == 0 and screen_name in screen_check.stdout:
+        pid_match = re.search(r'(\d+)\.' + re.escape(screen_name), screen_check.stdout)
+        pid = pid_match.group(1) if pid_match else "unknown"
+        add_check("Process alive", "PASS", f"screen PID {pid}")
+    else:
+        pg = subprocess.run(["pgrep", "-f", screen_name], capture_output=True, text=True, timeout=5)
+        if pg.stdout.strip():
+            pid = pg.stdout.strip().split("\n")[0]
+            add_check("Process alive (pgrep)", "PASS", f"PID {pid}")
+        else:
+            add_check("Process alive", "FAIL", f"screen session '{screen_name}' not found")
+            report["verdict"] = "FAIL"
+            return report
+    report["pid"] = pid
+
+    # Detect actual listening port
     actual_port = port
+    ports_found = []
     for try_port in range(8080, 8100):
         chk = subprocess.run(
             ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", f"http://127.0.0.1:{try_port}/"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=3,
         )
-        if chk.stdout.strip() in ("200", "301", "302", "308"):
-            actual_port = try_port
-            break
+        code = chk.stdout.strip()
+        if code in ("200", "301", "302", "308"):
+            ports_found.append(try_port)
+            if actual_port == port:
+                actual_port = try_port
+                break
+
+    if not ports_found:
+        add_check("Port detection", "FAIL", "no listening port found in range 8080-8099")
+        report["verdict"] = "FAIL"
+        return report
+
+    ss_check = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True, timeout=5)
+    port_confirmed = f":{actual_port}" in ss_check.stdout
+    add_check("Port listening", "PASS" if port_confirmed else "WARN",
+              f"port {actual_port} detected via HTTP, ss {'agrees' if port_confirmed else 'disagrees'}")
+
+    # HTTP health check
+    health = _http_health_check(actual_port, timeout_s=5)
+    if health:
+        http_ok = health["http_code"] in ("200", "301", "302", "308")
+        add_check("HTTP health check", "PASS" if http_ok else "FAIL",
+                  f"HTTP {health['http_code']}, body: {health['body'][:200]}")
+    else:
+        add_check("HTTP health check", "FAIL", "no response from port")
+        report["verdict"] = "FAIL"
+        return report
 
     info = {
         "name": project, "port": actual_port, "directory": project,
-        "status": "running",
-        "url": f"/apps/{project}/",
-        "type": "go" if has_main_go else "python" if has_main_py else "node" if has_package_json else "static",
+        "status": "running", "url": f"/apps/{project}/",
+        "type": project_type, "pid": pid,
         "registered_at": datetime.now(timezone.utc).isoformat(),
     }
     APP_REGISTRY[project] = info
+    add_check("App registry", "PASS", f"registered as '/apps/{project}/'")
 
-    return {"ok": True, "app": info, "url": f"https://jaxvora.vercel.app/apps/{project}/"}
+    # Verify proxy URL — real check via a worker thread so the event loop stays
+    # free to serve this server's own /apps/ route (a sync self-curl deadlocks).
+    proxy = await asyncio.to_thread(_verify_proxy_url, f"/apps/{project}/")
+    add_check("Proxy URL verification", proxy["status"],
+              f"GET {proxy['proxy_url']} -> HTTP {proxy.get('http_code', '?')}")
+    if proxy["status"] != "PASS":
+        report["verdict"] = "FAIL"
+        report["reason"] = (
+            f"proxy route /apps/{project}/ did not respond "
+            f"(HTTP {proxy.get('http_code', '?')})"
+        )
+        return {"ok": False, "report": report}
+
+    fails = [c for c in report["checks"] if c["status"] == "FAIL"]
+    report["verdict"] = "PASS" if not fails else "FAIL"
+    report["preview_url"] = f"https://jaxvora.vercel.app/apps/{project}/"
+
+    return {"ok": report["verdict"] == "PASS", "report": report}
 
 
 @app.post("/run/{name}")
 async def run_project(name: str):
     result = await _run_project(name)
-    if result.get("ok"):
-        return result
-    return JSONResponse(status_code=400, content=result)
+    if result.get("report"):
+        report = result["report"]
+        status = 200 if report.get("verdict") == "PASS" else 400
+        return JSONResponse(content=report, status_code=status)
+    return JSONResponse(content=result, status_code=400)
 
 
 # ── Async chat jobs ───────────────────────────────────────────────────────────
@@ -4319,7 +4683,13 @@ async def _run_chat_job(job_id: str, message: str, admin_token: Optional[str]):
     if job is None:
         return
     try:
-        result = await orchestrator.process(message, admin_token=admin_token)
+        # Check if cancelled before starting
+        if job.get("cancel"):
+            job["status"] = "cancelled"
+            job["response"] = "Cancelled by user."
+            return
+        result = await orchestrator.process(message, admin_token=admin_token,
+                                            cancel_flag=lambda: job.get("cancel", False))
         if isinstance(result, dict):
             job["result"] = result
             job["response"] = result.get("response", "")
@@ -4327,7 +4697,10 @@ async def _run_chat_job(job_id: str, message: str, admin_token: Optional[str]):
         else:
             job["result"] = {"response": str(result)}
             job["response"] = str(result)
-        job["status"] = "done"
+        job["status"] = "cancelled" if job.get("cancel") else "done"
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
+        job["response"] = "Cancelled by user."
     except Exception as e:
         logger.error(f"Chat job {job_id} failed: {e}", exc_info=True)
         job["status"] = "error"
@@ -4358,7 +4731,7 @@ async def chat_poll(job_id: str):
         for a in AGENT_REGISTRY.values() if a._status in ("running", "error")
     ]
     out: Dict[str, Any] = {"status": job["status"], "working": working}
-    if job["status"] == "done":
+    if job["status"] in ("done", "cancelled"):
         out["response"] = job.get("response", "")
         out["agents"] = job.get("agents", [])
         out["result"] = job.get("result", {})
@@ -4366,6 +4739,24 @@ async def chat_poll(job_id: str):
     elif job["status"] == "error":
         out["error"] = job.get("error", "Request failed.")
     return out
+
+
+@app.post("/chat/stop/{job_id}")
+async def chat_stop(job_id: str):
+    job = CHAT_JOBS.get(job_id)
+    if job is None:
+        return {"ok": False, "error": "Job not found"}
+    if job["status"] != "running":
+        return {"ok": False, "error": f"Job is {job['status']}, not running"}
+    job["cancel"] = True
+    job["status"] = "cancelled"
+    job["response"] = "Cancelled by user."
+    # Kill all running agents
+    for a in AGENT_REGISTRY.values():
+        if a._status == "running":
+            a._status = "idle"
+            a._current_task = ""
+    return {"ok": True, "stopped": job_id}
 
 
 @app.get("/agents")
