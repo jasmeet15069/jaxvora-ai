@@ -2174,18 +2174,47 @@ Rules:
                     state.add_message("system", "Continue. Output a <think> block followed by <dispatch> or <mcp_call>, or <reflect> with <finalize>.")
                     continue
 
-            # Execute agent dispatches
-            for dispatch in dispatches:
-                agent_name = dispatch.get("agent", "")
-                instruction = dispatch.get("instruction", task)
-                context = dispatch.get("context", "")
-                timeout = dispatch.get("timeout_seconds", 120)
-                full_task = f"{context}\n\n{instruction}" if context else instruction
-                state.add_message("system", f"Dispatching to {agent_name}...")
-                invoke_result = await tool_registry.run("agent_invoke", {"name": agent_name, "task": full_task})
-                status = "error" if invoke_result.startswith("[AgentInvokeTool]") else "success"
-                state.tool_results.append({"tool": f"dispatch:{agent_name}", "params": dispatch, "result": invoke_result, "status": status})
-                state.add_message("system", f"{agent_name} result:\n{invoke_result[:1000]}")
+            # Execute agent dispatches — IN PARALLEL. The Chief can fan out to
+            # several agents in one iteration; they run concurrently (bounded by
+            # MAX_PARALLEL_AGENTS) so the Agent Flow graph shows real parallelism.
+            if dispatches:
+                _dispatch_sem = asyncio.Semaphore(MAX_PARALLEL_AGENTS)
+
+                async def _run_dispatch(dispatch):
+                    agent_name = dispatch.get("agent", "")
+                    instruction = dispatch.get("instruction", task)
+                    context = dispatch.get("context", "")
+                    full_task = f"{context}\n\n{instruction}" if context else instruction
+                    try:
+                        timeout_s = float(dispatch.get("timeout_seconds", 120) or 120)
+                    except (TypeError, ValueError):
+                        timeout_s = 120.0
+                    timeout_s = max(10.0, min(timeout_s, 180.0))
+                    async with _dispatch_sem:
+                        try:
+                            invoke_result = await asyncio.wait_for(
+                                tool_registry.run("agent_invoke", {"name": agent_name, "task": full_task}),
+                                timeout=timeout_s,
+                            )
+                        except asyncio.TimeoutError:
+                            invoke_result = f"[AgentInvokeTool] {agent_name} timed out after {int(timeout_s)}s."
+                        except Exception as exc:
+                            invoke_result = f"[AgentInvokeTool] {agent_name} failed: {exc}"
+                    return dispatch, agent_name, invoke_result
+
+                for dispatch in dispatches:
+                    state.add_message("system", f"Dispatching to {dispatch.get('agent', '')}...")
+                dispatch_results = await asyncio.gather(
+                    *[_run_dispatch(d) for d in dispatches], return_exceptions=True
+                )
+                for item in dispatch_results:
+                    if isinstance(item, Exception):
+                        state.add_message("system", f"Dispatch error: {item}")
+                        continue
+                    dispatch, agent_name, invoke_result = item
+                    status = "error" if invoke_result.startswith("[AgentInvokeTool]") else "success"
+                    state.tool_results.append({"tool": f"dispatch:{agent_name}", "params": dispatch, "result": invoke_result, "status": status})
+                    state.add_message("system", f"{agent_name} result:\n{invoke_result[:1000]}")
 
             # Execute MCP calls
             for call in mcp_calls:
@@ -3527,8 +3556,86 @@ async def frontend():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    result = await orchestrator.process(req.message, admin_token=req.admin_token)
-    return result
+    """Synchronous chat (kept for compatibility). Always returns JSON, never a
+    raw 500, so clients never hit a JSON-parse error on failure."""
+    try:
+        return await orchestrator.process(req.message, admin_token=req.admin_token)
+    except Exception as e:
+        logger.error(f"/chat failed: {e}", exc_info=True)
+        return JSONResponse(status_code=200, content={
+            "plan": "error", "agents": [], "results": [],
+            "response": "The request could not be completed right now. Please try again.",
+            "organization": {"mode": "error"},
+        })
+
+
+# ── Async chat jobs ───────────────────────────────────────────────────────────
+# A long multi-agent run can exceed an upstream proxy's response timeout (e.g. the
+# Vercel rewrite), which would return a non-JSON error page. /chat/start launches
+# the run in the background and returns immediately; the client polls /chat/poll,
+# which also reports the agents currently working so the flow graph stays live.
+CHAT_JOBS: Dict[str, Dict[str, Any]] = {}
+CHAT_JOBS_MAX = 200
+
+
+def _prune_chat_jobs():
+    if len(CHAT_JOBS) <= CHAT_JOBS_MAX:
+        return
+    for jid, _ in sorted(CHAT_JOBS.items(), key=lambda kv: kv[1].get("created", 0))[: len(CHAT_JOBS) - CHAT_JOBS_MAX]:
+        CHAT_JOBS.pop(jid, None)
+
+
+async def _run_chat_job(job_id: str, message: str, admin_token: Optional[str]):
+    job = CHAT_JOBS.get(job_id)
+    if job is None:
+        return
+    try:
+        result = await orchestrator.process(message, admin_token=admin_token)
+        if isinstance(result, dict):
+            job["result"] = result
+            job["response"] = result.get("response", "")
+            job["agents"] = result.get("agents", []) or []
+        else:
+            job["result"] = {"response": str(result)}
+            job["response"] = str(result)
+        job["status"] = "done"
+    except Exception as e:
+        logger.error(f"Chat job {job_id} failed: {e}", exc_info=True)
+        job["status"] = "error"
+        job["error"] = "The request could not be completed right now. Please try again."
+    finally:
+        job["finished"] = datetime.now(timezone.utc).timestamp()
+
+
+@app.post("/chat/start")
+async def chat_start(req: ChatRequest):
+    _prune_chat_jobs()
+    job_id = str(uuid.uuid4())
+    CHAT_JOBS[job_id] = {
+        "status": "running", "response": None, "error": None, "agents": [],
+        "created": datetime.now(timezone.utc).timestamp(),
+    }
+    asyncio.create_task(_run_chat_job(job_id, req.message, req.admin_token))
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/chat/poll/{job_id}")
+async def chat_poll(job_id: str):
+    job = CHAT_JOBS.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"status": "not_found", "error": "Unknown or expired job."})
+    working = [
+        {"name": a.name, "division": a.division, "status": a._status, "task": a._current_task}
+        for a in AGENT_REGISTRY.values() if a._status in ("running", "error")
+    ]
+    out: Dict[str, Any] = {"status": job["status"], "working": working}
+    if job["status"] == "done":
+        out["response"] = job.get("response", "")
+        out["agents"] = job.get("agents", [])
+        out["result"] = job.get("result", {})
+    elif job["status"] == "error":
+        out["error"] = job.get("error", "Request failed.")
+    return out
 
 
 @app.get("/agents")
@@ -3733,12 +3840,28 @@ async def rag_status():
 
 @app.delete("/rag/documents/{doc_id}")
 async def rag_delete_document(doc_id: str):
-    """Delete a RAG document chunk."""
+    """Delete a single RAG document chunk by id."""
     try:
         await db_execute("DELETE FROM rag_documents WHERE id = $1::uuid", doc_id)
         rag_engine._index.pop(doc_id, None)
         return {"ok": True}
     except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.delete("/rag/source")
+async def rag_delete_source(source: str = Query(...)):
+    """Delete an entire knowledge-base file (all chunks sharing a source)."""
+    if db_pool is None:
+        return {"ok": False, "error": "Database unavailable."}
+    try:
+        rows = await db_fetch("SELECT id FROM rag_documents WHERE source = $1", source)
+        await db_execute("DELETE FROM rag_documents WHERE source = $1", source)
+        for r in rows:
+            rag_engine._index.pop(str(r["id"]), None)
+        return {"ok": True, "deleted": len(rows), "source": source}
+    except Exception as e:
+        logger.error(f"/rag/source delete failed: {e}", exc_info=True)
         return {"ok": False, "error": str(e)}
 
 

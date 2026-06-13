@@ -1478,30 +1478,72 @@ Error: ${attachedFile.error || 'Text extraction failed.'}`;
   const chatPayload = { message: fullMsg };
   if (adminToken) chatPayload.admin_token = adminToken;
 
-  const handleChatResponse = (d) => {
-    removeThinking();
-    appendMsg('bot', d.response, d.agents);
-    updateRsAgentStatus('Chief Orchestrator', 'running', 'Response ready');
-    const involved = d.agents && d.agents.length ? d.agents : ['Chief Orchestrator'];
-    involved.forEach(name => updateRsAgentStatus(name, 'running', '⚡'));
-    setTimeout(() => {
-      involved.forEach(name => updateRsAgentStatus(name, 'idle', ''));
-      updateRsAgentStatus('Chief Orchestrator', 'idle', '');
-    }, 3000);
-  };
   updateRsAgentStatus('Chief Orchestrator', 'running', 'Thinking...');
+  startFlowFastPoll();
+  runChatJob(chatPayload);
+}
 
-  if (chatWs && chatWs.readyState === 1) {
-    try { chatWs.send(JSON.stringify(chatPayload)); } catch (e) {
-      fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload) })
-        .then(r => r.json()).then(handleChatResponse)
-        .catch(err => { removeThinking(); appendMsg('bot', 'Error: ' + err); });
+// Robust JSON fetch — never throws on a non-JSON body (e.g. a proxy error page),
+// which is what produced the "Unexpected token 'A'" parse error before.
+async function safeFetchJson(url, opts) {
+  const r = await fetch(url, opts);
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+  if (!r.ok && !data) throw new Error('Server returned ' + r.status + ' ' + (r.statusText || ''));
+  return { ok: r.ok, status: r.status, data };
+}
+
+// While a chat is running, poll /agents quickly so the flow graph shows agents
+// working in parallel in near-realtime (also covers the Vercel frontend, where
+// WebSocket upgrades are unavailable).
+let flowFastTimer = null;
+function startFlowFastPoll() { if (!flowFastTimer) flowFastTimer = setInterval(loadAgents, 1200); }
+function stopFlowFastPoll() { if (flowFastTimer) { clearInterval(flowFastTimer); flowFastTimer = null; } }
+
+// Run a chat via the async job model: start returns immediately (no proxy
+// timeout), then poll until done. Falls back to the synchronous /chat endpoint.
+async function runChatJob(chatPayload) {
+  const finish = (render) => { removeThinking(); stopFlowFastPoll(); render(); };
+  try {
+    const started = await safeFetchJson('/chat/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload),
+    });
+    const jobId = started.data && started.data.job_id;
+    if (!jobId) return legacyChat(chatPayload, finish);
+
+    const deadline = Date.now() + 240000; // 4-minute hard cap
+    while (Date.now() < deadline) {
+      await new Promise(res => setTimeout(res, 900));
+      let poll;
+      try { poll = await safeFetchJson('/chat/poll/' + encodeURIComponent(jobId)); }
+      catch (_) { continue; } // transient hiccup — keep polling
+      const d = poll.data || {};
+      if (d.status === 'done') {
+        return finish(() => { appendMsg('bot', d.response || '(no response)', d.agents); flowSettle(d.agents); });
+      }
+      if (d.status === 'error') {
+        return finish(() => { appendMsg('bot', d.error || 'The request failed. Please try again.'); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
+      }
+      if (d.status === 'not_found') {
+        return finish(() => { appendMsg('bot', 'The request expired. Please try again.'); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
+      }
     }
-  } else {
-    fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload) })
-      .then(r => r.json()).then(handleChatResponse)
-      .catch(err => { removeThinking(); appendMsg('bot', 'Error: ' + err); });
+    return finish(() => { appendMsg('bot', 'This request is taking longer than expected — please try again.'); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
+  } catch (err) {
+    return finish(() => { appendMsg('bot', 'Error: ' + (err && err.message ? err.message : err)); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
   }
+}
+
+function legacyChat(chatPayload, finish) {
+  return safeFetchJson('/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload),
+  }).then(res => {
+    const d = res.data || {};
+    finish(() => { appendMsg('bot', d.response || 'The request could not be completed.', d.agents); flowSettle(d.agents); });
+  }).catch(err => {
+    finish(() => { appendMsg('bot', 'Error: ' + (err && err.message ? err.message : err)); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
+  });
 }
 
 function sendChip(msg) {
@@ -1657,6 +1699,7 @@ function clearLogs() {
 // ── Agents ─────────────────────────────────────────────────────────────────
 function renderAgents(agents) {
   latestAgents = Array.isArray(agents) ? agents : [];
+  flowSyncFromAgents(latestAgents); // keep the flow graph live on every poll
   const grid = document.getElementById('agent-grid');
   if (!grid) {
     updateDashboardRings();
@@ -1681,7 +1724,6 @@ function renderAgents(agents) {
     grid.appendChild(card);
   });
   updateDashboardRings();
-  flowSyncFromAgents(latestAgents);
 }
 
 async function loadOrganization() {
@@ -2631,11 +2673,12 @@ async function loadKnowledge() {
     if (list && data.sources && data.sources.length) {
       list.innerHTML = data.sources.map(s => {
         const date = s.last_added ? new Date(s.last_added + 'Z').toLocaleDateString() : 'unknown';
-        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">
-          <div>
-            <div style="color:var(--text);font-weight:500">${esc(s.source)}</div>
+        return `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div style="min-width:0">
+            <div style="color:var(--text);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.source)}</div>
             <div style="font-size:11px;color:var(--text3)">${s.chunks} chunks &middot; ${date}</div>
           </div>
+          <button class="kb-del-btn" title="Delete this file from the knowledge base" onclick="deleteKbSource('${encodeURIComponent(s.source)}')" style="flex-shrink:0;background:transparent;border:1px solid var(--border);color:var(--text2);border-radius:8px;padding:4px 10px;font-size:11px;font-family:var(--mono);cursor:pointer">🗑 Delete</button>
         </div>`;
       }).join('');
     } else if (list) {
@@ -2668,6 +2711,23 @@ async function loadKnowledge() {
   } catch (e) {
     if (list) list.innerHTML = `<div style="color:var(--red)">Failed to load RAG status: ${esc(e.message)}</div>`;
     if (sourcesInfo) sourcesInfo.innerHTML = `<div style="color:var(--red)">Failed to load sources: ${esc(e.message)}</div>`;
+  }
+}
+
+async function deleteKbSource(encSource) {
+  const source = decodeURIComponent(encSource);
+  if (!confirm('Delete "' + source + '" and all of its chunks from the knowledge base?\n\nThis cannot be undone.')) return;
+  const btns = document.querySelectorAll('.kb-del-btn');
+  btns.forEach(b => { b.disabled = true; });
+  try {
+    const r = await fetch('/rag/source?source=' + encodeURIComponent(source), { method: 'DELETE' });
+    const text = await r.text();
+    let d = {}; try { d = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Server returned ' + r.status));
+    await loadKnowledge();
+  } catch (e) {
+    alert('Could not delete "' + source + '": ' + (e && e.message ? e.message : e));
+    btns.forEach(b => { b.disabled = false; });
   }
 }
 

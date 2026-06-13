@@ -4,6 +4,8 @@
   "outputDirectory": "frontend/dist",
   "rewrites": [
     { "source": "/chat", "destination": "http://172.105.41.151:8090/chat" },
+    { "source": "/chat/start", "destination": "http://172.105.41.151:8090/chat/start" },
+    { "source": "/chat/poll/:path*", "destination": "http://172.105.41.151:8090/chat/poll/:path*" },
     { "source": "/agents", "destination": "http://172.105.41.151:8090/agents" },
     { "source": "/organization", "destination": "http://172.105.41.151:8090/organization" },
     { "source": "/tasks", "destination": "http://172.105.41.151:8090/tasks" },
