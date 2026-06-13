@@ -2570,6 +2570,8 @@ const flow = {
   chief: { status: 'idle', task: '', phase: 0 },
   agents: new Map(),
   raf: null, t: 0, lastTs: 0, _loop: null,
+  drag: { active: false, node: null, dx: 0, dy: 0, moved: false }, _suppressClick: false,
+  RETURN_MS: 520,
 
   init() {
     this.canvas = document.getElementById('flow-canvas');
@@ -2583,6 +2585,12 @@ const flow = {
     }
     window.addEventListener('resize', () => this.resize());
     this.canvas.addEventListener('click', (e) => this.onClick(e));
+    // free-drag interaction (pointer = mouse + touch); release springs back to orbit
+    this.canvas.style.touchAction = 'none';
+    this.canvas.addEventListener('pointerdown', (e) => this.onDown(e));
+    window.addEventListener('pointermove', (e) => this.onMove(e));
+    window.addEventListener('pointerup', (e) => this.onUp(e));
+    window.addEventListener('pointercancel', (e) => this.onUp(e));
     this.ensureRunning();
   },
 
@@ -2681,6 +2689,10 @@ const flow = {
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
       n.angle += diff * Math.min(1, dt / 140);
+      if (n.returning) {
+        n.returnT = (n.returnT || 0) + dt / this.RETURN_MS;
+        if (n.returnT >= 1) { n.returning = false; n.returnT = 0; }
+      }
     });
     if (dead.length) { dead.forEach(name => this.agents.delete(name)); this.layout(); this.updateOverlay(); }
     this.chief.phase += dt;
@@ -2709,8 +2721,22 @@ const flow = {
     live.forEach(n => {
       const float = Math.sin(this.t * 0.0016 + n.phase);
       const rad = R * (0.55 + 0.45 * n.appear);
-      const ax = cx + Math.cos(n.angle) * rad + Math.cos(n.angle) * float * 4;
-      const ay = cy + Math.sin(n.angle) * rad + Math.sin(n.angle) * float * 4;
+      // natural orbit position
+      const ox = cx + Math.cos(n.angle) * rad + Math.cos(n.angle) * float * 4;
+      const oy = cy + Math.sin(n.angle) * rad + Math.sin(n.angle) * float * 4;
+      n._ox = ox; n._oy = oy;
+      // actual render position: follow the pointer while dragging, or ease back
+      // to the live orbit position after release.
+      let ax, ay;
+      if (this.drag.active && this.drag.node === n) {
+        ax = n.dragX; ay = n.dragY;
+      } else if (n.returning) {
+        const e = 1 - Math.pow(1 - Math.min(1, n.returnT), 3); // easeOutCubic
+        ax = n.returnFrom.x + (ox - n.returnFrom.x) * e;
+        ay = n.returnFrom.y + (oy - n.returnFrom.y) * e;
+      } else {
+        ax = ox; ay = oy;
+      }
       n._x = ax; n._y = ay;
       const mx = (cx + ax) / 2, my = (cy + ay) / 2;
       const perp = n.angle + Math.PI / 2;
@@ -2787,17 +2813,74 @@ const flow = {
     }
   },
 
-  onClick(e) {
+  _evtXY(e) {
     const r = this.canvas.getBoundingClientRect();
-    const x = e.clientX - r.left, y = e.clientY - r.top;
-    if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) return;
+    return [e.clientX - r.left, e.clientY - r.top];
+  },
+
+  _hitAgent(x, y) {
     let hit = null, best = 1e9;
     this.agents.forEach(n => {
       if (n._x === undefined) return;
       const dd = Math.hypot(x - n._x, y - n._y);
-      if (dd <= (n._r || 12) && dd < best) { best = dd; hit = n.name; }
+      if (dd <= (n._r || 12) + 4 && dd < best) { best = dd; hit = n; }
     });
-    if (hit && document.getElementById('agent-modal')) openAgentModal(hit);
+    return hit;
+  },
+
+  onDown(e) {
+    if (!this.canvas) return;
+    const [x, y] = this._evtXY(e);
+    // don't hijack the chief node
+    if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) return;
+    const n = this._hitAgent(x, y);
+    if (!n) return;
+    e.preventDefault();
+    try { this.canvas.setPointerCapture(e.pointerId); } catch (_) {}
+    n.returning = false; n.returnT = 0;
+    n.dragX = n._x; n.dragY = n._y;
+    this.drag = { active: true, node: n, dx: n._x - x, dy: n._y - y, moved: false };
+    this.canvas.style.cursor = 'grabbing';
+    this.ensureRunning();
+  },
+
+  onMove(e) {
+    if (!this.canvas) return;
+    if (!this.drag.active) {
+      // hover affordance
+      const [hx, hy] = this._evtXY(e);
+      const over = this._hitAgent(hx, hy);
+      this.canvas.style.cursor = over ? 'grab' : 'default';
+      return;
+    }
+    const [x, y] = this._evtXY(e);
+    const n = this.drag.node;
+    n.dragX = x + this.drag.dx;
+    n.dragY = y + this.drag.dy;
+    if (Math.hypot(n.dragX - n._ox, n.dragY - n._oy) > 4) this.drag.moved = true;
+  },
+
+  onUp(e) {
+    if (!this.drag.active) return;
+    const n = this.drag.node;
+    try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (this.drag.moved) {
+      // spring back to the live orbit position with a transition
+      n.returning = true; n.returnT = 0;
+      n.returnFrom = { x: n.dragX, y: n.dragY };
+      this._suppressClick = true; // don't open the modal after a drag
+    }
+    this.drag = { active: false, node: null, dx: 0, dy: 0, moved: false };
+    this.canvas.style.cursor = 'default';
+    this.ensureRunning();
+  },
+
+  onClick(e) {
+    if (this._suppressClick) { this._suppressClick = false; return; }
+    const [x, y] = this._evtXY(e);
+    if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) return;
+    const n = this._hitAgent(x, y);
+    if (n && document.getElementById('agent-modal')) openAgentModal(n.name);
   },
 };
 
