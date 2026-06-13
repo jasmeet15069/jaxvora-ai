@@ -1,20 +1,20 @@
 # Jaxvora
 
-Autonomous multi-agent AI platform for Engineering, Data, Security, Career, and Automation workflows. 22 specialist agents coordinated by Llama 3.3 70B (Groq), powered by DeepSeek V3 (OpenRouter).
+Autonomous multi-agent AI platform for Engineering, Data, Security, Career, and Automation workflows. 22 specialist agents whose default brain is North Mini Code Free via OpenCode Zen (`north-mini-code-free`); the Chief Orchestrator runs Groq-first for speed, and Groq / OpenRouter (DeepSeek) remain in the failover chain.
 
 ## Run & Operate
 
 - `cd jaxvora && /home/runner/workspace/.pythonlibs/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8099` — run Jaxvora (served via Jaxvora workflow)
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- Required env secrets: `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `DATABASE_URL`
+- Required env secrets: `OPENCODE_ZEN_API_KEY` (default brain), `DATABASE_URL`; failover keys `GROQ_API_KEY`, `OPENROUTER_API_KEY`. Optional overrides: `OPENCODE_ZEN_MODEL` (default `north-mini-code-free`), `OPENCODE_ZEN_PRIMARY`, `LLM_PROVIDER_ORDER`, `ORCHESTRATOR_PROVIDER`
 
 ## Stack
 
 - **Backend**: Python 3.11 + FastAPI + asyncpg
 - **Frontend**: Vanilla HTML/CSS/JS (dark command center UI)
-- **Orchestrator**: Llama 3.3 70B via Groq
-- **Worker agents**: DeepSeek V3 via OpenRouter
-- **Review/Architecture**: Llama 3.3 70B via Groq
+- **Default agent brain**: North Mini Code Free via OpenCode Zen (`north-mini-code-free`)
+- **Orchestrator**: Groq-first (Llama 3.3 70B) for low latency, with Zen + the rest of the chain as fallback
+- **Failover chain**: OpenCode Zen → Groq → OpenRouter (DeepSeek), configurable via `LLM_PROVIDER_ORDER`
 - **DB**: PostgreSQL (Neon) — tasks, logs, audit, knowledge_base (full-text search replaces Qdrant)
 - **Real-time**: WebSockets (/ws/agents, /ws/tasks, /ws/logs, /ws/chat)
 - Node.js workspace: pnpm workspaces, TypeScript 5.9, Express 5
@@ -37,7 +37,7 @@ Autonomous multi-agent AI platform for Engineering, Data, Security, Career, and 
 
 ## Product
 
-- Chat with Chief Orchestrator (Llama 3.3 70B) for any engineering/data/security/career task
+- Chat with Chief Orchestrator (Groq-first; agents default to North Mini Code Free) for any engineering/data/security/career task
 - 22 agents across 5 divisions: Engineering, Security, Data, Career, Product
 - Live agent monitor with real-time WebSocket status
 - Task queue, live logs, approval center, analytics dashboard

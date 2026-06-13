@@ -1,13 +1,13 @@
 # Jaxvora
 
-Jaxvora is a production-ready, autonomous multi-agent AI platform for Engineering, Data, Security, Career, and Automation workflows. It combines DeepSeek V3 (via OpenRouter) and Llama 3.3 70B (via Groq) in an orchestrated multi-agent system with a dark mission-control UI.
+Jaxvora is a production-ready, autonomous multi-agent AI platform for Engineering, Data, Security, Career, and Automation workflows. Every agent's default brain is **North Mini Code (Free)** via **OpenCode Zen** (`north-mini-code-free`); the Chief Orchestrator runs Groq-first for low latency, and Groq / OpenRouter (DeepSeek) remain in the failover chain. Orchestrated multi-agent system with a dark mission-control UI.
 
 ## Architecture Overview
 
 ```
-User → Chat Interface → Chief Orchestrator (Llama 3.3 70B)
+User → Chat Interface → Chief Orchestrator (Groq-first)
                               ↓
-               Project Intelligence (Groq/Llama)
+               Project Intelligence (North Mini Code Free)
                               ↓
     ┌─────────────────────────────────────────────┐
     │  Engineering  │  Security  │  Data  │ Career │
@@ -23,8 +23,11 @@ All agents share a `BaseAgent` class. Inter-agent communication routes exclusive
 
 1. **Set secrets** in Replit Secrets panel:
    - `DATABASE_URL` — Neon PostgreSQL connection string
-   - `OPENROUTER_API_KEY` — for DeepSeek V3 and other models
-   - `GROQ_API_KEY` — Groq key for Llama 3.3 70B (orchestrator + code review)
+   - `OPENCODE_ZEN_API_KEY` — OpenCode Zen key; default brain for all agents (`north-mini-code-free`)
+   - `GROQ_API_KEY` — Groq key for Llama 3.3 70B (orchestrator + failover)
+   - `OPENROUTER_API_KEY` — DeepSeek failover
+
+   Optional overrides: `OPENCODE_ZEN_MODEL` (default `north-mini-code-free`), `OPENCODE_ZEN_PRIMARY`, `LLM_PROVIDER_ORDER`, `ORCHESTRATOR_PROVIDER`.
 
 2. **Run** via the workflow or:
    ```bash
@@ -45,28 +48,30 @@ All agents share a `BaseAgent` class. Inter-agent communication routes exclusive
 
 ## Agent Directory
 
-| Division | Agent | Model |
+All 22 agents default to **North Mini Code Free** via OpenCode Zen (`north-mini-code-free`). The Chief Orchestrator runs Groq-first for low latency; Groq and OpenRouter (DeepSeek) stay in the failover chain.
+
+| Division | Agent | Default Model |
 |---|---|---|
-| Executive | Chief Orchestrator | Llama 3.3 70B (Groq) |
-| Executive | Project Intelligence | Llama 3.3 70B (Groq) |
-| Engineering | AI Engineer | DeepSeek V3 |
-| Engineering | Software Engineer | DeepSeek V3 |
-| Engineering | Debug Agent | DeepSeek V3 |
-| Engineering | QA/Test Agent | DeepSeek V3 |
-| Engineering | Code Review | Llama 3.3 70B (Groq) |
-| Engineering | Architecture | Llama 3.3 70B (Groq) |
-| Engineering | Database | DeepSeek V3 |
-| Engineering | DevOps | DeepSeek V3 |
-| Security | Cybersecurity | DeepSeek V3 |
-| Security | Red Team | DeepSeek V3 |
-| Security | Compliance | DeepSeek V3 |
-| Data | Data Analyst | DeepSeek V3 |
-| Data | BI Agent | DeepSeek V3 |
-| Data | Data Engineer | DeepSeek V3 |
-| Data | ML Engineer | DeepSeek V3 |
-| Career | Resume Agent | DeepSeek V3 |
-| Career | Interview Coach | DeepSeek V3 |
-| Career | Career Coach | DeepSeek V3 |
-| Product | Product Manager | DeepSeek V3 |
-| Product | Documentation | DeepSeek V3 |
-| Product | Research | DeepSeek V3 |
+| Executive | Chief Orchestrator | North Mini Code Free (OpenCode Zen) · Groq-first |
+| Executive | Project Intelligence | North Mini Code Free (OpenCode Zen) |
+| Engineering | AI Engineer | North Mini Code Free (OpenCode Zen) |
+| Engineering | Software Engineer | North Mini Code Free (OpenCode Zen) |
+| Engineering | Debug Agent | North Mini Code Free (OpenCode Zen) |
+| Engineering | QA/Test Agent | North Mini Code Free (OpenCode Zen) |
+| Engineering | Code Review | North Mini Code Free (OpenCode Zen) |
+| Engineering | Architecture | North Mini Code Free (OpenCode Zen) |
+| Engineering | Database | North Mini Code Free (OpenCode Zen) |
+| Engineering | DevOps | North Mini Code Free (OpenCode Zen) |
+| Security | Cybersecurity | North Mini Code Free (OpenCode Zen) |
+| Security | Red Team | North Mini Code Free (OpenCode Zen) |
+| Security | Compliance | North Mini Code Free (OpenCode Zen) |
+| Data | Data Analyst | North Mini Code Free (OpenCode Zen) |
+| Data | BI Agent | North Mini Code Free (OpenCode Zen) |
+| Data | Data Engineer | North Mini Code Free (OpenCode Zen) |
+| Data | ML Engineer | North Mini Code Free (OpenCode Zen) |
+| Career | Resume Agent | North Mini Code Free (OpenCode Zen) |
+| Career | Interview Coach | North Mini Code Free (OpenCode Zen) |
+| Career | Career Coach | North Mini Code Free (OpenCode Zen) |
+| Product | Product Manager | North Mini Code Free (OpenCode Zen) |
+| Product | Documentation | North Mini Code Free (OpenCode Zen) |
+| Product | Research | North Mini Code Free (OpenCode Zen) |

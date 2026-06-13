@@ -44,10 +44,10 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 DEEPSEEK_V4_API_KEY = os.environ.get("DEEPSEEK_V4_API_KEY", "")
 
-# OpenCode Zen — free/unlimited DeepSeek V4 Flash, used as the agents' brain.
+# OpenCode Zen — free North Mini Code, used as the default brain for all agents.
 OPENCODE_ZEN_API_KEY = os.environ.get("OPENCODE_ZEN_API_KEY", "")
 OPENCODE_ZEN_BASE = os.environ.get("OPENCODE_ZEN_BASE", "https://opencode.ai/zen/v1")
-OPENCODE_ZEN_MODEL = os.environ.get("OPENCODE_ZEN_MODEL", "deepseek-v4-flash-free")
+OPENCODE_ZEN_MODEL = os.environ.get("OPENCODE_ZEN_MODEL", "north-mini-code-free")
 # When the key is present, route every agent LLM call through OpenCode Zen
 # (override with OPENCODE_ZEN_PRIMARY=0 to fall back to per-agent providers).
 OPENCODE_ZEN_PRIMARY = bool(OPENCODE_ZEN_API_KEY) and os.environ.get("OPENCODE_ZEN_PRIMARY", "1") not in ("0", "false", "False", "no")
@@ -314,7 +314,7 @@ async def call_deepseek_v4(system: str, user: str) -> str:
 
 
 # The Chief Orchestrator runs many think-steps per request; OpenCode Zen
-# (deepseek-v4-flash-free) is high-quality but slow. Run the orchestrator on the
+# (north-mini-code-free) is high-quality but slow. Run the orchestrator on the
 # FASTEST free model — Groq (LPU inference, llama-3.3-70b) — FIRST, regardless of
 # OPENCODE_ZEN_PRIMARY, with the rest of the chain (incl. Zen) as fallback. Agents
 # still default to Zen as their brain.
