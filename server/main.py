@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import time
 import hmac
 import html
 import sys
@@ -88,23 +89,34 @@ MAX_UPLOAD_TEXT_CHARS = 24000
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
 
-async def call_opencode_zen(system: str, user: str, max_tokens: int = DEEPSEEK_V4_MAX_TOKENS) -> str:
-    """OpenAI-compatible call to OpenCode Zen (DeepSeek V4 Flash Free)."""
-    cached = await redis_cache.get("llm", f"zen|{OPENCODE_ZEN_MODEL}|{system}|{user}")
-    if cached:
-        return cached
-    if not OPENCODE_ZEN_API_KEY:
-        return await call_openrouter(system, user)
+# ── Multi-provider LLM failover ─────────────────────────────────────────────
+# Every agent LLM call flows through call_llm_failover(), which walks an ordered
+# chain of providers and uses the first that works. If a provider errors or rate
+# -limits, it is tripped into a short cooldown and the call automatically shifts
+# to the next provider — so no single provider being down can stall the agents.
+# In the spirit of the evidence-driven rule: when ALL providers fail we return an
+# explicit error, never a fabricated answer.
+
+PROVIDER_COOLDOWN_SECONDS = float(os.environ.get("LLM_PROVIDER_COOLDOWN", "45") or 45)
+# name -> unix ts until which the provider is skipped after a failure.
+_PROVIDER_COOLDOWN: Dict[str, float] = {}
+
+
+class _RetryableLLMError(Exception):
+    """Transient provider failure (429 / timeout) — retry same provider briefly."""
+
+
+async def _post_chat(url: str, headers: Dict[str, str], model: str,
+                     system: str, user: str, max_tokens: int, timeout: float) -> str:
+    """One OpenAI-compatible chat call. Raises _RetryableLLMError on 429/timeout,
+    a plain Exception on any other failure; returns the message content on success."""
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(
-                f"{OPENCODE_ZEN_BASE}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENCODE_ZEN_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                url,
+                headers={"Content-Type": "application/json", **headers},
                 json={
-                    "model": OPENCODE_ZEN_MODEL,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
@@ -112,125 +124,148 @@ async def call_opencode_zen(system: str, user: str, max_tokens: int = DEEPSEEK_V
                     "max_tokens": max_tokens,
                 },
             )
+            if r.status_code == 429 or r.status_code >= 500:
+                raise _RetryableLLMError(f"HTTP {r.status_code}")
             r.raise_for_status()
-            result = r.json()["choices"][0]["message"]["content"]
-            await redis_cache.set("llm", f"zen|{OPENCODE_ZEN_MODEL}|{system}|{user}", result)
+            content = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            if not content:
+                raise Exception("empty response")
+            return content
+    except (httpx.TimeoutException, httpx.ConnectError) as e:
+        raise _RetryableLLMError(str(e))
+
+
+async def _raw_zen(system: str, user: str, max_tokens: int) -> str:
+    return await _post_chat(
+        f"{OPENCODE_ZEN_BASE}/chat/completions",
+        {"Authorization": f"Bearer {OPENCODE_ZEN_API_KEY}"},
+        OPENCODE_ZEN_MODEL, system, user, max_tokens, timeout=120)
+
+
+async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
+    return await _post_chat(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {"Authorization": f"Bearer {GROQ_API_KEY}"},
+        LLAMA_MODEL, system, user, min(max_tokens, MAX_TOKENS), timeout=60)
+
+
+async def _raw_deepseek_v4(system: str, user: str, max_tokens: int) -> str:
+    return await _post_chat(
+        f"{DEEPSEEK_V4_BASE}/chat/completions",
+        {"Authorization": f"Bearer {DEEPSEEK_V4_API_KEY}",
+         "HTTP-Referer": "https://jaxvora.ai", "X-Title": "Jaxvora"},
+        DEEPSEEK_V4_MODEL, system, user, max_tokens, timeout=120)
+
+
+async def _raw_openrouter(system: str, user: str, max_tokens: int) -> str:
+    return await _post_chat(
+        f"{OPENROUTER_BASE}/chat/completions",
+        {"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+         "HTTP-Referer": "https://jaxvora.ai", "X-Title": "Jaxvora"},
+        DEEPSEEK_MODEL, system, user, min(max_tokens, MAX_TOKENS), timeout=60)
+
+
+# Registry: ordered identity + key predicate + single-attempt fn.
+_PROVIDERS: Dict[str, Dict[str, Any]] = {
+    "zen": {"enabled": lambda: bool(OPENCODE_ZEN_API_KEY), "fn": _raw_zen},
+    "groq": {"enabled": lambda: bool(GROQ_API_KEY), "fn": _raw_groq},
+    "deepseek_v4": {"enabled": lambda: bool(DEEPSEEK_V4_API_KEY), "fn": _raw_deepseek_v4},
+    "openrouter": {"enabled": lambda: bool(OPENROUTER_API_KEY), "fn": _raw_openrouter},
+}
+
+
+def _build_provider_chain(prefer: Optional[str] = None) -> List[str]:
+    """Ordered list of provider names to try. Zen leads when it is primary;
+    `prefer` (an agent's own model) is moved to the front; configured-but-not-
+    cooled providers come first, with cooled ones kept only as a last resort."""
+    if OPENCODE_ZEN_PRIMARY:
+        order = ["zen", "groq", "deepseek_v4", "openrouter"]
+    else:
+        order = ["groq", "deepseek_v4", "openrouter", "zen"]
+    if prefer in _PROVIDERS:
+        order = [prefer] + [p for p in order if p != prefer]
+    enabled = [n for n in order if _PROVIDERS[n]["enabled"]()]
+    now = time.time()
+    hot = [n for n in enabled if _PROVIDER_COOLDOWN.get(n, 0) <= now]
+    return hot or enabled  # if everything is cooling down, try them all anyway
+
+
+def llm_provider_status() -> Dict[str, Any]:
+    """Snapshot for /settings/status — which providers are configured/cooling."""
+    now = time.time()
+    return {
+        "primary": "zen" if OPENCODE_ZEN_PRIMARY else "per-agent",
+        "chain": _build_provider_chain(),
+        "providers": {
+            n: {
+                "configured": _PROVIDERS[n]["enabled"](),
+                "cooldown_s": max(0, round(_PROVIDER_COOLDOWN.get(n, 0) - now, 1)),
+            } for n in _PROVIDERS
+        },
+    }
+
+
+async def _provider_attempt(name: str, system: str, user: str, max_tokens: int) -> str:
+    """Try one provider with brief in-place retry for transient (429/timeout)."""
+    fn = _PROVIDERS[name]["fn"]
+    delays = [0, 1, 3]
+    last: Optional[Exception] = None
+    for d in delays:
+        if d:
+            await asyncio.sleep(d)
+        try:
+            return await fn(system, user, max_tokens)
+        except _RetryableLLMError as e:
+            last = e
+            continue
+    raise last or RuntimeError("retryable attempts exhausted")
+
+
+async def call_llm_failover(system: str, user: str,
+                            max_tokens: int = DEEPSEEK_V4_MAX_TOKENS,
+                            prefer: Optional[str] = None) -> str:
+    """Single entrypoint every agent/tool uses. Walks the provider chain and
+    returns the first working response, shifting providers on any failure."""
+    cache_key = f"llm|{max_tokens}|{system}|{user}"
+    cached = await redis_cache.get("llm", cache_key)
+    if cached:
+        return cached
+    chain = _build_provider_chain(prefer)
+    if not chain:
+        return f"[Mock response — no LLM provider configured] Task: {user[:100]}"
+    errors: List[str] = []
+    for idx, name in enumerate(chain):
+        try:
+            result = await _provider_attempt(name, system, user, max_tokens)
+            _PROVIDER_COOLDOWN.pop(name, None)
+            if idx > 0:
+                logger.warning(f"LLM shifted to fallback provider '{name}' after: {'; '.join(errors)}")
+            await redis_cache.set("llm", cache_key, result)
             return result
-    except Exception as e:
-        logger.warning(f"OpenCode Zen error: {e} — falling back to OpenRouter")
-        return await call_openrouter(system, user)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            _PROVIDER_COOLDOWN[name] = time.time() + PROVIDER_COOLDOWN_SECONDS
+            logger.warning(f"LLM provider '{name}' failed ({e}) — shifting to next provider")
+            continue
+    logger.error(f"All LLM providers failed: {errors}")
+    return f"[All LLM providers failed] {'; '.join(errors)[:400]}"
+
+
+# ── Backwards-compatible wrappers (all route through the failover chain) ─────
+async def call_opencode_zen(system: str, user: str, max_tokens: int = DEEPSEEK_V4_MAX_TOKENS) -> str:
+    return await call_llm_failover(system, user, max_tokens, prefer="zen")
 
 
 async def call_openrouter(system: str, user: str, model: str = DEEPSEEK_MODEL) -> str:
-    cached = await redis_cache.get("llm", f"or|{model}|{system}|{user}")
-    if cached:
-        return cached
-    if not OPENROUTER_API_KEY:
-        return f"[Mock response — OPENROUTER_API_KEY not set] Task: {user[:100]}"
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                f"{OPENROUTER_BASE}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "HTTP-Referer": "https://jaxvora.ai",
-                    "X-Title": "Jaxvora",
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": MAX_TOKENS,
-                },
-            )
-            r.raise_for_status()
-            result = r.json()["choices"][0]["message"]["content"]
-            await redis_cache.set("llm", f"or|{model}|{system}|{user}", result)
-            return result
-    except Exception as e:
-        return f"[OpenRouter error: {e}]"
+    return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else "openrouter")
 
 
 async def call_groq(system: str, user: str) -> str:
-    if OPENCODE_ZEN_PRIMARY:
-        return await call_opencode_zen(system, user)
-    cached = await redis_cache.get("llm", f"groq|{system}|{user}")
-    if cached:
-        return cached
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY not set — falling back to OpenRouter")
-        return await call_openrouter(system, user)
-    delays = [1, 3, 7]
-    for attempt, delay in enumerate(delays + [None]):
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": LLAMA_MODEL,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                        "max_tokens": MAX_TOKENS,
-                    },
-                )
-                if r.status_code == 429:
-                    if delay is not None:
-                        logger.warning(f"Groq rate-limited (429), retrying in {delay}s (attempt {attempt+1}/3)")
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        logger.warning("Groq rate-limited after 3 retries — falling back to OpenRouter")
-                        return await call_openrouter(system, user)
-                r.raise_for_status()
-                result = r.json()["choices"][0]["message"]["content"]
-                await redis_cache.set("llm", f"groq|{system}|{user}", result)
-                return result
-        except httpx.HTTPStatusError as http_err:
-            logger.warning(f"Groq HTTP error {http_err.response.status_code} — falling back to OpenRouter")
-            return await call_openrouter(system, user)
-        except Exception as e:
-            if delay is not None:
-                await asyncio.sleep(delay)
-                continue
-            logger.error(f"Groq error after retries: {e} — falling back to OpenRouter")
-            return await call_openrouter(system, user)
-    return await call_openrouter(system, user)
+    return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else "groq")
 
 
 async def call_deepseek_v4(system: str, user: str) -> str:
-    if OPENCODE_ZEN_PRIMARY:
-        return await call_opencode_zen(system, user)
-    if not DEEPSEEK_V4_API_KEY:
-        logger.warning("DEEPSEEK_V4_API_KEY not set — falling back to OpenRouter")
-        return await call_openrouter(system, user)
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"{DEEPSEEK_V4_BASE}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_V4_API_KEY}",
-                    "HTTP-Referer": "https://jaxvora.ai",
-                    "X-Title": "Jaxvora",
-                },
-                json={
-                    "model": DEEPSEEK_V4_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": DEEPSEEK_V4_MAX_TOKENS,
-                },
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.warning(f"DeepSeek V4 error: {e} — falling back to OpenRouter")
-        return await call_openrouter(system, user)
+    return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else "deepseek_v4")
 
 
 def _resolve_app_resource(env_value: str, *relative_parts: str) -> Optional[Path]:
@@ -2509,16 +2544,11 @@ class BaseAgent:
     _current_task: str = ""
 
     async def call_llm(self, system: str, user: str) -> str:
-        # Free/unlimited DeepSeek V4 Flash via OpenCode Zen is the brain for every
-        # agent when configured; otherwise fall back to each agent's own provider.
-        if OPENCODE_ZEN_PRIMARY:
-            return await call_opencode_zen(system, user)
-        if self.model == "groq":
-            return await call_groq(system, user)
-        elif self.model == "deepseek_v4":
-            return await call_deepseek_v4(system, user)
-        else:
-            return await call_openrouter(system, user)
+        # Every agent runs through the multi-provider failover chain. When Zen is
+        # primary it leads; otherwise the agent's own model is tried first. If any
+        # provider is down/rate-limited, the call automatically shifts to the next.
+        prefer = {"groq": "groq", "deepseek_v4": "deepseek_v4"}.get(self.model, "openrouter")
+        return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else prefer)
 
     async def run(self, task: str, project_id: Optional[str] = None) -> AgentResult:
         self._status = "running"
@@ -5467,6 +5497,7 @@ async def get_settings_status():
                 "missing": gmail_missing,
             },
         },
+        "llm_failover": llm_provider_status(),
         "email": {
             "notification_email": NOTIFICATION_EMAIL,
             "sender": GMAIL_SENDER,
