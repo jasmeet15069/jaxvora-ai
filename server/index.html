@@ -407,7 +407,21 @@ body.chat-view #content { overflow: hidden; }
 }
 .msg.user .msg-bubble { white-space: pre-wrap; }
 .msg-meta { font-size: 10px; color: var(--text3); }
-.msg.thinking .msg-bubble { color: var(--text2); font-style: italic; }
+.msg.thinking { max-width: 420px; align-self: flex-start; }
+.think-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: rgba(108,99,255,0.08); border: 1px solid rgba(108,99,255,0.16); border-radius: 10px; cursor: pointer; user-select: none; transition: background 0.2s; }
+.think-header:hover { background: rgba(108,99,255,0.14); }
+.think-header .think-spinner { font-size: 18px; line-height: 1; }
+.think-header .think-title { font-size: 13px; font-weight: 600; color: var(--text1); }
+.think-header .think-count { font-size: 11px; color: var(--text3); margin-left: auto; }
+.think-header .think-arrow { font-size: 11px; color: var(--text3); transition: transform 0.2s; }
+.think-body { padding: 4px 0 6px 14px; display: none; }
+.think-step { display: flex; align-items: flex-start; gap: 6px; padding: 4px 0; font-size: 12px; color: var(--text2); line-height: 1.4; }
+.think-step .step-icon { flex-shrink: 0; width: 16px; text-align: center; font-size: 12px; }
+.think-step .step-agent { font-weight: 600; color: var(--text1); white-space: nowrap; min-width: fit-content; }
+.think-step .step-desc { color: var(--text3); overflow: hidden; text-overflow: ellipsis; }
+.think-step.running .step-agent { color: var(--teal); }
+.think-step.error .step-agent { color: var(--red); }
+.think-step.error .step-icon { }
 .md-content { display: flex; flex-direction: column; gap: 10px; }
 .md-content h3 {
   margin: 0 0 2px;
@@ -1258,6 +1272,8 @@ let chatWs, logsWs, agentsWs, tasksWs;
 let latestAnalytics = null;
 let latestAgents = [];
 const RING_CIRCUMFERENCE = 314;
+let _thinkingPanel = null;
+let _thinkingSeenAgents = new Map();
 
 function clamp(n, min = 0, max = 100) {
   return Math.max(min, Math.min(max, Number.isFinite(Number(n)) ? Number(n) : min));
@@ -1410,7 +1426,7 @@ function connectChatWs() {
     else if (d.type === 'agent_start') { appendMsg('bot', `Running ${d.agent}...`); updateRsAgentStatus(d.agent, 'running', d.task || 'working'); }
     else if (d.type === 'agent_done') { appendMsg('bot', `${d.success ? 'Done' : 'Failed'}: ${d.agent}`); updateRsAgentStatus(d.agent, d.success ? 'idle' : 'error', ''); }
     else if (d.type === 'response') {
-      removeThinking();
+      finishThinking(d.steps || []);
       appendMsg('bot', d.message, d.agents);
       flowSettle(d.agents);
     } else if (d.type === 'error') { appendMsg('bot', `Error: ${d.message}`); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); }
@@ -1536,7 +1552,7 @@ function stopFlowFastPoll() { if (flowFastTimer) { clearInterval(flowFastTimer);
 // Run a chat via the async job model: start returns immediately (no proxy
 // timeout), then poll until done. Falls back to the synchronous /chat endpoint.
 async function runChatJob(chatPayload) {
-  const finish = (render) => { removeThinking(); stopFlowFastPoll(); render(); };
+  const finish = (render) => { stopFlowFastPoll(); render(); };
   try {
     const started = await safeFetchJson('/chat/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload),
@@ -1551,8 +1567,13 @@ async function runChatJob(chatPayload) {
       try { poll = await safeFetchJson('/chat/poll/' + encodeURIComponent(jobId)); }
       catch (_) { continue; } // transient hiccup — keep polling
       const d = poll.data || {};
+      if (d.working) updateThinking(d.working);
       if (d.status === 'done') {
-        return finish(() => { appendMsg('bot', d.response || '(no response)', d.agents); flowSettle(d.agents); });
+        return finish(() => {
+          finishThinking(d.steps || []);
+          appendMsg('bot', d.response || '(no response)', d.agents);
+          flowSettle(d.agents);
+        });
       }
       if (d.status === 'error') {
         return finish(() => { appendMsg('bot', d.error || 'The request failed. Please try again.'); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
@@ -1572,7 +1593,7 @@ function legacyChat(chatPayload, finish) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload),
   }).then(res => {
     const d = res.data || {};
-    finish(() => { appendMsg('bot', d.response || 'The request could not be completed.', d.agents); flowSettle(d.agents); });
+    finish(() => { finishThinking(d.steps || []); appendMsg('bot', d.response || 'The request could not be completed.', d.agents); flowSettle(d.agents); });
   }).catch(err => {
     finish(() => { appendMsg('bot', 'Error: ' + (err && err.message ? err.message : err)); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); });
   });
@@ -1678,18 +1699,82 @@ function appendMsg(role, text, agents) {
   const isThinking = role === 'bot thinking';
   if (isThinking) removeThinking();
   div.className = 'msg ' + (isThinking ? 'bot thinking' : role === 'user' ? 'user' : 'bot');
-  if (isThinking) div.id = 'thinking-msg';
+  if (isThinking) {
+    div.id = 'thinking-msg';
+    div.innerHTML = `<div class="think-header" onclick="toggleThinking(event)">
+      <span class="think-spinner">⏳</span>
+      <span class="think-title">Working...</span>
+      <span class="think-count"></span>
+      <span class="think-arrow">▸</span>
+    </div><div class="think-body"></div>`;
+    _thinkingPanel = {
+      el: div, body: div.querySelector('.think-body'), count: div.querySelector('.think-count'),
+      spinner: div.querySelector('.think-spinner'), title: div.querySelector('.think-title'),
+      arrow: div.querySelector('.think-arrow'),
+    };
+    _thinkingSeenAgents.clear();
+  }
   let agentTags = '';
-  if (agents && agents.length) agentTags = '<div class="md-agent-tags">' + agents.map(a => `<span class="tag">${escHtml(a)}</span>`).join('') + '</div>';
-  const body = isThinking || role === 'user' ? escHtml(text) : renderRichText(text);
-  div.innerHTML = `<div class="msg-bubble">${body}${agentTags}</div><div class="msg-meta">${new Date().toLocaleTimeString()}</div>`;
-  document.getElementById('chat-messages').appendChild(div);
+  if (agents && agents.length) agentTags = '<div class="md-agent-tags">' + agents.map(a => `<span class="tag">${esc(a)}</span>`).join('') + '</div>';
+  if (!isThinking) {
+    const body = role === 'user' ? escHtml(text) : renderRichText(text);
+    div.innerHTML = `<div class="msg-bubble">${body}${agentTags}</div><div class="msg-meta">${new Date().toLocaleTimeString()}</div>`;
+    document.getElementById('chat-messages').appendChild(div);
+  }
+  if (isThinking) document.getElementById('chat-messages').appendChild(div);
   document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
 }
 
 function removeThinking() {
+  _thinkingPanel = null;
+  _thinkingSeenAgents.clear();
   const t = document.getElementById('thinking-msg');
   if (t) t.remove();
+}
+
+function toggleThinking(e) {
+  const panel = _thinkingPanel;
+  if (!panel) return;
+  const body = panel.body;
+  const arrow = panel.arrow;
+  if (!body.style.display || body.style.display === 'none') {
+    body.style.display = 'block';
+    arrow.textContent = '▾';
+  } else {
+    body.style.display = 'none';
+    arrow.textContent = '▸';
+  }
+}
+
+function updateThinking(working) {
+  const panel = _thinkingPanel;
+  if (!panel || !working) return;
+  if (working.length) {
+    panel.count.textContent = `(${working.length} agent${working.length > 1 ? 's' : ''})`;
+    panel.body.innerHTML = working.map(a =>
+      `<div class="think-step running"><span class="step-icon">⟳</span><span class="step-agent">${esc(a.name)}</span><span class="step-desc">${esc(a.task || '...')}</span></div>`
+    ).join('');
+    working.forEach(a => _thinkingSeenAgents.set(a.name, {task: a.task, status: a.status}));
+  }
+}
+
+function finishThinking(steps) {
+  const panel = _thinkingPanel;
+  if (!panel) return;
+  panel.title.textContent = 'Show details';
+  panel.spinner.textContent = '✅';
+  const total = steps && steps.length ? steps.length : _thinkingSeenAgents.size;
+  panel.count.textContent = `(${total} step${total !== 1 ? 's' : ''})`;
+  if (steps && steps.length) {
+    panel.body.innerHTML = steps.map(s => {
+      const icon = s.status === 'error' ? '❌' : s.type === 'think' ? '💭' : s.type === 'dispatch' ? '👷' : s.type === 'mcp' ? '🔧' : s.type === 'reflect' ? '🔍' : '✅';
+      return `<div class="think-step ${s.status || 'done'}"><span class="step-icon">${icon}</span><span class="step-agent">${esc(s.agent || '')}</span><span class="step-desc">${esc(s.description || '')}</span></div>`;
+    }).join('');
+  } else if (_thinkingSeenAgents.size) {
+    panel.body.innerHTML = Array.from(_thinkingSeenAgents).map(([name, info]) =>
+      `<div class="think-step done"><span class="step-icon">✅</span><span class="step-agent">${esc(name)}</span><span class="step-desc">${esc(info.task || 'completed')}</span></div>`
+    ).join('');
+  }
 }
 
 // ── Logs ───────────────────────────────────────────────────────────────────

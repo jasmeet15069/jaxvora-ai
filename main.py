@@ -2138,6 +2138,17 @@ class AgentGraphState:
         self.agent_latencies: Dict[str, float] = {}
         self.error_counts: Dict[str, int] = defaultdict(int)
         self.last_reflect: Optional[Dict] = None
+        self.steps: List[Dict] = []
+
+    def add_step(self, type_: str, agent: str, description: str, detail: str = "", status: str = "done"):
+        self.steps.append({
+            "type": type_,
+            "agent": agent,
+            "description": description,
+            "detail": str(detail)[:800],
+            "status": status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
     def add_message(self, role: str, content: str):
         self.messages.append({"role": role, "content": content})
@@ -2396,6 +2407,7 @@ Rules:
             final_match = re.search(r'<final_answer>(.*?)</final_answer>', response, re.DOTALL)
             if final_match:
                 state.final_output = final_match.group(1).strip()
+                state.add_step("final", agent.name, "Final answer ready", state.final_output[:500])
                 return state.final_output
 
             # ── Parse THINK for risk_flags ──
@@ -2406,6 +2418,7 @@ Rules:
                 state.rag_query = think_data.get("rag_query", state.rag_query)
                 state.estimated_hops = think_data.get("estimated_hops", state.estimated_hops)
                 risk_flags_raw = think_data.get("risk_flags", "")
+                state.add_step("think", agent.name, f"Thinking about subtask", think_data.get("raw_intent", ""))
                 if risk_flags_raw and risk_flags_raw.strip().upper() != "NONE" and agent.name != "Chief Orchestrator":
                     state.pending_confirmation = {"risk_flags": risk_flags_raw, "task_id": state.task_id}
                     if pending_states is not None:
@@ -2418,6 +2431,7 @@ Rules:
                 state.last_reflect = reflect
                 state.goal_fulfilled = reflect.get("goal_fulfilled", False)
                 state.confidence_score = reflect.get("confidence_score", 0.0)
+                state.add_step("reflect", agent.name, f"Reflected (conf:{reflect.get('confidence_score', 0.0):.2f})", str(reflect))
                 next_action = reflect.get("next_action")
                 if next_action == "finalize":
                     if reflect.get("synthesis"):
@@ -2425,10 +2439,12 @@ Rules:
                             f"Task: {task}\n\nSynthesis: {reflect['synthesis']}\n\n"
                             f"Conversation:\n{state.to_prompt()}\n\nProvide the final answer.")
                         state.final_output = final
+                        state.add_step("final", agent.name, "Final answer from synthesis", final[:500])
                         return final
                     if state.messages:
                         content = state.messages[-1].get("content", "")
                         state.final_output = content[:4000]
+                        state.add_step("final", agent.name, "Final answer from last message", state.final_output[:500])
                         return state.final_output
                 elif next_action == "request_human_input":
                     return f"__HUMAN_INPUT__:{state.task_id}:{reflect.get('question', 'Need your input to continue.')}"
@@ -2490,6 +2506,7 @@ Rules:
                     status = "error" if invoke_result.startswith("[AgentInvokeTool]") else "success"
                     state.tool_results.append({"tool": f"dispatch:{agent_name}", "params": dispatch, "result": invoke_result, "status": status})
                     state.add_message("system", f"{agent_name} result:\n{invoke_result[:1000]}")
+                    state.add_step("dispatch", agent_name, f"Dispatched {agent_name}", invoke_result[:500], status)
 
             # Execute MCP calls
             for call in mcp_calls:
@@ -2499,6 +2516,7 @@ Rules:
                 result = await tool_registry.run(tool_name, params)
                 state.tool_results.append({"tool": tool_name, "params": params, "result": result})
                 state.add_message("system", f"Tool result:\n{result[:1000]}")
+                state.add_step("mcp", tool_name, f"MCP call: {tool_name}", str(result)[:500])
 
             # ── OBSERVE (results already in state) → loop back to THINK ──
 
@@ -2508,6 +2526,7 @@ Rules:
                 f"Task: {task}\n\nConversation:\n{state.to_prompt()}\n\n"
                 "Provide your final synthesized answer based on all information gathered.")
             state.final_output = final
+            state.add_step("final", agent.name, "Synthesized final answer", final[:500])
             return final
         return "I was unable to complete this task."
 
@@ -3534,12 +3553,37 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                     "organization": {"mode": "human_input_required"},
                 }
 
-        # Normal output
+        # Normal output — include steps from state if available
+        if state:
+            agents_involved = list(set(
+                tr.get("params", {}).get("agent", "")
+                for tr in state.tool_results if tr["tool"].startswith("dispatch:")
+            ))
+            return {
+                "plan": f"TAOR loop completed in {state.iteration + 1} iterations",
+                "agents": agents_involved,
+                "response": loop_output,
+                "results": [
+                    {"agent": tr.get("params", {}).get("agent", tr["tool"]),
+                     "success": tr.get("status", "success") == "success",
+                     "output": str(tr.get("result", ""))[:300]}
+                    for tr in state.tool_results[-10:]
+                ],
+                "steps": state.steps,
+                "organization": {
+                    "mode": "taor_v1",
+                    "iterations": state.iteration + 1,
+                    "confidence": state.confidence_score,
+                    "task_id": state.task_id,
+                    "agents_involved": agents_involved,
+                },
+            }
         return {
             "plan": "TAOR loop execution",
             "agents": [],
             "response": loop_output,
             "results": [],
+            "steps": [],
             "organization": {"mode": "taor_v1"},
         }
 
@@ -3592,6 +3636,8 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
 
         # ── TAOR Loop ──
         try:
+            _taor_state = AgentGraphState(user_input, self.SYSTEM, max_iterations=8)
+            _taor_state.add_message("user", user_input)
             loop_output = await AgentWorkflow.run(
                 ToolCallingAgent(
                     name="Chief Orchestrator", model="groq",
@@ -3600,9 +3646,10 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                     system_prompt=self.SYSTEM,
                 ),
                 user_input, max_iterations=8,
+                state=_taor_state,
                 pending_states=self._pending_states,
             )
-            return await self._handle_loop_output(loop_output, None, user_input, stream_fn)
+            return await self._handle_loop_output(loop_output, _taor_state, user_input, stream_fn)
         except Exception as e:
             logger.error(f"TAOR loop failed: {e}", exc_info=True)
             # Fallback to direct LLM
@@ -4154,6 +4201,7 @@ async def chat_poll(job_id: str):
         out["response"] = job.get("response", "")
         out["agents"] = job.get("agents", [])
         out["result"] = job.get("result", {})
+        out["steps"] = job.get("result", {}).get("steps", [])
     elif job["status"] == "error":
         out["error"] = job.get("error", "Request failed.")
     return out
