@@ -1395,6 +1395,135 @@ class AgentInvokeTool(MCPTool):
 WORKSPACE_DIR = Path("/root/jaxvora-ai/workspace")
 
 
+# === Social media connectors & autonomous posting ===========================
+SOCIAL_PLATFORMS = ["x", "facebook", "instagram", "whatsapp", "reddit", "linkedin"]
+SOCIAL_LABELS = {"x": "X (Twitter)", "facebook": "Facebook", "instagram": "Instagram",
+                 "whatsapp": "WhatsApp", "reddit": "Reddit", "linkedin": "LinkedIn"}
+_SOCIAL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+async def social_load() -> Dict[str, Dict[str, Any]]:
+    global _SOCIAL_CACHE
+    if db_pool is not None:
+        try:
+            row = await db_fetchrow("SELECT value FROM app_settings WHERE key='social_connectors'")
+            if row and row["value"]:
+                _SOCIAL_CACHE = json.loads(row["value"])
+        except Exception as e:
+            logger.warning(f"social_load failed: {e}")
+    return _SOCIAL_CACHE
+
+
+async def social_save(data: Dict[str, Dict[str, Any]]):
+    global _SOCIAL_CACHE
+    _SOCIAL_CACHE = data
+    if db_pool is not None:
+        try:
+            await db_execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES ('social_connectors', $1, NOW()) "
+                "ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()",
+                json.dumps(data),
+            )
+        except Exception as e:
+            logger.warning(f"social_save failed: {e}")
+
+
+def social_public_view(data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for p in SOCIAL_PLATFORMS:
+        c = data.get(p, {}) or {}
+        tok = c.get("token") or ""
+        out.append({
+            "platform": p, "label": SOCIAL_LABELS[p],
+            "connected": bool(tok),
+            "auto_post": bool(c.get("auto_post")),
+            "token_hint": (tok[:4] + "…" + tok[-4:]) if len(tok) > 8 else ("set" if tok else ""),
+            "meta": dict(c.get("meta") or {}),
+        })
+    return out
+
+
+async def social_publish(platform: str, conn: Dict[str, Any], text: str, link: str = "", image_url: str = "") -> Dict[str, Any]:
+    """Best-effort token-based publish. Each platform needs its API token (and a
+    few platform-specific meta fields) obtained from that platform's dev portal."""
+    token = (conn.get("token") or "").strip()
+    meta = conn.get("meta") or {}
+    if not token:
+        return {"ok": False, "error": f"{SOCIAL_LABELS.get(platform, platform)} is not connected."}
+    body = text + ((" " + link) if link else "")
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            if platform == "x":
+                r = await client.post("https://api.twitter.com/2/tweets",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"text": body[:280]})
+            elif platform == "linkedin":
+                author = meta.get("author") or meta.get("urn")
+                if not author:
+                    return {"ok": False, "error": "LinkedIn needs meta.author URN (e.g. urn:li:person:XXXX)."}
+                r = await client.post("https://api.linkedin.com/v2/ugcPosts",
+                    headers={"Authorization": f"Bearer {token}", "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json"},
+                    json={"author": author, "lifecycleState": "PUBLISHED",
+                          "specificContent": {"com.linkedin.ugc.ShareContent": {"shareCommentary": {"text": body}, "shareMediaCategory": "NONE"}},
+                          "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}})
+            elif platform == "facebook":
+                page = meta.get("page_id")
+                if not page:
+                    return {"ok": False, "error": "Facebook needs meta.page_id."}
+                r = await client.post(f"https://graph.facebook.com/{page}/feed",
+                    params={"message": body, "access_token": token})
+            elif platform == "instagram":
+                return {"ok": False, "error": "Instagram requires an image + 2-step container publish; provide meta.ig_user_id and image_url to enable."}
+            elif platform == "reddit":
+                sub = meta.get("subreddit")
+                if not sub:
+                    return {"ok": False, "error": "Reddit needs meta.subreddit."}
+                r = await client.post("https://oauth.reddit.com/api/submit",
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": "Jaxvora/1.0"},
+                    data={"sr": sub, "kind": "self", "title": (text[:280] or "Update"), "text": body})
+            elif platform == "whatsapp":
+                phone_id, to = meta.get("phone_id"), meta.get("to")
+                if not (phone_id and to):
+                    return {"ok": False, "error": "WhatsApp needs meta.phone_id and meta.to."}
+                r = await client.post(f"https://graph.facebook.com/v19.0/{phone_id}/messages",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}})
+            else:
+                return {"ok": False, "error": f"Unknown platform {platform}"}
+        return {"ok": r.status_code < 300, "status": r.status_code, "response": r.text[:300]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class SocialMediaTool(MCPTool):
+    def __init__(self):
+        super().__init__(
+            "social_post",
+            ("Post to a connected social platform. params: platform (x|facebook|instagram|"
+             "whatsapp|reddit|linkedin), text, link (optional), force (optional). If that "
+             "platform's auto_post is OFF, returns a DRAFT for approval instead of publishing."),
+            risk_level="critical", requires_confirmation=True)
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        platform = (params.get("platform") or "").lower().strip()
+        text = params.get("text") or ""
+        if platform not in SOCIAL_PLATFORMS:
+            return f"social_post error: unknown platform '{platform}'. Options: {', '.join(SOCIAL_PLATFORMS)}"
+        if not text:
+            return "social_post error: empty text"
+        data = await social_load()
+        conn = data.get(platform, {}) or {}
+        if not conn.get("token"):
+            return f"[{SOCIAL_LABELS[platform]}] not connected — connect it on the Connectors page first."
+        force = str(params.get("force", "")).lower() in ("1", "true", "yes")
+        if not conn.get("auto_post") and not force:
+            return f"[DRAFT · {SOCIAL_LABELS[platform]}] auto-post is OFF. Draft for your approval:\n\n{text}"
+        result = await social_publish(platform, conn, text, params.get("link", ""), params.get("image_url", ""))
+        if result.get("ok"):
+            return f"[Posted to {SOCIAL_LABELS[platform]}] (HTTP {result.get('status')})"
+        return f"[{SOCIAL_LABELS[platform]} post failed] {result.get('error') or result.get('response')}"
+
+
 class MCPToolRegistry:
     def __init__(self):
         self._tools: Dict[str, MCPTool] = {}
@@ -2793,6 +2922,13 @@ def build_registry():
         ToolCallingAgent(name="Risk & Planning Agent", model="deepseek_v4", division="Executive",
             description="Risk assessment, mitigation planning, incident response, business continuity",
             system_prompt="You are a risk management specialist. Identify, assess, and mitigate project and business risks. Design incident response plans, business continuity strategies, disaster recovery procedures, and compliance risk frameworks."),
+        ToolCallingAgent(name="Social Media Agent", model="deepseek", division="Product",
+            description="Plans and publishes content to connected social platforms (X, Facebook, Instagram, WhatsApp, Reddit, LinkedIn) via the social_post tool, deciding what fits each channel.",
+            system_prompt=("You are Jaxvora's Social Media Agent. You craft platform-appropriate posts and use the "
+                "social_post tool to publish to connected platforms: x, facebook, instagram, whatsapp, reddit, linkedin. "
+                "Decide which platforms fit a given message and tailor tone/length per platform (keep X under 280 chars). "
+                "If a platform's auto-post is OFF the tool returns a DRAFT — present those drafts clearly for approval. "
+                "Never fabricate engagement metrics, and never post the same spammy text to every platform.")),
     ]
     for a in agents:
         AGENT_REGISTRY[a.name] = a
@@ -3978,6 +4114,68 @@ async def rag_delete_source(source: str = Query(...)):
         return {"ok": False, "error": str(e)}
 
 
+# ── Social media connectors ───────────────────────────────────────────────────
+@app.get("/social/connectors")
+async def social_connectors():
+    return {"ok": True, "platforms": social_public_view(await social_load())}
+
+
+@app.post("/social/connect")
+async def social_connect(req: dict):
+    platform = (req.get("platform") or "").lower().strip()
+    if platform not in SOCIAL_PLATFORMS:
+        return {"ok": False, "error": "unknown platform"}
+    data = await social_load()
+    conn = data.get(platform, {}) or {}
+    if "token" in req:
+        conn["token"] = (req.get("token") or "").strip()
+    if "auto_post" in req:
+        conn["auto_post"] = bool(req.get("auto_post"))
+    if isinstance(req.get("meta"), dict):
+        conn["meta"] = {**(conn.get("meta") or {}), **req["meta"]}
+    data[platform] = conn
+    await social_save(data)
+    return {"ok": True, "platforms": social_public_view(data)}
+
+
+@app.post("/social/disconnect")
+async def social_disconnect(req: dict):
+    platform = (req.get("platform") or "").lower().strip()
+    data = await social_load()
+    if platform in data:
+        data[platform] = {"auto_post": False}
+        await social_save(data)
+    return {"ok": True, "platforms": social_public_view(data)}
+
+
+@app.post("/social/auto")
+async def social_auto(req: dict):
+    platform = (req.get("platform") or "").lower().strip()
+    data = await social_load()
+    if platform in SOCIAL_PLATFORMS:
+        conn = data.get(platform, {}) or {}
+        conn["auto_post"] = bool(req.get("auto_post"))
+        data[platform] = conn
+        await social_save(data)
+    return {"ok": True, "platforms": social_public_view(data)}
+
+
+@app.post("/social/post")
+async def social_post_endpoint(req: dict):
+    """Manual post (explicit user action) — publishes regardless of auto_post."""
+    platform = (req.get("platform") or "").lower().strip()
+    text = req.get("text") or ""
+    if platform not in SOCIAL_PLATFORMS:
+        return {"ok": False, "error": "unknown platform"}
+    if not text:
+        return {"ok": False, "error": "empty text"}
+    data = await social_load()
+    conn = data.get(platform, {}) or {}
+    if not conn.get("token"):
+        return {"ok": False, "error": f"{SOCIAL_LABELS[platform]} is not connected."}
+    return await social_publish(platform, conn, text, req.get("link", ""), req.get("image_url", ""))
+
+
 @app.get("/web/search")
 async def web_search(q: str = Query(...), max_results: int = 5):
     """Search the web using DuckDuckGo."""
@@ -4575,6 +4773,7 @@ async def startup():
     tool_registry.register(SSHTool())
     tool_registry.register(WebSearchTool())
     tool_registry.register(AgentInvokeTool())
+    tool_registry.register(SocialMediaTool())
 
     logger.info(f"✓ {len(AGENT_REGISTRY)} agents registered")
     logger.info(f"✓ {len(tool_registry._tools)} MCP tools registered")

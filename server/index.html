@@ -770,6 +770,7 @@ body.chat-view #content { overflow: hidden; }
 
     <div class="nav-section">Knowledge</div>
     <div class="nav-item" data-section="knowledge"><span class="icon">▣</span>Knowledge Base <span class="nav-badge" id="kb-count" style="display:none">0</span></div>
+    <div class="nav-item" data-section="connectors"><span class="icon">⇄</span>Connectors <span class="nav-badge" id="social-count" style="display:none">0</span></div>
   <div class="sidebar-footer">
     <span class="status-dot"></span>
     System <span id="sys-status" style="color:var(--teal)">online</span>
@@ -1183,6 +1184,26 @@ body.chat-view #content { overflow: hidden; }
       </div>
     </div>
 
+    <!-- Connectors -->
+    <div class="section" id="section-connectors">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Connectors</div>
+          <div class="section-sub">Connect social platforms, then let the Social Media Agent post. Auto-post is OFF by default — the agent drafts for approval until you enable it per platform.</div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">Ask the Social Media Agent</div>
+        <textarea id="social-compose" placeholder="e.g. Announce our new jax-todolist app on LinkedIn and X with a friendly tone" style="width:100%;min-height:64px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:13px;outline:none;resize:vertical"></textarea>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;align-items:center">
+          <button class="btn" onclick="askSocialAgent()" style="background:var(--violet);color:#fff;border:none;padding:9px 16px;border-radius:8px">Ask Social Agent</button>
+          <span style="font-size:11px;color:var(--text3)">It drafts per platform and only auto-posts where auto-post is ON.</span>
+        </div>
+        <div id="social-agent-output" style="margin-top:12px;font-size:13px;color:var(--text2);white-space:pre-wrap"></div>
+      </div>
+      <div id="social-cards" class="grid-2" style="gap:12px">Loading connectors…</div>
+    </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
 
@@ -1298,6 +1319,7 @@ const sections = {
   analytics: { title: 'Analytics', meta: 'Productivity metrics', load: loadAnalytics },
   settings: { title: 'Settings', meta: 'API keys and tools', load: loadSettings },
   knowledge: { title: 'Knowledge Base', meta: 'RAG documents & web search', load: loadKnowledge },
+  connectors: { title: 'Connectors', meta: 'Social platforms & autonomous posting', load: loadConnectors },
 };
 
 function isMobileLayout() {
@@ -2649,6 +2671,117 @@ function switchKbTab(name) {
   const content = document.getElementById(`kb-tab-${name}`);
   if (content) content.style.display = 'block';
   if (name === 'workspace') wsRefresh();
+}
+
+// ── Connectors (social media) ────────────────────────────────────────────────
+const SOCIAL_META_HINT = {
+  x: '', linkedin: 'author=urn:li:person:XXXX', facebook: 'page_id=12345',
+  instagram: 'ig_user_id=12345', reddit: 'subreddit=test', whatsapp: 'phone_id=123, to=15551234567',
+};
+
+async function loadConnectors() {
+  const wrap = document.getElementById('social-cards');
+  if (!wrap) return;
+  try {
+    const r = await fetch('/social/connectors');
+    const d = await r.json();
+    const plats = (d && d.platforms) || [];
+    const connected = plats.filter(p => p.connected).length;
+    const badge = document.getElementById('social-count');
+    if (badge) { badge.textContent = String(connected); badge.style.display = connected ? '' : 'none'; }
+    wrap.innerHTML = plats.map(renderConnectorCard).join('') || 'No platforms.';
+  } catch (e) {
+    wrap.innerHTML = '<div style="color:var(--red)">Could not load connectors: ' + escHtml(String(e)) + '</div>';
+  }
+}
+
+function renderConnectorCard(p) {
+  const metaStr = Object.entries(p.meta || {}).map(([k, v]) => k + '=' + v).join(', ');
+  const status = p.connected
+    ? '<span class="pill green" style="font-size:10px">connected' + (p.token_hint ? (' · ' + escHtml(p.token_hint)) : '') + '</span>'
+    : '<span class="pill" style="font-size:10px;color:var(--text3)">not connected</span>';
+  const hint = SOCIAL_META_HINT[p.platform] ? 'extra: ' + SOCIAL_META_HINT[p.platform] : 'extra config (key=value, comma-separated)';
+  return `<div class="card" data-platform="${p.platform}" style="display:flex;flex-direction:column;gap:8px">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+      <div style="font-weight:700;font-size:14px">${escHtml(p.label)}</div>${status}
+    </div>
+    <input type="password" id="tok-${p.platform}" placeholder="API token / access token" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text);font-size:12px;outline:none">
+    <input type="text" id="meta-${p.platform}" placeholder="${hint}" value="${escHtml(metaStr)}" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text);font-size:12px;outline:none">
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);cursor:pointer">
+      <input type="checkbox" id="auto-${p.platform}" ${p.auto_post ? 'checked' : ''} onchange="toggleSocialAuto('${p.platform}', this.checked)"> Auto-post (agent may publish without asking)
+    </label>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" onclick="connectSocial('${p.platform}')" style="background:var(--violet);color:#fff;border:none;padding:7px 12px;border-radius:8px;font-size:12px">Save</button>
+      <button class="btn" onclick="testSocialPost('${p.platform}')" style="background:transparent;border:1px solid var(--border);color:var(--text2);padding:7px 12px;border-radius:8px;font-size:12px">Test post</button>
+      ${p.connected ? `<button class="btn" onclick="disconnectSocial('${p.platform}')" style="background:transparent;border:1px solid var(--border);color:var(--text2);padding:7px 12px;border-radius:8px;font-size:12px">Disconnect</button>` : ''}
+    </div>
+  </div>`;
+}
+
+function parseMetaInput(str) {
+  const meta = {};
+  (str || '').split(',').forEach(pair => {
+    const i = pair.indexOf('=');
+    if (i > 0) { const k = pair.slice(0, i).trim(); const v = pair.slice(i + 1).trim(); if (k) meta[k] = v; }
+  });
+  return meta;
+}
+
+async function connectSocial(platform) {
+  const tokEl = document.getElementById('tok-' + platform);
+  const metaEl = document.getElementById('meta-' + platform);
+  const body = { platform, meta: parseMetaInput(metaEl ? metaEl.value : '') };
+  if (tokEl && tokEl.value) body.token = tokEl.value;
+  try {
+    const r = await fetch('/social/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'save failed');
+    loadConnectors();
+  } catch (e) { alert('Could not save ' + platform + ': ' + (e && e.message ? e.message : e)); }
+}
+
+async function toggleSocialAuto(platform, checked) {
+  try { await fetch('/social/auto', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform, auto_post: checked }) }); }
+  catch (e) { alert('Could not update auto-post: ' + e); }
+}
+
+async function disconnectSocial(platform) {
+  if (!confirm('Disconnect ' + platform + '? (your stored token will be cleared)')) return;
+  try { await fetch('/social/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform }) }); loadConnectors(); }
+  catch (e) { alert('Could not disconnect: ' + e); }
+}
+
+async function testSocialPost(platform) {
+  const text = prompt('Text to post to ' + platform + ' now:');
+  if (!text) return;
+  try {
+    const r = await fetch('/social/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform, text }) });
+    const d = await r.json();
+    alert(d.ok ? ('Posted to ' + platform + ' (HTTP ' + (d.status || '') + ')') : ('Failed: ' + (d.error || d.response || 'unknown')));
+  } catch (e) { alert('Error: ' + e); }
+}
+
+async function askSocialAgent() {
+  const ta = document.getElementById('social-compose');
+  const out = document.getElementById('social-agent-output');
+  const text = ta ? ta.value.trim() : '';
+  if (!text) return;
+  if (out) out.textContent = '⏳ Social Media Agent is working…';
+  try {
+    const started = await safeFetchJson('/chat/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Use the Social Media Agent for this social request. Draft per platform and respect each platform\'s auto-post setting: ' + text }) });
+    const jid = started.data && started.data.job_id;
+    if (!jid) { if (out) out.textContent = 'Could not start the agent.'; return; }
+    const deadline = Date.now() + 240000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 900));
+      let poll; try { poll = await safeFetchJson('/chat/poll/' + encodeURIComponent(jid)); } catch (_) { continue; }
+      const d = poll.data || {};
+      if (d.status === 'done') { if (out) out.textContent = d.response || '(no response)'; loadConnectors(); return; }
+      if (d.status === 'error') { if (out) out.textContent = d.error || 'Failed.'; return; }
+      if (d.status === 'not_found') { if (out) out.textContent = 'Request expired.'; return; }
+    }
+    if (out) out.textContent = 'Taking longer than expected — try again.';
+  } catch (e) { if (out) out.textContent = 'Error: ' + (e && e.message ? e.message : e); }
 }
 
 async function loadKnowledge() {

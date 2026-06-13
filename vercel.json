@@ -27,6 +27,7 @@
     { "source": "/settings/:path*", "destination": "http://172.105.41.151:8090/settings/:path*" },
     { "source": "/send-email/:path*", "destination": "http://172.105.41.151:8090/send-email/:path*" },
     { "source": "/gmail/:path*", "destination": "http://172.105.41.151:8090/gmail/:path*" },
+    { "source": "/social/:path*", "destination": "http://172.105.41.151:8090/social/:path*" },
     { "source": "/ws/:path*", "destination": "http://172.105.41.151:8090/ws/:path*" },
     { "source": "/:path*", "destination": "/index.html" }
   ]
