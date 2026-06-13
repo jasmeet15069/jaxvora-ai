@@ -416,6 +416,7 @@ body.chat-view #content { overflow: hidden; }
 .think-header .think-arrow { font-size: 11px; color: var(--text3); transition: transform 0.2s; }
 .think-body { padding: 4px 0 6px 14px; display: none; }
 .think-step { display: flex; align-items: flex-start; gap: 6px; padding: 4px 0; font-size: 12px; color: var(--text2); line-height: 1.4; }
+.think-step .step-num { flex-shrink: 0; min-width: 18px; text-align: right; color: var(--text3); font-family: var(--mono); font-weight: 600; }
 .think-step .step-icon { flex-shrink: 0; width: 16px; text-align: center; font-size: 12px; }
 .think-step .step-agent { font-weight: 600; color: var(--text1); white-space: nowrap; min-width: fit-content; }
 .think-step .step-desc { color: var(--text3); overflow: hidden; text-overflow: ellipsis; }
@@ -1802,8 +1803,8 @@ function updateThinking(working) {
   if (!panel || !working) return;
   if (working.length) {
     panel.count.textContent = `(${working.length} agent${working.length > 1 ? 's' : ''})`;
-    panel.body.innerHTML = working.map(a =>
-      `<div class="think-step running"><span class="step-icon">⟳</span><span class="step-agent">${esc(a.name)}</span><span class="step-desc">${esc(a.task || '...')}</span></div>`
+    panel.body.innerHTML = working.map((a, i) =>
+      `<div class="think-step running"><span class="step-num">${i + 1}.</span><span class="step-icon">⟳</span><span class="step-agent">${esc(a.name)}</span><span class="step-desc">${esc(a.task || '...')}</span></div>`
     ).join('');
     working.forEach(a => _thinkingSeenAgents.set(a.name, {task: a.task, status: a.status}));
   }
@@ -1817,13 +1818,13 @@ function finishThinking(steps) {
   const total = steps && steps.length ? steps.length : _thinkingSeenAgents.size;
   panel.count.textContent = `(${total} step${total !== 1 ? 's' : ''})`;
   if (steps && steps.length) {
-    panel.body.innerHTML = steps.map(s => {
+    panel.body.innerHTML = steps.map((s, i) => {
       const icon = s.status === 'error' ? '❌' : s.type === 'think' ? '💭' : s.type === 'dispatch' ? '👷' : s.type === 'mcp' ? '🔧' : s.type === 'reflect' ? '🔍' : '✅';
-      return `<div class="think-step ${s.status || 'done'}"><span class="step-icon">${icon}</span><span class="step-agent">${esc(s.agent || '')}</span><span class="step-desc">${esc(s.description || '')}</span></div>`;
+      return `<div class="think-step ${s.status || 'done'}"><span class="step-num">${i + 1}.</span><span class="step-icon">${icon}</span><span class="step-agent">${esc(s.agent || '')}</span><span class="step-desc">${esc(s.description || '')}</span></div>`;
     }).join('');
   } else if (_thinkingSeenAgents.size) {
-    panel.body.innerHTML = Array.from(_thinkingSeenAgents).map(([name, info]) =>
-      `<div class="think-step done"><span class="step-icon">✅</span><span class="step-agent">${esc(name)}</span><span class="step-desc">${esc(info.task || 'completed')}</span></div>`
+    panel.body.innerHTML = Array.from(_thinkingSeenAgents).map(([name, info], i) =>
+      `<div class="think-step done"><span class="step-num">${i + 1}.</span><span class="step-icon">✅</span><span class="step-agent">${esc(name)}</span><span class="step-desc">${esc(info.task || 'completed')}</span></div>`
     ).join('');
   }
 }
@@ -2615,6 +2616,7 @@ const flow = {
     const meta = AGENT_META[name] || { color: '#8b85ff', division: '', lead: false };
     return { name, color: meta.color, division: meta.division, lead: meta.lead,
       status: 'running', task: '', appear: 0, removing: false,
+      dir: 1, respond: 0,   // dir: +1 chief->agent (dispatch), -1 agent->chief (response)
       angle: undefined, targetAngle: 0, phase: this.t * 0.003 + this.agents.size,
       seed: (this.agents.size * 0.37) % 1 };
   },
@@ -2627,13 +2629,20 @@ const flow = {
     let n = this.agents.get(name);
     if (!n) { n = this.makeNode(name); this.agents.set(name, n); this.layout(); }
     n.status = status; n.task = task || n.task || ''; n.removing = false;
+    n.dir = 1; n.respond = 0;  // active/running => Chief is feeding it (light flows outward)
     if (this.chief.status !== 'running') this.setChief('running', this.chief.task || 'orchestrating');
     this.ensureRunning();
   },
 
   deactivate(name) {
     const n = this.agents.get(name);
-    if (n) n.removing = true;
+    if (n && !n.removing) {
+      // The agent is done — it now "responds" to the Chief: reverse the flow
+      // (agent -> Chief) and hold briefly so the return movement is visible, then fade.
+      n.removing = true;
+      n.dir = -1;
+      n.respond = 1100;
+    }
     this.ensureRunning();
   },
 
@@ -2682,7 +2691,11 @@ const flow = {
   update(dt) {
     const dead = [];
     this.agents.forEach((n, name) => {
-      if (n.removing) { n.appear -= dt / 320; if (n.appear <= 0) dead.push(name); }
+      if (n.removing) {
+        // hold while the response flows back to the Chief, then fade out
+        if (n.respond > 0) { n.respond -= dt; }
+        else { n.appear -= dt / 360; if (n.appear <= 0) dead.push(name); }
+      }
       else if (n.appear < 1) { n.appear = Math.min(1, n.appear + dt / 360); }
       if (n.angle === undefined) n.angle = n.targetAngle;
       let diff = n.targetAngle - n.angle;
@@ -2747,20 +2760,23 @@ const flow = {
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.quadraticCurveTo(ctrlx, ctrly, ax, ay);
-      ctx.strokeStyle = `rgba(${ec},${0.35 * n.appear})`;
+      const inbound = n.dir < 0;            // agent -> Chief (a response)
+      const pcol = isErr ? '255,77,106' : (inbound ? '0,212,170' : ec);  // teal = response
+      ctx.strokeStyle = `rgba(${pcol},${0.35 * n.appear})`;
       ctx.lineWidth = 1.4;
       ctx.stroke();
-      // flowing particles chief -> agent
-      if (!isErr) {
-        for (let k = 0; k < 3; k++) {
-          const fr = ((this.t * 0.0006 + n.seed + k / 3) % 1);
-          const [px, py] = this.quad(cx, cy, ctrlx, ctrly, ax, ay, fr);
-          ctx.beginPath();
-          ctx.arc(px, py, 2, 0, Math.PI * 2);
-          ctx.fillStyle = `rgba(${ec},${(1 - fr) * n.appear})`;
-          ctx.shadowColor = `rgb(${ec})`; ctx.shadowBlur = 6;
-          ctx.fill(); ctx.shadowBlur = 0;
-        }
+      // flowing particles — direction is realtime: Chief->agent on dispatch,
+      // agent->Chief while the agent responds (then it fades out).
+      for (let k = 0; k < 3; k++) {
+        const fr = ((this.t * 0.0006 + n.seed + k / 3) % 1);
+        const te = inbound ? (1 - fr) : fr;        // travel param along the curve
+        const [px, py] = this.quad(cx, cy, ctrlx, ctrly, ax, ay, te);
+        const headAlpha = (inbound ? te : (1 - te)) * n.appear;  // brightest at the destination
+        ctx.beginPath();
+        ctx.arc(px, py, inbound ? 2.4 : 2, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${pcol},${headAlpha})`;
+        ctx.shadowColor = `rgb(${pcol})`; ctx.shadowBlur = inbound ? 8 : 6;
+        ctx.fill(); ctx.shadowBlur = 0;
       }
     });
 

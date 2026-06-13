@@ -2727,19 +2727,41 @@ class BaseAgent:
             await log_to_db("INFO", f"[{self.name}] Starting: {task[:80]}", task_id)
             await ws_manager.broadcast_agent_status(self.name, "running", task[:60])
             output = await self._execute(task)
+        except asyncio.CancelledError:
+            # Dispatch timed out / was cancelled. CancelledError is NOT an Exception
+            # subclass, so it would otherwise escape and leave _status stuck at
+            # "running" forever — keeping a ghost node in the Agent Flow graph. Settle
+            # the status, record it, and re-raise to honor the cancellation.
+            self._status = "idle"
+            self._current_task = ""
+            try:
+                await db_execute(
+                    "UPDATE tasks SET status='cancelled', completed_at=NOW() WHERE id=$1", task_id)
+            except Exception:
+                pass
+            raise
         except Exception as e:
             tb = traceback.format_exc()
-            await db_execute(
-                "UPDATE tasks SET status='failed', output=$1, completed_at=NOW() WHERE id=$2",
-                str(e), task_id
-            )
-            await db_execute(
-                "INSERT INTO agent_history (agent_name, task_summary, outcome) VALUES ($1, $2, 'failed')",
-                self.name, task[:120]
-            )
-            await log_to_db("ERROR", f"[{self.name}] Error: {e}", task_id)
-            self._status = "error"
-            await ws_manager.broadcast_agent_status(self.name, "error", str(e)[:60])
+            try:
+                await db_execute(
+                    "UPDATE tasks SET status='failed', output=$1, completed_at=NOW() WHERE id=$2",
+                    str(e), task_id
+                )
+                await db_execute(
+                    "INSERT INTO agent_history (agent_name, task_summary, outcome) VALUES ($1, $2, 'failed')",
+                    self.name, task[:120]
+                )
+                await log_to_db("ERROR", f"[{self.name}] Error: {e}", task_id)
+            except Exception:
+                pass
+            # Settle to idle (not a sticky "error") so the agent does not linger in the
+            # flow graph; the failure is still carried in the returned AgentResult.
+            self._status = "idle"
+            self._current_task = ""
+            try:
+                await ws_manager.broadcast_agent_status(self.name, "error", str(e)[:60])
+            except Exception:
+                pass
             return AgentResult(self.name, task, f"Error: {e}\n{tb}", False, task_id)
 
         try:
