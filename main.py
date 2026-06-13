@@ -977,64 +977,161 @@ class MCPTool:
 
 
 class FileSystemTool(MCPTool):
+    """Full file capabilities scoped to the agent workspace — like a coding agent."""
     SANDBOX = Path("/root/jaxvora-ai/workspace")
 
     def __init__(self):
-        super().__init__("file_system", "Read and write files in the workspace",
-                         risk_level="medium", requires_confirmation=True)
+        super().__init__(
+            "file_system",
+            ("Read/write/edit/append/list/mkdir/delete files in the workspace folder. "
+             "params: action (read|write|edit|append|list|mkdir|delete|exists), path, "
+             "content (for write/append), old_string + new_string (for edit). "
+             "All paths are sandboxed to /root/jaxvora-ai/workspace."),
+            risk_level="medium", requires_confirmation=True)
         self.SANDBOX.mkdir(parents=True, exist_ok=True)
 
+    def _resolve(self, raw_path: str) -> Path:
+        resolved = (self.SANDBOX / (raw_path or "")).resolve()
+        if not str(resolved).startswith(str(self.SANDBOX.resolve())):
+            raise ValueError("path escapes workspace sandbox")
+        return resolved
+
     def permission_check(self, params: Dict[str, Any]) -> Optional[str]:
-        path = params.get("path", "")
-        resolved = (self.SANDBOX / path).resolve()
         try:
-            resolved.relative_to(self.SANDBOX)
+            self._resolve(params.get("path", ""))
         except ValueError:
-            return f"Path traversal blocked: {path}"
+            return f"Path traversal blocked: {params.get('path', '')}"
         return None
 
     async def run(self, params: Dict[str, Any]) -> str:
         try:
             action = params.get("action", "read")
-            raw_path = params.get("path", "")
-            resolved = (self.SANDBOX / raw_path).resolve()
-            if not str(resolved).startswith(str(self.SANDBOX.resolve())):
-                return f"file_system error: path escapes sandbox ({self.SANDBOX})"
+            resolved = self._resolve(params.get("path", ""))
+            rel = resolved.relative_to(self.SANDBOX.resolve())
             if action == "read":
-                with open(resolved) as f:
-                    return f.read()
-            elif action == "write":
+                if not resolved.exists():
+                    return f"file_system: not found: {rel}"
+                return resolved.read_text(encoding="utf-8", errors="ignore")[:20000]
+            if action == "write":
                 resolved.parent.mkdir(parents=True, exist_ok=True)
-                with open(resolved, "w") as f:
+                content = params.get("content", "")
+                resolved.write_text(content, encoding="utf-8")
+                return f"Wrote {len(content)} chars to {rel}"
+            if action == "append":
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                with open(resolved, "a", encoding="utf-8") as f:
                     f.write(params.get("content", ""))
-                return f"Written to {resolved}"
-            return "Unknown action"
+                return f"Appended to {rel}"
+            if action == "edit":
+                if not resolved.exists():
+                    return f"file_system: not found: {rel}"
+                old = params.get("old_string", "")
+                new = params.get("new_string", "")
+                txt = resolved.read_text(encoding="utf-8", errors="ignore")
+                if old and old not in txt:
+                    return "file_system edit: old_string not found in file"
+                resolved.write_text(txt.replace(old, new) if old else txt + new, encoding="utf-8")
+                return f"Edited {rel}"
+            if action in ("list", "ls"):
+                base = resolved if resolved.is_dir() else resolved.parent
+                if not base.exists():
+                    return "(empty)"
+                items = [("[dir] " if p.is_dir() else "      ") + p.name for p in sorted(base.iterdir())]
+                return "\n".join(items) or "(empty)"
+            if action == "mkdir":
+                resolved.mkdir(parents=True, exist_ok=True)
+                return f"Created directory {rel}"
+            if action == "exists":
+                return "true" if resolved.exists() else "false"
+            if action == "delete":
+                if resolved.is_dir():
+                    import shutil
+                    shutil.rmtree(resolved)
+                elif resolved.exists():
+                    resolved.unlink()
+                else:
+                    return "file_system: nothing to delete"
+                return f"Deleted {rel}"
+            return f"file_system: unknown action '{action}'"
+        except ValueError as e:
+            return f"file_system error: {e}"
         except Exception as e:
             return f"file_system error: {e}"
 
 
 class TerminalTool(MCPTool):
-    ALLOWED_COMMANDS = {"ls", "cat", "echo", "pwd", "find", "grep", "wc", "head", "tail", "python3", "pip", "node"}
+    """Run shell commands in the agent workspace (git, npm, docker, scp, ...)."""
+    WORKSPACE = Path("/root/jaxvora-ai/workspace")
+    ALLOWED = {
+        # inspect / navigate
+        "ls", "cat", "pwd", "find", "grep", "wc", "head", "tail", "tree", "which",
+        "file", "stat", "du", "df", "echo", "env", "date", "whoami", "sort", "uniq", "diff",
+        # file ops
+        "mkdir", "touch", "cp", "mv", "rm", "sed", "awk", "tar", "unzip", "zip", "chmod", "ln",
+        # dev toolchains
+        "git", "npm", "npx", "node", "yarn", "pnpm", "python3", "python", "pip", "pip3",
+        "go", "cargo", "rustc", "make", "gcc", "g++", "java", "mvn", "gradle",
+        # ops
+        "docker", "docker-compose", "curl", "wget", "scp", "ssh", "kubectl",
+    }
+    DENY = ["rm -rf /", "rm -rf /*", "rm -rf ~", "mkfs", "dd if=", " :/", "shutdown",
+            "reboot", "> /etc", "/etc/passwd", "/etc/shadow", "/root/.ssh", "sudo ",
+            "chmod -R 777 /", ":(){", "> /dev/sda"]
 
     def __init__(self):
-        super().__init__("terminal", "Run sandboxed shell commands (read-only)",
-                         risk_level="high", requires_confirmation=True)
+        super().__init__(
+            "terminal",
+            ("Run a shell command inside the workspace folder (/root/jaxvora-ai/workspace). "
+             "Supports git, npm/npx/node, python3/pip, go, cargo, make, docker, curl, scp, and "
+             "file ops. params: command (string), timeout (seconds, default 120). One command "
+             "per call — no pipes/redirects/&&."),
+            risk_level="high", requires_confirmation=True)
+        self.WORKSPACE.mkdir(parents=True, exist_ok=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
-        cmd = params.get("command", "")
+        cmd = (params.get("command") or "").strip()
+        if not cmd:
+            return "terminal error: empty command"
+        low = cmd.lower()
+        for bad in self.DENY:
+            if bad in low:
+                return f"Command blocked for safety (matched '{bad.strip()}')."
         try:
             parts = shlex.split(cmd)
         except ValueError:
-            return "terminal error: invalid command string"
-        if not parts or parts[0] not in self.ALLOWED_COMMANDS:
-            return f"Command blocked for safety: {cmd}"
+            return "terminal error: could not parse command"
+        if not parts:
+            return "terminal error: empty command"
+        if parts[0] not in self.ALLOWED:
+            return f"Command '{parts[0]}' is not allowed. Allowed: {', '.join(sorted(self.ALLOWED))}"
+        for p in parts[1:]:
+            if ".." in p.split("/"):
+                return f"Parent-directory access blocked: {p}"
+            if p.startswith("/") and not p.startswith("-") and "://" not in p and not p.startswith(str(self.WORKSPACE)):
+                return f"Absolute path outside workspace blocked: {p}"
         try:
-            result = subprocess.run(
-                parts, shell=False, capture_output=True, text=True, timeout=10
+            timeout_s = float(params.get("timeout", 120) or 120)
+        except (TypeError, ValueError):
+            timeout_s = 120.0
+        timeout_s = max(1.0, min(timeout_s, 300.0))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *parts, cwd=str(self.WORKSPACE),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
-            return result.stdout or result.stderr or "(no output)"
-        except subprocess.TimeoutExpired:
-            return "Command timed out"
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return f"Command timed out after {int(timeout_s)}s"
+            text = (out or b"").decode("utf-8", "ignore")
+            text = text[:8000] if text.strip() else f"(exit {proc.returncode}, no output)"
+            return f"$ {cmd}\n{text}"
+        except FileNotFoundError:
+            return f"terminal error: '{parts[0]}' is not installed on the server"
         except Exception as e:
             return f"terminal error: {e}"
 
@@ -2753,6 +2850,22 @@ Your role: parse user intent, create execution plans, route to specialist agents
 Write user-facing responses in clean markdown with short headings, bullets, and fenced code blocks when useful.
 Do not return raw JSON, internal traces, or long unstructured paragraphs in the final response.
 Never say Jaxvora cannot use a configured tool; route tool-specific requests before giving generic advice.
+
+WORKSPACE EXECUTION — act like a coding agent (Codex / Claude Code style). When the user asks you to build, create, scaffold, write, edit, or run code, apps, websites, scripts, or files, ACTUALLY do it with tools instead of only describing it:
+- Create every file the project needs with the file_system tool (action=write). Put the project under its own folder when the user names one (e.g. jax-todolist/).
+- Run, build, and verify with the terminal tool (go, npm, node, python3, git, scp, curl, etc.). Tools run inside the workspace folder.
+- Then <finalize> with a short summary listing the files you created and the key command output.
+Example ACT blocks:
+<mcp_call tool="file_system" subtask_id="1">
+  <parameter name="action">write</parameter>
+  <parameter name="path">jax-todolist/main.go</parameter>
+  <parameter name="content">package main
+// ... full file contents here ...
+</parameter>
+</mcp_call>
+<mcp_call tool="terminal" subtask_id="2">
+  <parameter name="command">go build ./jax-todolist</parameter>
+</mcp_call>
 
 Available agents:
 Engineering: AI Engineer, Software Engineer, Debug Agent, QA/Test Agent, Code Review, Architecture, Database, DevOps
