@@ -183,24 +183,21 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 }
 body.chat-view #content { overflow: hidden; }
 
-/* ── Right Sidebar: Agent Flow Graph ── */
+/* ── Agent Flow: live node-link graph (docked panel, not a popup) ── */
 #right-sidebar {
-  position: fixed;
-  top: 60px;
-  right: 0;
-  width: 300px;
-  height: calc(100vh - 60px);
-  background: rgba(10,11,15,0.95);
+  position: relative;
+  width: 340px;
+  flex-shrink: 0;
+  align-self: stretch;
+  background: rgba(10,11,15,0.96);
   border-left: 1px solid var(--border);
   backdrop-filter: blur(20px);
   display: flex;
   flex-direction: column;
-  z-index: 100;
-  transform: translateX(0);
-  transition: transform 0.25s ease;
   overflow: hidden;
+  transition: width 0.25s ease;
 }
-#right-sidebar.hidden { transform: translateX(100%); }
+#right-sidebar.hidden { display: none; }
 .rs-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 16px;
@@ -213,55 +210,24 @@ body.chat-view #content { overflow: hidden; }
   letter-spacing: 1px;
   flex-shrink: 0;
 }
-.rs-tree-wrap { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; min-height: 0; }
-.rs-tree-wrap::-webkit-scrollbar { width: 4px; }
-.rs-tree-wrap::-webkit-scrollbar-track { background: transparent; }
-.rs-tree-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-.rs-tree { padding: 6px 8px; font-family: var(--mono); font-size: 10px; color: var(--text); }
-.rs-tree-chief {
-  background: var(--glass); border: 1px solid var(--border); border-radius: 8px;
-  padding: 6px 12px; margin-bottom: 8px; text-align: center; cursor: pointer;
-  transition: box-shadow 0.2s;
+.rs-header .rs-right { display: flex; align-items: center; gap: 10px; }
+.rs-live { display: inline-flex; align-items: center; gap: 6px; font-size: 9px; color: var(--teal); letter-spacing: 0.5px; }
+.rs-live::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--teal); box-shadow: 0 0 6px var(--teal); animation: pulse 1.6s infinite;
 }
-.rs-tree-chief .label { font-size: 11px; font-weight: 700; }
-.rs-tree-chief .badge { font-size: 8px; color: var(--violet2); font-weight: 700; margin-left: 4px; }
-.rs-tree-chief .status { font-size: 9px; margin-top: 1px; font-family: var(--mono); }
-.rs-tree-div {}
-.rs-tree-div-header {
-  display: flex; align-items: center; gap: 4px; padding: 3px 8px; cursor: pointer;
-  border-radius: 4px; font-size: 9px; font-weight: 600; color: var(--text2);
-  border-left: 2px solid var(--border); margin: 1px 0;
-}
-.rs-tree-div-header:hover { background: rgba(255,255,255,0.04); border-left-color: var(--violet); }
-.rs-tree-agent {
-  display: flex; align-items: center; gap: 3px; padding: 2px 8px 2px 20px;
-  font-size: 9px; cursor: pointer; border-left: 2px solid var(--border);
-  margin-left: 8px; border-radius: 0;
-}
-.rs-tree-agent:hover { background: rgba(255,255,255,0.04); border-left-color: var(--violet); }
-.rs-tree-agent .name { color: var(--text); }
-.rs-tree-agent .st { font-size: 7px; font-family: var(--mono); margin-left: auto; flex-shrink: 0; }
-.rs-tree-agent .task { display: none; font-size: 7px; color: var(--text3); margin-left: 4px; overflow: hidden; text-overflow: ellipsis; max-width: 70px; white-space: nowrap; }
-.rs-tree-agent:hover .task { display: inline-block; }
-.rs-flow-particle {
-  position: absolute;
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--violet);
-  z-index: 1;
-  pointer-events: none;
-  box-shadow: 0 0 8px var(--violet);
-  animation: particleMove 2s ease-in-out infinite;
-}
-@keyframes particleMove {
-  0% { opacity: 0; }
-  20% { opacity: 1; }
-  80% { opacity: 1; }
-  100% { opacity: 0; }
+.rs-body { position: relative; flex: 1 1 auto; min-height: 0; }
+#flow-canvas { display: block; width: 100%; height: 100%; cursor: pointer; }
+.rs-empty {
+  position: absolute; left: 0; right: 0; bottom: 14px;
+  text-align: center; font-family: var(--mono); font-size: 9px;
+  color: var(--text3); letter-spacing: 0.5px; pointer-events: none;
+  transition: opacity 0.3s;
 }
 .rs-legend {
   display: flex;
   gap: 12px;
+  justify-content: center;
   padding: 8px 16px;
   border-top: 1px solid var(--border);
   font-size: 9px;
@@ -276,7 +242,24 @@ body.chat-view #content { overflow: hidden; }
   margin-right: 4px;
   vertical-align: middle;
 }
-@media (max-width: 1100px) { #right-sidebar { display: none; } }
+#flow-backdrop {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,0.55); backdrop-filter: blur(2px); z-index: 940;
+}
+
+/* Tablet / mobile: panel becomes a clean slide-in overlay (no longer hidden) */
+@media (max-width: 1024px) {
+  #right-sidebar {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: min(92vw, 400px); height: 100%;
+    z-index: 950; transform: translateX(105%);
+    transition: transform 0.28s ease;
+    box-shadow: -18px 0 50px rgba(0,0,0,0.45);
+  }
+  #right-sidebar.hidden { display: flex; transform: translateX(105%); }
+  #right-sidebar:not(.hidden) { transform: translateX(0); }
+  body.flow-open #flow-backdrop { display: block; }
+}
 
 /* ── Section visibility ── */
 .section { display: none; }
@@ -1203,23 +1186,23 @@ body.chat-view #content { overflow: hidden; }
   </div><!-- /content -->
 </div><!-- /main -->
 
-<!-- ── Right Sidebar: Agent Flow Graph ── -->
+<!-- ── Agent Flow: live node-link graph ── -->
+<div id="flow-backdrop" onclick="closeRightSidebar()"></div>
 <aside id="right-sidebar">
   <div class="rs-header">
     <span>⚡ Agent Flow</span>
-    <button class="btn btn-sm" onclick="toggleRightSidebar()" style="font-size:14px;padding:2px 8px;background:transparent;border:none;color:var(--text2);cursor:pointer">✕</button>
+    <span class="rs-right">
+      <span class="rs-live" id="rs-live">live</span>
+      <button class="btn btn-sm" onclick="toggleRightSidebar()" aria-label="Close agent flow" style="font-size:14px;padding:2px 8px;background:transparent;border:none;color:var(--text2);cursor:pointer">✕</button>
+    </span>
   </div>
-  <div class="rs-tree-wrap">
-    <div class="rs-tree" id="rs-tree">
-      <div class="rs-tree-chief" id="rs-node-chief">
-        <div class="label">👑 Chief Orchestrator <span class="badge">CEO</span></div>
-        <div class="status" id="rs-chief-status">● idle</div>
-      </div>
-    </div>
+  <div class="rs-body">
+    <canvas id="flow-canvas"></canvas>
+    <div class="rs-empty" id="rs-empty">Chief idle · awaiting dispatch</div>
   </div>
   <div class="rs-legend">
-    <span><span class="rs-dot" style="background:var(--teal)"></span> idle</span>
-    <span><span class="rs-dot" style="background:var(--violet2);animation:pulse 1s infinite"></span> running</span>
+    <span><span class="rs-dot" style="background:var(--violet2)"></span> chief</span>
+    <span><span class="rs-dot" style="background:var(--teal);animation:pulse 1.2s infinite"></span> working</span>
     <span><span class="rs-dot" style="background:var(--red)"></span> error</span>
   </div>
 </aside>
@@ -1386,14 +1369,19 @@ function connectChatWs() {
   try { chatWs?.close(); } catch {}
   chatWs = new WebSocket(wsUrl('/ws/chat'));
   chatWs.onmessage = wsOnMessage(d => {
-    if (d.type === 'thinking') appendMsg('bot thinking', d.message);
-    else if (d.type === 'company_start') appendMsg('bot thinking', `Company mode: ${d.agents.length} agents working in parallel...`);
-    else if (d.type === 'agent_start') appendMsg('bot', `Running ${d.agent}...`);
-    else if (d.type === 'agent_done') appendMsg('bot', `${d.success ? 'Done' : 'Failed'}: ${d.agent}`);
+    if (d.type === 'thinking') { appendMsg('bot thinking', d.message); updateRsAgentStatus('Chief Orchestrator', 'running', 'thinking'); }
+    else if (d.type === 'company_start') {
+      appendMsg('bot thinking', `Company mode: ${d.agents.length} agents working in parallel...`);
+      updateRsAgentStatus('Chief Orchestrator', 'running', 'dispatching');
+      (d.agents || []).forEach(a => updateRsAgentStatus(typeof a === 'string' ? a : (a && a.name), 'running', 'queued'));
+    }
+    else if (d.type === 'agent_start') { appendMsg('bot', `Running ${d.agent}...`); updateRsAgentStatus(d.agent, 'running', d.task || 'working'); }
+    else if (d.type === 'agent_done') { appendMsg('bot', `${d.success ? 'Done' : 'Failed'}: ${d.agent}`); updateRsAgentStatus(d.agent, d.success ? 'idle' : 'error', ''); }
     else if (d.type === 'response') {
       removeThinking();
       appendMsg('bot', d.message, d.agents);
-    } else if (d.type === 'error') appendMsg('bot', `Error: ${d.message}`);
+      flowSettle(d.agents);
+    } else if (d.type === 'error') { appendMsg('bot', `Error: ${d.message}`); updateRsAgentStatus('Chief Orchestrator', 'idle', ''); }
   });
   chatWs.onerror = e => console.error('Chat WS error:', e);
   chatWs.onclose = () => { wsReconnectGuard = false; setTimeout(connectChatWs, 3000); };
@@ -1693,6 +1681,7 @@ function renderAgents(agents) {
     grid.appendChild(card);
   });
   updateDashboardRings();
+  flowSyncFromAgents(latestAgents);
 }
 
 async function loadOrganization() {
@@ -2271,21 +2260,37 @@ async function generateAndDownload(filename, content, contentType) {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  connectChatWs();
-  connectLogsWs();
-  connectAgentsWs();
-  connectTasksWs();
+  initRightSidebar();
+
+  // Same-origin (live VM) supports WebSocket upgrades; the Vercel frontend
+  // proxies API/WS via rewrites where WS upgrades do not survive, so there we
+  // poll the HTTP endpoints instead to keep the dashboard and flow graph live.
+  const isVercelFrontend = location.hostname.endsWith('.vercel.app');
+  if (!isVercelFrontend) {
+    connectChatWs();
+    connectLogsWs();
+    connectAgentsWs();
+    connectTasksWs();
+  } else {
+    const ss = document.getElementById('sys-status');
+    if (ss) ss.textContent = 'online';
+  }
+
   loadDashboard();
   loadAgents();
 
-  // Poll dashboard every 30s
   setInterval(loadDashboard, 30000);
+  setInterval(loadAgents, 15000); // keeps the live Agent Flow graph in sync where WS is unavailable
 
-  // Init right sidebar with agent tree
-  initRightSidebar();
+  // The flow panel is docked on desktop; on small screens start it collapsed.
+  if (window.matchMedia('(max-width: 1024px)').matches) {
+    const rs = document.getElementById('right-sidebar');
+    if (rs) rs.classList.add('hidden');
+    document.body.classList.remove('flow-open');
+  }
 });
 
-// ── Right Sidebar: Agent Flow Graph ──────────────────────────────────────────
+// ── Agent Flow: live node-link graph (Chief → active agents only) ────────────
 
 const RS_DIVISIONS = [
   { name: 'Engineering', color: '#9ece6a', lead: 'Architecture', agents: ['AI Engineer','Software Engineer','Debug Agent','QA/Test Agent','Code Review','Architecture','Database','DevOps','Backend Engineer','Frontend Engineer'] },
@@ -2295,89 +2300,293 @@ const RS_DIVISIONS = [
   { name: 'Product', color: '#ff9e64', lead: 'Product Manager', agents: ['Product Manager','Documentation','Research','UX Designer','Requirements Analyst'] },
   { name: 'Executive', color: '#a9b1d6', lead: 'Risk & Planning Agent', agents: ['Project Intelligence','Jaxvora Doctor','Strategy Agent','Risk & Planning Agent'] },
 ];
-let rsAgentNodes = {};
-let rsAnimFrame = null;
+const AGENT_META = {};
+RS_DIVISIONS.forEach(d => d.agents.forEach(a => { AGENT_META[a] = { division: d.name, color: d.color, lead: a === d.lead }; }));
 
-function initRightSidebar() {
-  const tree = document.getElementById('rs-tree');
-  if (!tree) return;
-  // Remove old agent entries, keep chief
-  tree.querySelectorAll('.rs-tree-div, .rs-tree-agent').forEach(el => el.remove());
-  rsAgentNodes = {};
-
-  RS_DIVISIONS.forEach((div, di) => {
-    const divEl = document.createElement('div');
-    divEl.className = 'rs-tree-div';
-    divEl.innerHTML = `<div class="rs-tree-div-header" style="border-left-color:${div.color}"><span style="color:${div.color}">◆</span> ${div.name} <span style="color:var(--text3);margin-left:auto">${div.agents.length}</span></div>`;
-    tree.appendChild(divEl);
-
-    div.agents.forEach((name) => {
-      const isLead = name === div.lead;
-      const agentEl = document.createElement('div');
-      agentEl.className = 'rs-tree-agent';
-      agentEl.id = 'rs-agent-' + name.replace(/\s+/g, '-');
-      agentEl.title = div.name + (isLead ? ' (Lead)' : '');
-      agentEl.innerHTML = `<span class="name">${isLead ? '★ ' : ''}${name}</span><span class="st idle" id="rs-st-${name.replace(/\s+/g,'-')}" style="color:var(--teal)">●</span><span class="task" id="rs-tsk-${name.replace(/\s+/g,'-')}"></span>`;
-      agentEl.onclick = () => {
-        const m = document.getElementById('agent-modal');
-        if (m) { openAgentModal(name); }
-      };
-      tree.appendChild(agentEl);
-      rsAgentNodes[name] = { el: agentEl, div: div.name, lead: isLead };
-    });
-  });
+function flowHexToRgb(h) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h || '');
+  return m ? [parseInt(m[1],16), parseInt(m[2],16), parseInt(m[3],16)] : [139,133,255];
 }
+function flowShort(name) { return name.length > 16 ? name.slice(0, 15) + '…' : name; }
+
+const flow = {
+  canvas: null, ctx: null, dpr: 1, w: 0, h: 0,
+  chief: { status: 'idle', task: '', phase: 0 },
+  agents: new Map(),
+  raf: null, t: 0, lastTs: 0, _loop: null,
+
+  init() {
+    this.canvas = document.getElementById('flow-canvas');
+    if (!this.canvas) return;
+    this.ctx = this.canvas.getContext('2d');
+    this._loop = this.loop.bind(this);
+    this.resize();
+    if ('ResizeObserver' in window) {
+      this.ro = new ResizeObserver(() => this.resize());
+      this.ro.observe(this.canvas.parentElement || this.canvas);
+    }
+    window.addEventListener('resize', () => this.resize());
+    this.canvas.addEventListener('click', (e) => this.onClick(e));
+    this.ensureRunning();
+  },
+
+  resize() {
+    if (!this.canvas) return;
+    const r = this.canvas.getBoundingClientRect();
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.w = Math.max(1, r.width); this.h = Math.max(1, r.height);
+    this.canvas.width = Math.round(this.w * this.dpr);
+    this.canvas.height = Math.round(this.h * this.dpr);
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.layout();
+    this.ensureRunning();
+  },
+
+  visible() {
+    const rs = document.getElementById('right-sidebar');
+    return rs && !rs.classList.contains('hidden') && this.w > 1;
+  },
+
+  makeNode(name) {
+    const meta = AGENT_META[name] || { color: '#8b85ff', division: '', lead: false };
+    return { name, color: meta.color, division: meta.division, lead: meta.lead,
+      status: 'running', task: '', appear: 0, removing: false,
+      angle: undefined, targetAngle: 0, phase: this.t * 0.003 + this.agents.size,
+      seed: (this.agents.size * 0.37) % 1 };
+  },
+
+  // public API — name/status('running'|'idle'|'error')/task
+  set(name, status, task) {
+    if (!name) return;
+    if (name === 'Chief Orchestrator') { this.setChief(status, task); return; }
+    if (status === 'idle') { this.deactivate(name); return; }
+    let n = this.agents.get(name);
+    if (!n) { n = this.makeNode(name); this.agents.set(name, n); this.layout(); }
+    n.status = status; n.task = task || n.task || ''; n.removing = false;
+    if (this.chief.status !== 'running') this.setChief('running', this.chief.task || 'orchestrating');
+    this.ensureRunning();
+  },
+
+  deactivate(name) {
+    const n = this.agents.get(name);
+    if (n) n.removing = true;
+    this.ensureRunning();
+  },
+
+  setChief(status, task) {
+    this.chief.status = status === 'running' ? 'running' : 'idle';
+    this.chief.task = status === 'running' ? (task || this.chief.task || 'orchestrating') : '';
+    this.ensureRunning();
+  },
+
+  layout() {
+    const live = [...this.agents.values()].filter(n => !n.removing);
+    const n = live.length;
+    live.forEach((node, i) => {
+      node.targetAngle = -Math.PI / 2 + (i / Math.max(1, n)) * Math.PI * 2;
+      if (node.angle === undefined) node.angle = node.targetAngle;
+    });
+  },
+
+  ensureRunning() {
+    this.updateOverlay();
+    if (this.visible() && !this.raf) { this.lastTs = 0; this.raf = requestAnimationFrame(this._loop); }
+  },
+
+  updateOverlay() {
+    const empty = document.getElementById('rs-empty');
+    if (!empty) return;
+    const live = [...this.agents.values()].filter(n => !n.removing).length;
+    if (live === 0 && this.chief.status !== 'running') {
+      empty.textContent = 'Chief idle · awaiting dispatch'; empty.style.opacity = '1';
+    } else {
+      empty.textContent = live + ' agent' + (live === 1 ? '' : 's') + ' working in parallel';
+      empty.style.opacity = '0.7';
+    }
+  },
+
+  loop(ts) {
+    this.raf = null;
+    if (!this.lastTs) this.lastTs = ts;
+    const dt = Math.min(64, ts - this.lastTs); this.lastTs = ts;
+    this.t += dt;
+    this.update(dt);
+    this.draw();
+    if (this.visible()) this.raf = requestAnimationFrame(this._loop);
+  },
+
+  update(dt) {
+    const dead = [];
+    this.agents.forEach((n, name) => {
+      if (n.removing) { n.appear -= dt / 320; if (n.appear <= 0) dead.push(name); }
+      else if (n.appear < 1) { n.appear = Math.min(1, n.appear + dt / 360); }
+      if (n.angle === undefined) n.angle = n.targetAngle;
+      let diff = n.targetAngle - n.angle;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      n.angle += diff * Math.min(1, dt / 140);
+    });
+    if (dead.length) { dead.forEach(name => this.agents.delete(name)); this.layout(); this.updateOverlay(); }
+    this.chief.phase += dt;
+  },
+
+  quad(x0, y0, cx, cy, x1, y1, t) {
+    const u = 1 - t;
+    return [u*u*x0 + 2*u*t*cx + t*t*x1, u*u*y0 + 2*u*t*cy + t*t*y1];
+  },
+
+  draw() {
+    const ctx = this.ctx; if (!ctx) return;
+    ctx.clearRect(0, 0, this.w, this.h);
+    const cx = this.w / 2, cy = this.h / 2;
+    const R = Math.max(70, Math.min(this.w, this.h) * 0.34);
+    const live = [...this.agents.values()];
+
+    // faint orbit ring (depth cue)
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(108,99,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // edges + particles (behind nodes)
+    live.forEach(n => {
+      const float = Math.sin(this.t * 0.0016 + n.phase);
+      const rad = R * (0.55 + 0.45 * n.appear);
+      const ax = cx + Math.cos(n.angle) * rad + Math.cos(n.angle) * float * 4;
+      const ay = cy + Math.sin(n.angle) * rad + Math.sin(n.angle) * float * 4;
+      n._x = ax; n._y = ay;
+      const mx = (cx + ax) / 2, my = (cy + ay) / 2;
+      const perp = n.angle + Math.PI / 2;
+      const ctrlx = mx + Math.cos(perp) * 18, ctrly = my + Math.sin(perp) * 18;
+      const [r, g, b] = flowHexToRgb(n.color);
+      const isErr = n.status === 'error';
+      const ec = isErr ? '255,77,106' : `${r},${g},${b}`;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.quadraticCurveTo(ctrlx, ctrly, ax, ay);
+      ctx.strokeStyle = `rgba(${ec},${0.35 * n.appear})`;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      // flowing particles chief -> agent
+      if (!isErr) {
+        for (let k = 0; k < 3; k++) {
+          const fr = ((this.t * 0.0006 + n.seed + k / 3) % 1);
+          const [px, py] = this.quad(cx, cy, ctrlx, ctrly, ax, ay, fr);
+          ctx.beginPath();
+          ctx.arc(px, py, 2, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${ec},${(1 - fr) * n.appear})`;
+          ctx.shadowColor = `rgb(${ec})`; ctx.shadowBlur = 6;
+          ctx.fill(); ctx.shadowBlur = 0;
+        }
+      }
+    });
+
+    // agent nodes
+    live.forEach(n => {
+      const breathe = 1 + 0.06 * Math.sin(this.t * 0.002 + n.phase);
+      const rNode = (n.lead ? 9 : 7) * n.appear * breathe;
+      const [r, g, b] = flowHexToRgb(n.color);
+      const isErr = n.status === 'error';
+      const col = isErr ? '255,77,106' : `${r},${g},${b}`;
+      n._r = rNode + 6;
+      const grad = ctx.createRadialGradient(n._x, n._y, 0, n._x, n._y, rNode * 3);
+      grad.addColorStop(0, `rgba(${col},${0.5 * n.appear})`);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(n._x, n._y, rNode * 3, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(n._x, n._y, rNode, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${col},${0.92 * n.appear})`; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = `rgba(255,255,255,${0.5 * n.appear})`; ctx.stroke();
+      // label
+      ctx.font = (n.lead ? '600 ' : '500 ') + '9px JetBrains Mono, monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = `rgba(232,233,240,${0.92 * n.appear})`;
+      const ly = n._y + rNode + 9;
+      ctx.fillText((n.lead ? '★ ' : '') + flowShort(n.name), n._x, ly);
+    });
+
+    // chief node (center, on top)
+    const running = this.chief.status === 'running';
+    const cPulse = running ? 1 + 0.10 * Math.sin(this.t * 0.005) : 1;
+    const cr = 16 * cPulse;
+    this.chiefHit = { x: cx, y: cy, r: cr + 8 };
+    const cg = ctx.createRadialGradient(cx, cy, 0, cx, cy, cr * 3.4);
+    cg.addColorStop(0, running ? 'rgba(139,133,255,0.55)' : 'rgba(108,99,255,0.28)');
+    cg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = cg;
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 3.4, 0, Math.PI * 2); ctx.fill();
+    const cgrad = ctx.createLinearGradient(cx - cr, cy - cr, cx + cr, cy + cr);
+    cgrad.addColorStop(0, '#6c63ff'); cgrad.addColorStop(1, '#00d4aa');
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, Math.PI * 2); ctx.fillStyle = cgrad; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = running ? 'rgba(139,133,255,0.9)' : 'rgba(255,255,255,0.4)'; ctx.stroke();
+    ctx.font = '13px JetBrains Mono, monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('👑', cx, cy + 0.5);
+    ctx.font = '600 9px JetBrains Mono, monospace';
+    ctx.fillStyle = 'rgba(232,233,240,0.95)';
+    ctx.fillText('Chief Orchestrator', cx, cy + cr + 12);
+    if (running && this.chief.task) {
+      ctx.font = '8px JetBrains Mono, monospace'; ctx.fillStyle = 'rgba(139,133,255,0.85)';
+      ctx.fillText('→ ' + flowShort(this.chief.task), cx, cy + cr + 23);
+    }
+  },
+
+  onClick(e) {
+    const r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) return;
+    let hit = null, best = 1e9;
+    this.agents.forEach(n => {
+      if (n._x === undefined) return;
+      const dd = Math.hypot(x - n._x, y - n._y);
+      if (dd <= (n._r || 12) && dd < best) { best = dd; hit = n.name; }
+    });
+    if (hit && document.getElementById('agent-modal')) openAgentModal(hit);
+  },
+};
+
+function initRightSidebar() { flow.init(); }
+
+function updateRsAgentStatus(name, status, task) { flow.set(name, status, task); }
 
 function toggleRightSidebar() {
-  document.getElementById('right-sidebar').classList.toggle('hidden');
+  const rs = document.getElementById('right-sidebar');
+  if (!rs) return;
+  const willHide = !rs.classList.contains('hidden');
+  rs.classList.toggle('hidden', willHide);
+  document.body.classList.toggle('flow-open', !willHide);
+  if (!willHide) { flow.resize(); flow.ensureRunning(); }
 }
 
-function updateRsAgentStatus(name, status, task) {
-  if (name === 'Chief Orchestrator') {
-    const chiefStatus = document.getElementById('rs-chief-status');
-    const chiefNode = document.getElementById('rs-node-chief');
-    if (chiefStatus) {
-      if (status === 'running') {
-        chiefStatus.textContent = '→ ' + (task || 'processing');
-        chiefStatus.style.color = 'var(--violet2)';
-      } else {
-        chiefStatus.textContent = '● idle';
-        chiefStatus.style.color = 'var(--teal)';
-      }
-    }
-    if (chiefNode) {
-      chiefNode.style.boxShadow = status === 'running' ? '0 0 20px rgba(108,99,255,0.5)' : 'none';
-      chiefNode.style.borderColor = status === 'running' ? 'var(--violet2)' : 'var(--border)';
-    }
-    if (status === 'running') spawnParticle();
-    return;
-  }
-
-  const id = name.replace(/\s+/g, '-');
-  const statusEl = document.getElementById('rs-st-' + id);
-  const taskEl = document.getElementById('rs-tsk-' + id);
-  const card = document.getElementById('rs-agent-' + id);
-  if (statusEl) {
-    statusEl.textContent = status === 'running' ? '◆' : status === 'error' ? '▲' : '●';
-    statusEl.style.color = status === 'running' ? 'var(--violet2)' : status === 'error' ? 'var(--red)' : 'var(--teal)';
-  }
-  if (taskEl) taskEl.textContent = (task || '').slice(0, 30);
-  if (card) {
-    card.style.borderLeftColor = status === 'running' ? 'var(--violet2)' : status === 'error' ? 'var(--red)' : 'var(--border)';
-    card.style.background = status === 'running' ? 'rgba(108,99,255,0.1)' : 'transparent';
-  }
+function closeRightSidebar() {
+  const rs = document.getElementById('right-sidebar');
+  if (!rs) return;
+  rs.classList.add('hidden');
+  document.body.classList.remove('flow-open');
 }
 
-function spawnParticle() {
-  const tree = document.getElementById('rs-tree');
-  if (!tree) return;
-  const p = document.createElement('div');
-  p.className = 'rs-flow-particle';
-  p.style.left = '50%';
-  p.style.top = '20px';
-  p.style.transform = 'translateX(-50%)';
-  tree.appendChild(p);
-  setTimeout(() => p.remove(), 2000);
+// Settle the graph back to idle a moment after a response completes.
+function flowSettle(agents) {
+  const involved = (agents || []).map(a => typeof a === 'string' ? a : (a && a.name)).filter(Boolean);
+  setTimeout(() => {
+    involved.forEach(a => updateRsAgentStatus(a, 'idle', ''));
+    flow.agents.forEach((n, name) => updateRsAgentStatus(name, 'idle', ''));
+    updateRsAgentStatus('Chief Orchestrator', 'idle', '');
+  }, 1800);
+}
+
+// Drive the graph from a polled /agents snapshot (live Vercel frontend path).
+function flowSyncFromAgents(list) {
+  if (!Array.isArray(list)) return;
+  const active = new Set();
+  list.forEach(a => {
+    if (a.status === 'running' || a.status === 'error') {
+      active.add(a.name);
+      flow.set(a.name, a.status, a.current_task || '');
+    }
+  });
+  flow.agents.forEach((n, name) => { if (!active.has(name) && !n.removing) flow.deactivate(name); });
+  flow.setChief(active.size > 0 ? 'running' : 'idle', active.size > 0 ? 'orchestrating' : '');
 }
 
 function switchKbTab(name) {

@@ -12,6 +12,7 @@ rmSync(outputDir, { recursive: true, force: true });
 mkdirSync(outputDir, { recursive: true });
 
 let html = readFileSync(sourceHtml, "utf8");
+html = html.replace(/\r\n/g, "\n");
 html = html.replace(
   /<title>.*?<\/title>/,
   "<title>Jaxvora - AI Command Center</title>",
@@ -20,34 +21,10 @@ html = html.replace(
   "</head>",
   '<meta name="description" content="Jaxvora autonomous multi-agent AI command center" />\n</head>',
 );
-html = html.replace(
-  `  connectChatWs();
-  connectLogsWs();
-  connectAgentsWs();
-  connectTasksWs();
-  loadDashboard();
-  loadAgents();
 
-  // Poll dashboard every 30s
-  setInterval(loadDashboard, 30000);
-  setInterval(loadApprovals, 15000);`,
-  `  const isVercelFrontend = location.hostname.endsWith('.vercel.app');
-  if (!isVercelFrontend) {
-    connectChatWs();
-    connectLogsWs();
-    connectAgentsWs();
-    connectTasksWs();
-  } else {
-    document.getElementById('sys-status').textContent = 'online';
-  }
-  loadDashboard();
-  loadAgents();
-
-  // Vercel proxies HTTP to the VM backend; poll where WebSocket upgrades are unavailable.
-  setInterval(loadDashboard, 30000);
-  setInterval(loadAgents, 15000);
-  setInterval(loadApprovals, 15000);`,
-);
+// NOTE: the Vercel-vs-VM runtime split (WebSocket on same-origin, HTTP polling
+// on the Vercel frontend) now lives in the source index.html DOMContentLoaded
+// handler, so this build step no longer needs a brittle string replacement.
 
 writeFileSync(outputHtml, html);
 writeFileSync(resolve(outputDir, "robots.txt"), "User-agent: *\nAllow: /\n");
