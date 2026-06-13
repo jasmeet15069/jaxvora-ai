@@ -42,6 +42,14 @@ logger = logging.getLogger("jaxvora")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 DEEPSEEK_V4_API_KEY = os.environ.get("DEEPSEEK_V4_API_KEY", "")
+
+# OpenCode Zen — free/unlimited DeepSeek V4 Flash, used as the agents' brain.
+OPENCODE_ZEN_API_KEY = os.environ.get("OPENCODE_ZEN_API_KEY", "")
+OPENCODE_ZEN_BASE = os.environ.get("OPENCODE_ZEN_BASE", "https://opencode.ai/zen/v1")
+OPENCODE_ZEN_MODEL = os.environ.get("OPENCODE_ZEN_MODEL", "deepseek-v4-flash-free")
+# When the key is present, route every agent LLM call through OpenCode Zen
+# (override with OPENCODE_ZEN_PRIMARY=0 to fall back to per-agent providers).
+OPENCODE_ZEN_PRIMARY = bool(OPENCODE_ZEN_API_KEY) and os.environ.get("OPENCODE_ZEN_PRIMARY", "1") not in ("0", "false", "False", "no")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 
@@ -80,6 +88,39 @@ MAX_UPLOAD_TEXT_CHARS = 24000
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
 
+async def call_opencode_zen(system: str, user: str, max_tokens: int = DEEPSEEK_V4_MAX_TOKENS) -> str:
+    """OpenAI-compatible call to OpenCode Zen (DeepSeek V4 Flash Free)."""
+    cached = await redis_cache.get("llm", f"zen|{OPENCODE_ZEN_MODEL}|{system}|{user}")
+    if cached:
+        return cached
+    if not OPENCODE_ZEN_API_KEY:
+        return await call_openrouter(system, user)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"{OPENCODE_ZEN_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENCODE_ZEN_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENCODE_ZEN_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "max_tokens": max_tokens,
+                },
+            )
+            r.raise_for_status()
+            result = r.json()["choices"][0]["message"]["content"]
+            await redis_cache.set("llm", f"zen|{OPENCODE_ZEN_MODEL}|{system}|{user}", result)
+            return result
+    except Exception as e:
+        logger.warning(f"OpenCode Zen error: {e} — falling back to OpenRouter")
+        return await call_openrouter(system, user)
+
+
 async def call_openrouter(system: str, user: str, model: str = DEEPSEEK_MODEL) -> str:
     cached = await redis_cache.get("llm", f"or|{model}|{system}|{user}")
     if cached:
@@ -113,6 +154,8 @@ async def call_openrouter(system: str, user: str, model: str = DEEPSEEK_MODEL) -
 
 
 async def call_groq(system: str, user: str) -> str:
+    if OPENCODE_ZEN_PRIMARY:
+        return await call_opencode_zen(system, user)
     cached = await redis_cache.get("llm", f"groq|{system}|{user}")
     if cached:
         return cached
@@ -160,6 +203,8 @@ async def call_groq(system: str, user: str) -> str:
 
 
 async def call_deepseek_v4(system: str, user: str) -> str:
+    if OPENCODE_ZEN_PRIMARY:
+        return await call_opencode_zen(system, user)
     if not DEEPSEEK_V4_API_KEY:
         logger.warning("DEEPSEEK_V4_API_KEY not set — falling back to OpenRouter")
         return await call_openrouter(system, user)
@@ -1995,6 +2040,10 @@ class BaseAgent:
     _current_task: str = ""
 
     async def call_llm(self, system: str, user: str) -> str:
+        # Free/unlimited DeepSeek V4 Flash via OpenCode Zen is the brain for every
+        # agent when configured; otherwise fall back to each agent's own provider.
+        if OPENCODE_ZEN_PRIMARY:
+            return await call_opencode_zen(system, user)
         if self.model == "groq":
             return await call_groq(system, user)
         elif self.model == "deepseek_v4":
@@ -4176,6 +4225,40 @@ async def social_post_endpoint(req: dict):
     return await social_publish(platform, conn, text, req.get("link", ""), req.get("image_url", ""))
 
 
+@app.post("/admin/reset")
+async def admin_reset(req: dict):
+    """Wipe Jaxvora's execution history so it starts fresh. Clears the task queue,
+    logs, audit, agent history and all jaxvora_* run tables. Preserves the
+    knowledge base (rag_documents), connectors and app settings. Guarded: requires
+    {"confirm":"RESET"} and the admin token; not exposed via the Vercel proxy."""
+    if (req.get("confirm") or "") != "RESET":
+        return {"ok": False, "error": "Pass {\"confirm\":\"RESET\"} to wipe history."}
+    expected = GMAIL_AUTOMATION_API_TOKEN
+    if expected and (req.get("admin_token") or "") != expected:
+        return {"ok": False, "error": "Valid admin_token required."}
+    if db_pool is None:
+        return {"ok": False, "error": "Database unavailable."}
+    tables = [
+        "jaxvora_ssh_audit", "jaxvora_operation_log", "jaxvora_subtask_log",
+        "jaxvora_sessions", "agent_history", "audit", "logs", "tasks",
+    ]
+    cleared = {}
+    for t in tables:
+        try:
+            await db_execute(f"TRUNCATE TABLE {t} RESTART IDENTITY CASCADE")
+            cleared[t] = "cleared"
+        except Exception as e:
+            cleared[t] = f"skipped: {e}"
+    for a in AGENT_REGISTRY.values():
+        a._status = "idle"
+        a._current_task = ""
+    try:
+        CHAT_JOBS.clear()
+    except Exception:
+        pass
+    return {"ok": True, "cleared": cleared, "note": "Knowledge base, connectors and settings were preserved."}
+
+
 @app.get("/web/search")
 async def web_search(q: str = Query(...), max_results: int = 5):
     """Search the web using DuckDuckGo."""
@@ -4545,6 +4628,7 @@ async def get_settings_status():
         "keys": {
             "OPENROUTER_API_KEY": {"configured": bool(OPENROUTER_API_KEY)},
             "GROQ_API_KEY": {"configured": bool(GROQ_API_KEY)},
+            "OPENCODE_ZEN_API_KEY": {"configured": bool(OPENCODE_ZEN_API_KEY), "primary": OPENCODE_ZEN_PRIMARY, "model": OPENCODE_ZEN_MODEL},
             "DATABASE_URL": {"configured": bool(DATABASE_URL), "connected": bool(db_pool)},
             "GMAIL_AUTOMATION": {
                 "configured": gmail_api_status["configured"],
