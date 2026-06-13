@@ -31,7 +31,7 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email import encoders
 import base64
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Form, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, UploadFile, File, Form, Header, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -3850,6 +3850,37 @@ async def frontend():
         if index_path.exists():
             return index_path.read_text(encoding="utf-8")
     raise HTTPException(status_code=500, detail="Frontend index.html is missing")
+
+
+TODOLIST_BASE = "http://127.0.0.1:8080"
+
+
+async def _proxy_todolist(request: Request, target_path: str):
+    import httpx
+    target = f"{TODOLIST_BASE}/{target_path}" if target_path else TODOLIST_BASE
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.request(
+                method=request.method,
+                url=target,
+                headers=headers,
+                content=body if body else None,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+
+
+@app.api_route("/todolist", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def todolist_root(request: Request):
+    return await _proxy_todolist(request, "")
+
+
+@app.api_route("/todolist/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def todolist_proxy(request: Request, path: str):
+    return await _proxy_todolist(request, path)
 
 
 @app.post("/chat")

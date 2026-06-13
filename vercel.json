@@ -29,6 +29,8 @@
     { "source": "/gmail/:path*", "destination": "http://172.105.41.151:8090/gmail/:path*" },
     { "source": "/social/:path*", "destination": "http://172.105.41.151:8090/social/:path*" },
     { "source": "/ws/:path*", "destination": "http://172.105.41.151:8090/ws/:path*" },
+    { "source": "/todolist/:path*", "destination": "http://172.105.41.151:8090/todolist/:path*" },
+    { "source": "/todolist", "destination": "http://172.105.41.151:8090/todolist" },
     { "source": "/:path*", "destination": "/index.html" }
   ]
 }
