@@ -183,6 +183,101 @@ nav { flex: 1; padding: 12px 8px; overflow-y: auto; }
 }
 body.chat-view #content { overflow: hidden; }
 
+/* ── Right Sidebar: Agent Flow Graph ── */
+#right-sidebar {
+  position: fixed;
+  top: 60px;
+  right: 0;
+  width: 300px;
+  height: calc(100vh - 60px);
+  background: rgba(10,11,15,0.95);
+  border-left: 1px solid var(--border);
+  backdrop-filter: blur(20px);
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
+  transform: translateX(0);
+  transition: transform 0.25s ease;
+  overflow: hidden;
+}
+#right-sidebar.hidden { transform: translateX(100%); }
+.rs-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  flex-shrink: 0;
+}
+.rs-tree-wrap { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; min-height: 0; }
+.rs-tree-wrap::-webkit-scrollbar { width: 4px; }
+.rs-tree-wrap::-webkit-scrollbar-track { background: transparent; }
+.rs-tree-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+.rs-tree { padding: 6px 8px; font-family: var(--mono); font-size: 10px; color: var(--text); }
+.rs-tree-chief {
+  background: var(--glass); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 12px; margin-bottom: 8px; text-align: center; cursor: pointer;
+  transition: box-shadow 0.2s;
+}
+.rs-tree-chief .label { font-size: 11px; font-weight: 700; }
+.rs-tree-chief .badge { font-size: 8px; color: var(--violet2); font-weight: 700; margin-left: 4px; }
+.rs-tree-chief .status { font-size: 9px; margin-top: 1px; font-family: var(--mono); }
+.rs-tree-div {}
+.rs-tree-div-header {
+  display: flex; align-items: center; gap: 4px; padding: 3px 8px; cursor: pointer;
+  border-radius: 4px; font-size: 9px; font-weight: 600; color: var(--text2);
+  border-left: 2px solid var(--border); margin: 1px 0;
+}
+.rs-tree-div-header:hover { background: rgba(255,255,255,0.04); border-left-color: var(--violet); }
+.rs-tree-agent {
+  display: flex; align-items: center; gap: 3px; padding: 2px 8px 2px 20px;
+  font-size: 9px; cursor: pointer; border-left: 2px solid var(--border);
+  margin-left: 8px; border-radius: 0;
+}
+.rs-tree-agent:hover { background: rgba(255,255,255,0.04); border-left-color: var(--violet); }
+.rs-tree-agent .name { color: var(--text); }
+.rs-tree-agent .st { font-size: 7px; font-family: var(--mono); margin-left: auto; flex-shrink: 0; }
+.rs-tree-agent .task { display: none; font-size: 7px; color: var(--text3); margin-left: 4px; overflow: hidden; text-overflow: ellipsis; max-width: 70px; white-space: nowrap; }
+.rs-tree-agent:hover .task { display: inline-block; }
+.rs-flow-particle {
+  position: absolute;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--violet);
+  z-index: 1;
+  pointer-events: none;
+  box-shadow: 0 0 8px var(--violet);
+  animation: particleMove 2s ease-in-out infinite;
+}
+@keyframes particleMove {
+  0% { opacity: 0; }
+  20% { opacity: 1; }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
+}
+.rs-legend {
+  display: flex;
+  gap: 12px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 9px;
+  color: var(--text3);
+  font-family: var(--mono);
+  flex-shrink: 0;
+}
+.rs-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+@media (max-width: 1100px) { #right-sidebar { display: none; } }
+
 /* ── Section visibility ── */
 .section { display: none; }
 .section.active { display: block; }
@@ -494,20 +589,6 @@ body.chat-view #content { overflow: hidden; }
 .outcome-badge.success { background: rgba(0,212,170,0.15); color: var(--teal); }
 .outcome-badge.failed { background: rgba(255,77,106,0.15); color: var(--red); }
 
-/* ── Decision Log ── */
-.approval-card {
-  background: var(--glass); border: 1px solid var(--border);
-  border-radius: 10px; padding: 16px; margin-bottom: 12px;
-}
-.approval-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-.approval-agent { font-size: 13px; font-weight: 600; color: var(--violet2); font-family: var(--mono); }
-.approval-action { font-size: 11px; color: var(--text2); }
-.approval-payload { font-size: 11px; font-family: var(--mono); background: rgba(0,0,0,0.3); border-radius: 6px; padding: 10px; color: var(--text); margin: 10px 0; max-height: 80px; overflow: hidden; text-overflow: ellipsis; }
-.decision-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; font-family: var(--mono); letter-spacing: 0.05em; }
-.decision-approved { background: rgba(0,210,140,0.15); color: var(--teal); border: 1px solid rgba(0,210,140,0.3); }
-.decision-rejected { background: rgba(255,82,82,0.15); color: var(--red); border: 1px solid rgba(255,82,82,0.3); }
-.decision-pending { background: rgba(255,200,0,0.1); color: #ffc800; border: 1px solid rgba(255,200,0,0.25); }
-.decision-reason { font-size: 10px; color: var(--text2); font-family: var(--mono); margin-top: 6px; font-style: italic; }
 .empty-state { text-align: center; padding: 40px 20px; color: var(--text3); font-family: var(--mono); font-size: 12px; }
 .empty-icon { font-size: 32px; margin-bottom: 12px; }
 
@@ -698,12 +779,14 @@ body.chat-view #content { overflow: hidden; }
     <div class="nav-section">Operations</div>
     <div class="nav-item" data-section="tasks"><span class="icon">◫</span>Task Queue</div>
     <div class="nav-item" data-section="logs"><span class="icon">▤</span>Live Logs</div>
-    <div class="nav-item" data-section="approval"><span class="icon">◉</span>Decision Log <span class="nav-badge" id="pending-count">0</span></div>
+
 
     <div class="nav-section">Insights</div>
     <div class="nav-item" data-section="analytics"><span class="icon">◰</span>Analytics</div>
     <div class="nav-item" data-section="settings"><span class="icon">◯</span>Settings</div>
-  </nav>
+
+    <div class="nav-section">Knowledge</div>
+    <div class="nav-item" data-section="knowledge"><span class="icon">▣</span>Knowledge Base <span class="nav-badge" id="kb-count" style="display:none">0</span></div>
   <div class="sidebar-footer">
     <span class="status-dot"></span>
     System <span id="sys-status" style="color:var(--teal)">online</span>
@@ -723,6 +806,7 @@ body.chat-view #content { overflow: hidden; }
       </div>
     </div>
     <div class="topbar-right">
+      <button class="pill" onclick="toggleRightSidebar()" title="Toggle Agent Flow Graph" style="cursor:pointer;border-color:var(--violet);color:var(--violet2);font-size:11px">⚡ Flow</button>
       <div class="pill green" id="active-agents-pill">0 active</div>
       <div class="pill violet" id="tasks-today-pill">0 tasks today</div>
     </div>
@@ -832,15 +916,28 @@ body.chat-view #content { overflow: hidden; }
         <div class="chip" onclick="sendChip('Create an ETL pipeline for user analytics data')">⚡ ETL pipeline</div>
       </div>
       <div id="chat-messages"></div>
+      <div id="computer-panel" style="display:none;border:1px solid var(--border);border-radius:12px;margin-bottom:8px;background:var(--glass);max-height:300px;overflow-y:auto;padding:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <span style="font-size:12px;font-weight:600;color:var(--text2);font-family:var(--mono)">🖥 Computer</span>
+          <div style="display:flex;gap:4px">
+            <button class="btn btn-sm" onclick="wsPanelUp()" id="ws-up-btn" style="font-size:10px;padding:2px 6px;display:none">⬆</button>
+            <button class="btn btn-sm" onclick="wsPanelMkdir()" title="New folder" style="font-size:10px;padding:2px 6px;background:var(--glass2)">📁+</button>
+            <button class="btn btn-sm" onclick="wsPanelNewFile()" title="New file" style="font-size:10px;padding:2px 6px;background:var(--glass2)">+</button>
+            <button class="btn btn-primary btn-sm" onclick="loadComputerPanel()" style="font-size:10px;padding:2px 6px">↻</button>
+          </div>
+        </div>
+        <div id="computer-list" style="font-size:11px;font-family:var(--mono);color:var(--text2);min-height:30px">Loading...</div>
+      </div>
       <input type="file" id="file-input" style="display:none" onchange="handleFileSelect(this)">
       <div class="chat-input-row">
         <button class="chat-attach-btn" onclick="document.getElementById('file-input').click()" title="Attach file" id="clip-btn">📎</button>
+        <button class="chat-attach-btn" onclick="toggleComputer()" title="Toggle Computer (workspace)" id="computer-toggle" style="background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer;color:var(--text2);font-size:13px;font-family:var(--mono)">🖥</button>
         <div id="file-preview" class="file-preview" aria-live="polite">
           <span class="file-preview-icon">📎</span>
           <span class="file-preview-name" id="file-preview-name"></span>
           <button class="file-clear" onclick="clearAttachment()" title="Remove attachment">×</button>
         </div>
-        <input type="text" id="chat-input" placeholder="Ask Jaxvora anything... (Enter to send)" onkeydown="if(event.key==='Enter')sendChat()">
+        <input type="text" id="chat-input" placeholder="Ask Jaxvora anything... (Enter to send)" onkeydown="if(event.key==='Enter')sendChat()" onpaste="handlePaste(event)">
         <button class="btn btn-primary chat-send-btn" onclick="sendChat()">Send</button>
       </div>
     </div>
@@ -913,18 +1010,6 @@ body.chat-view #content { overflow: hidden; }
         </label>
       </div>
       <div id="log-container"></div>
-    </div>
-
-    <!-- Decision Log -->
-    <div class="section" id="section-approval">
-      <div class="section-header">
-        <div>
-          <div class="section-title">Decision Log</div>
-          <div class="section-sub">AI-powered auto-decisions — no human review needed</div>
-        </div>
-        <button class="btn btn-teal btn-sm" onclick="loadApprovals()">↻ Refresh</button>
-      </div>
-      <div id="approval-list"></div>
     </div>
 
     <!-- Analytics -->
@@ -1037,8 +1122,107 @@ body.chat-view #content { overflow: hidden; }
       </div>
     </div>
 
+    <!-- Knowledge Base -->
+    <div class="section" id="section-knowledge">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Knowledge Base</div>
+          <div class="section-sub">RAG documents & web search</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="kb-index-status" class="pill">&#9679; Index loaded</span>
+        </div>
+      </div>
+
+      <!-- Tabs -->
+      <div style="display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:0">
+        <button class="btn btn-sm kb-tab" data-tab="documents" style="border-radius:8px 8px 0 0;background:rgba(108,99,255,0.12);color:var(--violet2);border:1px solid rgba(108,99,255,0.2);border-bottom:none" onclick="switchKbTab('documents')">Documents</button>
+        <button class="btn btn-sm kb-tab" data-tab="workspace" style="border-radius:8px 8px 0 0" onclick="switchKbTab('workspace')">🖥 Computer</button>
+        <button class="btn btn-sm kb-tab" data-tab="upload" style="border-radius:8px 8px 0 0" onclick="switchKbTab('upload')">Upload</button>
+      </div>
+
+      <!-- Tab: Documents -->
+      <div class="kb-tab-content" id="kb-tab-documents">
+        <div class="card mb-16">
+          <div class="card-header">
+            <div class="card-title">RAG Documents <span id="kb-doc-count" style="color:var(--teal)">0</span></div>
+            <input type="text" id="kb-doc-search" placeholder="Search documents..." style="width:200px;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:var(--text);font-size:12px;outline:none" onkeydown="if(event.key==='Enter')searchRag()">
+          </div>
+          <div id="kb-doc-list" style="font-size:12px;font-family:var(--mono);color:var(--text2);min-height:40px">Loading documents...</div>
+        </div>
+
+        <!-- Sources info -->
+        <div class="card mb-16">
+          <div class="card-header"><div class="card-title">Source Information</div></div>
+          <div id="kb-sources-info" style="font-size:12px;font-family:var(--mono);color:var(--text2);min-height:30px">
+            <div style="color:var(--text3);padding:4px 0">No sources loaded yet. Upload documents to populate the knowledge base.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Upload -->
+      <div class="kb-tab-content" id="kb-tab-upload" style="display:none">
+        <div class="card mb-16">
+          <div class="card-header"><div class="card-title">Upload to RAG</div></div>
+          <div style="display:flex;gap:8px;margin-bottom:12px">
+            <input type="text" id="rag-upload-text" placeholder="Or paste text content..." style="flex:1;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+            <label class="btn btn-teal btn-sm" style="cursor:pointer">Upload File<input type="file" id="rag-upload-file" style="display:none" onchange="uploadRagFile(this)"></label>
+            <button class="btn btn-primary btn-sm" onclick="ingestRagText()">Ingest Text</button>
+          </div>
+          <div id="rag-upload-status" style="font-size:11px;font-family:var(--mono);color:var(--text2)"></div>
+        </div>
+      </div>
+
+      <!-- Tab: Workspace -->
+      <div class="kb-tab-content" id="kb-tab-workspace" style="display:none">
+        <div class="card mb-16">
+          <div class="card-header">
+            <div class="card-title">🖥 Computer <span id="ws-path" style="color:var(--text3);font-size:11px">/workspace</span></div>
+            <div style="display:flex;gap:6px">
+              <button class="btn btn-sm" onclick="wsGoUp()" id="ws-up-btn" style="display:none">⬆ Up</button>
+              <button class="btn btn-teal btn-sm" onclick="wsNewFile()">+ New File</button>
+              <button class="btn btn-primary btn-sm" onclick="wsRefresh()">↻ Refresh</button>
+            </div>
+          </div>
+          <div id="ws-list" style="font-size:12px;font-family:var(--mono);color:var(--text2);min-height:40px">Loading workspace...</div>
+        </div>
+        <!-- File editor -->
+        <div class="card" id="ws-editor-card" style="display:none">
+          <div class="card-header">
+            <div class="card-title" id="ws-editor-title">File</div>
+            <div style="display:flex;gap:6px">
+              <button class="btn btn-primary btn-sm" onclick="wsSave()">💾 Save</button>
+              <button class="btn btn-sm" onclick="wsCloseEditor()">✕ Close</button>
+            </div>
+          </div>
+          <textarea id="ws-editor" style="width:100%;min-height:300px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px;color:var(--text);font-size:13px;font-family:var(--mono);outline:none;resize:vertical" placeholder="File content..."></textarea>
+        </div>
+      </div>
+    </div>
+
   </div><!-- /content -->
 </div><!-- /main -->
+
+<!-- ── Right Sidebar: Agent Flow Graph ── -->
+<aside id="right-sidebar">
+  <div class="rs-header">
+    <span>⚡ Agent Flow</span>
+    <button class="btn btn-sm" onclick="toggleRightSidebar()" style="font-size:14px;padding:2px 8px;background:transparent;border:none;color:var(--text2);cursor:pointer">✕</button>
+  </div>
+  <div class="rs-tree-wrap">
+    <div class="rs-tree" id="rs-tree">
+      <div class="rs-tree-chief" id="rs-node-chief">
+        <div class="label">👑 Chief Orchestrator <span class="badge">CEO</span></div>
+        <div class="status" id="rs-chief-status">● idle</div>
+      </div>
+    </div>
+  </div>
+  <div class="rs-legend">
+    <span><span class="rs-dot" style="background:var(--teal)"></span> idle</span>
+    <span><span class="rs-dot" style="background:var(--violet2);animation:pulse 1s infinite"></span> running</span>
+    <span><span class="rs-dot" style="background:var(--red)"></span> error</span>
+  </div>
+</aside>
 </div><!-- /app -->
 
 <!-- Agent Modal -->
@@ -1063,6 +1247,11 @@ const RING_CIRCUMFERENCE = 314;
 
 function clamp(n, min = 0, max = 100) {
   return Math.max(min, Math.min(max, Number.isFinite(Number(n)) ? Number(n) : min));
+}
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s ?? '');
+  return d.innerHTML;
 }
 
 function setRingProgress(id, percent) {
@@ -1123,9 +1312,9 @@ const sections = {
   agents: { title: 'Agent Monitor', meta: 'Company graph + 22 specialist agents', load: loadAgentSection },
   tasks: { title: 'Task Queue', meta: 'Live task management', load: loadTasks },
   logs: { title: 'Live Logs', meta: 'Real-time log stream', load: null },
-  approval: { title: 'Decision Log', meta: 'AI-powered auto-decisions', load: loadApprovals },
   analytics: { title: 'Analytics', meta: 'Productivity metrics', load: loadAnalytics },
   settings: { title: 'Settings', meta: 'API keys and tools', load: loadSettings },
+  knowledge: { title: 'Knowledge Base', meta: 'RAG documents & web search', load: loadKnowledge },
 };
 
 function isMobileLayout() {
@@ -1178,10 +1367,25 @@ function wsUrl(path) {
   return `${proto}://${location.host}${path}`;
 }
 
+let wsReconnectGuard = false;
+
+function wsOnMessage(handler) {
+  return e => {
+    try {
+      const d = JSON.parse(e.data);
+      handler(d);
+    } catch (err) {
+      console.error('WS parse error:', err);
+    }
+  };
+}
+
 function connectChatWs() {
+  if (wsReconnectGuard) return;
+  wsReconnectGuard = true;
+  try { chatWs?.close(); } catch {}
   chatWs = new WebSocket(wsUrl('/ws/chat'));
-  chatWs.onmessage = e => {
-    const d = JSON.parse(e.data);
+  chatWs.onmessage = wsOnMessage(d => {
     if (d.type === 'thinking') appendMsg('bot thinking', d.message);
     else if (d.type === 'company_start') appendMsg('bot thinking', `Company mode: ${d.agents.length} agents working in parallel...`);
     else if (d.type === 'agent_start') appendMsg('bot', `Running ${d.agent}...`);
@@ -1190,44 +1394,55 @@ function connectChatWs() {
       removeThinking();
       appendMsg('bot', d.message, d.agents);
     } else if (d.type === 'error') appendMsg('bot', `Error: ${d.message}`);
-  };
-  chatWs.onclose = () => setTimeout(connectChatWs, 3000);
+  });
+  chatWs.onerror = e => console.error('Chat WS error:', e);
+  chatWs.onclose = () => { wsReconnectGuard = false; setTimeout(connectChatWs, 3000); };
 }
 
 function connectLogsWs() {
+  if (wsReconnectGuard) return;
+  wsReconnectGuard = true;
+  try { logsWs?.close(); } catch {}
   logsWs = new WebSocket(wsUrl('/ws/logs'));
-  logsWs.onmessage = e => {
-    const d = JSON.parse(e.data);
+  logsWs.onmessage = wsOnMessage(d => {
     if (d.type === 'log') addLog(d);
-  };
-  logsWs.onclose = () => setTimeout(connectLogsWs, 3000);
+  });
+  logsWs.onerror = e => console.error('Logs WS error:', e);
+  logsWs.onclose = () => { wsReconnectGuard = false; setTimeout(connectLogsWs, 3000); };
 }
 
 function connectAgentsWs() {
+  if (wsReconnectGuard) return;
+  wsReconnectGuard = true;
+  try { agentsWs?.close(); } catch {}
   agentsWs = new WebSocket(wsUrl('/ws/agents'));
-  agentsWs.onmessage = e => {
-    const d = JSON.parse(e.data);
+  agentsWs.onmessage = wsOnMessage(d => {
     if (d.type === 'snapshot') renderAgents(d.agents);
     else if (d.type === 'agent_status') updateAgentCard(d);
     else if (d.type === 'system_ready') {
       document.getElementById('sys-status').textContent = 'online';
     }
-  };
-  agentsWs.onclose = () => setTimeout(connectAgentsWs, 3000);
+  });
+  agentsWs.onerror = e => console.error('Agents WS error:', e);
+  agentsWs.onclose = () => { wsReconnectGuard = false; setTimeout(connectAgentsWs, 3000); };
 }
 
 function connectTasksWs() {
+  if (wsReconnectGuard) return;
+  wsReconnectGuard = true;
+  try { tasksWs?.close(); } catch {}
   tasksWs = new WebSocket(wsUrl('/ws/tasks'));
-  tasksWs.onmessage = e => {
-    const d = JSON.parse(e.data);
+  tasksWs.onmessage = wsOnMessage(d => {
     if (d.type === 'snapshot') renderTasks(d.tasks);
-  };
-  tasksWs.onclose = () => setTimeout(connectTasksWs, 3000);
+  });
+  tasksWs.onerror = e => console.error('Tasks WS error:', e);
+  tasksWs.onclose = () => { wsReconnectGuard = false; setTimeout(connectTasksWs, 3000); };
 }
 
 // ── Chat ───────────────────────────────────────────────────────────────────
 async function sendChat() {
   const input = document.getElementById('chat-input');
+  if (!input) return;
   let msg = input.value.trim();
   if (!msg && !attachedFile) return;
   if (attachedFile && attachedFile.uploading) {
@@ -1275,11 +1490,28 @@ Error: ${attachedFile.error || 'Text extraction failed.'}`;
   const chatPayload = { message: fullMsg };
   if (adminToken) chatPayload.admin_token = adminToken;
 
+  const handleChatResponse = (d) => {
+    removeThinking();
+    appendMsg('bot', d.response, d.agents);
+    updateRsAgentStatus('Chief Orchestrator', 'running', 'Response ready');
+    const involved = d.agents && d.agents.length ? d.agents : ['Chief Orchestrator'];
+    involved.forEach(name => updateRsAgentStatus(name, 'running', '⚡'));
+    setTimeout(() => {
+      involved.forEach(name => updateRsAgentStatus(name, 'idle', ''));
+      updateRsAgentStatus('Chief Orchestrator', 'idle', '');
+    }, 3000);
+  };
+  updateRsAgentStatus('Chief Orchestrator', 'running', 'Thinking...');
+
   if (chatWs && chatWs.readyState === 1) {
-    chatWs.send(JSON.stringify(chatPayload));
+    try { chatWs.send(JSON.stringify(chatPayload)); } catch (e) {
+      fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload) })
+        .then(r => r.json()).then(handleChatResponse)
+        .catch(err => { removeThinking(); appendMsg('bot', 'Error: ' + err); });
+    }
   } else {
     fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chatPayload) })
-      .then(r => r.json()).then(d => { removeThinking(); appendMsg('bot', d.response, d.agents); })
+      .then(r => r.json()).then(handleChatResponse)
       .catch(err => { removeThinking(); appendMsg('bot', 'Error: ' + err); });
   }
 }
@@ -1362,7 +1594,17 @@ function renderRichText(text) {
   let match;
   while ((match = codeRe.exec(source)) !== null) {
     if (match.index > lastIndex) parts.push(renderTextSegment(source.slice(lastIndex, match.index)));
-    parts.push(`<pre class="md-code"><code>${escHtml(match[2].trim())}</code></pre>`);
+    const lang = match[1] || 'txt';
+    const code = match[2].trim();
+    const lines = code.split('\n').length;
+    const fileHint = lines > 3 && !source.includes('[download:') ? '' : '';
+    parts.push(`<div style="position:relative">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 12px;background:rgba(0,0,0,0.3);border-radius:8px 8px 0 0;font-size:11px;color:var(--text3);font-family:var(--mono)">
+        <span>${escHtml(lang)}</span>
+        <button class="btn btn-sm" style="font-size:10px;padding:2px 8px" onclick="generateAndDownload('code.${escHtml(lang)}',this.parentElement.nextElementSibling.textContent,'text/plain;charset=utf-8')">⬇ Download</button>
+      </div>
+      <pre class="md-code"><code>${escHtml(code)}</code></pre>
+    </div>`);
     lastIndex = codeRe.lastIndex;
   }
   if (lastIndex < source.length) parts.push(renderTextSegment(source.slice(lastIndex)));
@@ -1380,7 +1622,7 @@ function appendMsg(role, text, agents) {
   const body = isThinking || role === 'user' ? escHtml(text) : renderRichText(text);
   div.innerHTML = `<div class="msg-bubble">${body}${agentTags}</div><div class="msg-meta">${new Date().toLocaleTimeString()}</div>`;
   document.getElementById('chat-messages').appendChild(div);
-  document.getElementById('chat-messages').scrollTop = 99999;
+  document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
 }
 
 function removeThinking() {
@@ -1404,21 +1646,24 @@ function renderLog(d) {
   if (!c) return;
   const el = document.createElement('div');
   el.className = 'log-entry';
-  const ts = d.ts ? new Date(d.ts).toLocaleTimeString() : '';
-  el.innerHTML = `<span class="log-ts">${ts}</span><span class="log-level ${d.level}">${d.level}</span><span class="log-msg">${escHtml(d.message)}</span>`;
+  const ts = d.ts ? fmtDate(d.ts) : '';
+  const safeLevel = ['INFO','WARN','ERROR','SUCCESS'].includes(d.level) ? d.level : 'INFO';
+  el.innerHTML = `<span class="log-ts">${escHtml(ts)}</span><span class="log-level ${safeLevel}">${escHtml(d.level)}</span><span class="log-msg">${escHtml(d.message)}</span>`;
   c.appendChild(el);
-  if (document.getElementById('log-autoscroll')?.checked) c.scrollTop = 99999;
+  if (document.getElementById('log-autoscroll')?.checked) c.scrollTop = c.scrollHeight;
 }
 
 function filterLogs() {
   const c = document.getElementById('log-container');
+  if (!c) return;
   c.innerHTML = '';
   allLogs.forEach(renderLog);
 }
 
 function clearLogs() {
   allLogs = [];
-  document.getElementById('log-container').innerHTML = '';
+  const c = document.getElementById('log-container');
+  if (c) c.innerHTML = '';
 }
 
 // ── Agents ─────────────────────────────────────────────────────────────────
@@ -1481,8 +1726,8 @@ async function loadOrganization() {
   }
 }
 
-function loadAgentSection() {
-  loadOrganization();
+async function loadAgentSection() {
+  await loadOrganization();
   return loadAgents();
 }
 
@@ -1497,6 +1742,8 @@ function updateAgentCard(d) {
   if (!card) return;
   card.querySelector('.status-indicator').className = 'status-indicator ' + d.status;
   card.querySelector('.agent-task').textContent = d.task || 'Waiting for task...';
+  // Also update the right sidebar agent flow graph
+  updateRsAgentStatus(d.name, d.status, d.task);
 }
 
 function loadAgents() {
@@ -1511,20 +1758,31 @@ function loadAgents() {
 
 async function openAgentModal(name) {
   document.getElementById('modal-agent-name').textContent = name;
-  const agent = await fetch('/agents').then(r => r.json()).then(a => a.find(x => x.name === name));
-  if (agent) {
-    document.getElementById('modal-agent-desc').textContent = agent.description;
-    document.getElementById('modal-agent-status').innerHTML =
-      `<div class="pill ${agent.status === 'running' ? 'green' : ''}" style="display:inline-flex;gap:6px;align-items:center"><div class="status-indicator ${agent.status}" style="width:6px;height:6px;flex-shrink:0"></div>${agent.status.toUpperCase()}</div>`;
+  try {
+    const agents = await fetch('/agents').then(r => { if (!r.ok) throw new Error('Failed to fetch agents'); return r.json(); });
+    const agent = Array.isArray(agents) ? agents.find(x => x.name === name) : null;
+    if (agent) {
+      document.getElementById('modal-agent-desc').textContent = agent.description || '';
+      const safeStatus = ['idle','running','error'].includes(agent.status) ? agent.status : 'idle';
+      document.getElementById('modal-agent-status').innerHTML =
+        `<div class="pill ${agent.status === 'running' ? 'green' : ''}" style="display:inline-flex;gap:6px;align-items:center"><div class="status-indicator ${safeStatus}" style="width:6px;height:6px;flex-shrink:0"></div>${escHtml(agent.status.toUpperCase())}</div>`;
+    }
+  } catch (e) {
+    document.getElementById('modal-agent-desc').textContent = 'Failed to load agent details: ' + e.message;
   }
-  const rows = await fetch('/tasks?agent=' + encodeURIComponent(name) + '&limit=5').then(r => r.json());
+  let rows = [];
+  try {
+    rows = await fetch('/tasks?agent=' + encodeURIComponent(name) + '&limit=5').then(r => { if (!r.ok) return []; return r.json(); });
+  } catch {}
   const hist = document.getElementById('modal-history');
-  hist.innerHTML = rows.length ? rows.map(r =>
-    `<div class="history-item">
-      <div class="history-task">${escHtml((r.input || '').slice(0, 100))}</div>
-      <div class="history-meta">${statusBadge(r.status)} · ${fmtDate(r.created_at)}</div>
-    </div>`
-  ).join('') : '<div class="empty-state"><div>No recent tasks</div></div>';
+  if (hist) {
+    hist.innerHTML = Array.isArray(rows) && rows.length ? rows.map(r =>
+      `<div class="history-item">
+        <div class="history-task">${escHtml((r.input || '').slice(0, 100))}</div>
+        <div class="history-meta">${statusBadge(r.status)} · ${fmtDate(r.created_at)}</div>
+      </div>`
+    ).join('') : '<div class="empty-state"><div>No recent tasks</div></div>';
+  }
   document.getElementById('agent-modal').classList.add('open');
 }
 
@@ -1545,6 +1803,7 @@ function renderTasks(tasks) {
 
 function renderTaskCol(id, tasks) {
   const el = document.getElementById(id);
+  if (!el) return;
   el.innerHTML = tasks.length ? tasks.map(t => `
     <div class="task-card">
       <div class="task-agent">${t.agent_name}</div>
@@ -1556,43 +1815,6 @@ function renderTaskCol(id, tasks) {
 
 function loadTasks() {
   fetch('/tasks').then(r => r.json()).then(renderTasks).catch(console.error);
-}
-
-// ── Decision Log ────────────────────────────────────────────────────────────
-function loadApprovals() {
-  fetch('/audit').then(r => r.json()).then(rows => {
-    const pending = rows.filter(r => r.approved === null).length;
-    document.getElementById('pending-count').textContent = pending || rows.length;
-    const el = document.getElementById('approval-list');
-    if (!rows.length) {
-      el.innerHTML = '<div class="empty-state"><div class="empty-icon">🤖</div><div>No decisions yet — start chatting to see AI decisions here</div></div>';
-      return;
-    }
-    el.innerHTML = rows.map(r => {
-      let badge, statusText;
-      if (r.approved === null) {
-        badge = '<span class="decision-badge decision-pending">⏳ DECIDING...</span>';
-        statusText = 'AI is reviewing this request...';
-      } else if (r.approved) {
-        badge = '<span class="decision-badge decision-approved">✓ APPROVED</span>';
-        statusText = r.decision_reason || 'Approved by AI.';
-      } else {
-        badge = '<span class="decision-badge decision-rejected">✗ REJECTED</span>';
-        statusText = r.decision_reason || 'Rejected by AI.';
-      }
-      return `
-      <div class="approval-card">
-        <div class="approval-header">
-          <div class="approval-agent">${r.agent_name}</div>
-          <div class="approval-action">${fmtDate(r.timestamp)}</div>
-        </div>
-        <div style="font-size:11px;color:var(--text2);margin-bottom:8px;font-family:var(--mono)">${r.action}</div>
-        <div class="approval-payload">${escHtml(r.payload || '')}</div>
-        <div style="margin-top:10px">${badge}</div>
-        <div class="decision-reason">${escHtml(statusText)}</div>
-      </div>`;
-    }).join('');
-  });
 }
 
 // ── Analytics ─────────────────────────────────────────────────────────────
@@ -1630,7 +1852,7 @@ function renderBars(id, data) {
   const max = Math.max(...data.map(d => Number(d.calls)));
   el.innerHTML = data.slice(0, 10).map(d => {
     const pct = max ? Math.max(8, (d.calls / max) * 100) : 8;
-    const shortName = d.agent_name.split(' ')[0];
+    const shortName = (d.agent_name || '?').split(' ')[0];
     return `<div class="bar-item">
       <div class="bar-fill" style="height:${pct}%"></div>
       <div class="bar-label">${shortName}</div>
@@ -1639,18 +1861,6 @@ function renderBars(id, data) {
 }
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
-function loadDashboard() {
-  fetch('/analytics').then(r => r.json()).then(d => {
-    document.getElementById('d-tasks-today').textContent = d.tasks_today ?? '—';
-    document.getElementById('d-success-rate').textContent = (d.success_rate ?? '—') + '%';
-    document.getElementById('d-total').textContent = d.total_tasks ?? '—';
-    document.getElementById('d-failed').textContent = d.failed ?? '—';
-    document.getElementById('tasks-today-pill').textContent = (d.tasks_today || 0) + ' tasks today';
-    renderBars('usage-bars', d.by_agent || []);
-  }).catch(() => {});
-}
-
-// ── File Attachment ─────────────────────────────────────────────────────────
 async function loadDashboard() {
   try {
     const [d, agents] = await Promise.all([
@@ -1682,6 +1892,18 @@ async function loadDashboard() {
 }
 
 let attachedFile = null;
+
+function handlePaste(e) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      appendMsg('bot', '📷 Image paste detected — Jaxvora supports file uploads via the 📎 button instead.');
+      return;
+    }
+  }
+}
 
 function handleFileSelect(input) {
   const file = input.files[0];
@@ -1720,7 +1942,8 @@ function handleFileSelect(input) {
         content: '',
       };
       previewName.textContent = file.name + ' - upload failed';
-    });
+    })
+    .finally(() => { input.value = ''; });
   return;
 }
 
@@ -1797,6 +2020,7 @@ function loadSettings() {
     renderGmailAutomation({ configured: false, missing: ['status unavailable'] });
   });
   fetch('/tools').then(r => r.json()).then(tools => {
+    if (!Array.isArray(tools)) tools = [];
     document.getElementById('tools-list').innerHTML = tools.map(t => `
       <div class="setting-row">
         <div><div class="setting-label" style="font-family:var(--mono);font-size:12px">${t.name}</div><div class="setting-desc">${t.description}</div></div>
@@ -1971,19 +2195,27 @@ async function searchKB() {
   if (!q) return;
   const col = document.getElementById('kb-collection').value;
   const url = '/memory/search?q=' + encodeURIComponent(q) + (col ? '&collection=' + col : '');
-  const results = await fetch(url).then(r => r.json());
   const el = document.getElementById('kb-results');
+  if (!el) return;
+  el.textContent = 'Searching...';
+  let results;
+  try {
+    results = await fetch(url).then(r => { if (!r.ok) throw new Error('Search failed: ' + r.status); return r.json(); });
+  } catch (e) {
+    el.innerHTML = '<span style="color:var(--red)">' + escHtml(e.message) + '</span>';
+    return;
+  }
   if (!results.length) { el.textContent = 'No results found.'; return; }
   el.innerHTML = results.map(r => `
     <div style="padding:10px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px">
-      <div style="color:var(--violet2);margin-bottom:4px;font-size:10px;text-transform:uppercase">${r.collection} · score: ${r.score.toFixed(3)}</div>
-      <div style="color:var(--text);line-height:1.5">${escHtml(r.content.slice(0, 200))}</div>
+      <div style="color:var(--violet2);margin-bottom:4px;font-size:10px;text-transform:uppercase">${escHtml(r.collection)} · score: ${r.score.toFixed(3)}</div>
+      <div style="color:var(--text);line-height:1.5">${escHtml((r.content || '').slice(0, 200))}</div>
     </div>`).join('');
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 function fmtDate(ts) {
   if (!ts) return '';
@@ -1995,7 +2227,46 @@ function statusBadge(s) {
 }
 function modelLabel(m) {
   if (m === 'groq') return '● Llama 3.3 70B';
-  return '● DeepSeek V3';
+  if (m === 'deepseek') return '● DeepSeek V3';
+  if (m === 'deepseek_v4') return '● DeepSeek V4 Flash';
+  return '● ' + (m || 'Unknown');
+}
+
+function downloadFile(filename, b64content, contentType) {
+  try {
+    const byteStr = atob(b64content);
+    const bytes = new Uint8Array(byteStr.length);
+    for (let i = 0; i < byteStr.length; i++) bytes[i] = byteStr.charCodeAt(i);
+    const blob = new Blob([bytes], { type: contentType || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    appendMsg('bot', '❌ Download failed: ' + e.message);
+  }
+}
+
+async function generateAndDownload(filename, content, contentType) {
+  try {
+    const res = await fetch('/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, content, content_type: contentType || 'text/plain' })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      downloadFile(data.filename, data.content_base64, data.content_type);
+    } else {
+      appendMsg('bot', '❌ Download preparation failed');
+    }
+  } catch (e) {
+    appendMsg('bot', '❌ Download error: ' + e.message);
+  }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
@@ -2009,8 +2280,537 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Poll dashboard every 30s
   setInterval(loadDashboard, 30000);
-  setInterval(loadApprovals, 15000);
+
+  // Init right sidebar with agent tree
+  initRightSidebar();
 });
+
+// ── Right Sidebar: Agent Flow Graph ──────────────────────────────────────────
+
+const RS_DIVISIONS = [
+  { name: 'Engineering', color: '#9ece6a', lead: 'Architecture', agents: ['AI Engineer','Software Engineer','Debug Agent','QA/Test Agent','Code Review','Architecture','Database','DevOps','Backend Engineer','Frontend Engineer'] },
+  { name: 'Security', color: '#f7768e', lead: 'Cybersecurity', agents: ['Cybersecurity','Red Team','Compliance','Vulnerability Scanner','Auth & IAM Agent','Network Security Agent'] },
+  { name: 'Data', color: '#e0af68', lead: 'Data Engineer', agents: ['Data Analyst','BI Agent','Data Engineer','ML Engineer','ETL Engineer','RAG Specialist'] },
+  { name: 'Career', color: '#bb9af7', lead: 'Career Coach', agents: ['Resume Agent','Interview Coach','Career Coach','Job Search Agent','Application Tracker'] },
+  { name: 'Product', color: '#ff9e64', lead: 'Product Manager', agents: ['Product Manager','Documentation','Research','UX Designer','Requirements Analyst'] },
+  { name: 'Executive', color: '#a9b1d6', lead: 'Risk & Planning Agent', agents: ['Project Intelligence','Jaxvora Doctor','Strategy Agent','Risk & Planning Agent'] },
+];
+let rsAgentNodes = {};
+let rsAnimFrame = null;
+
+function initRightSidebar() {
+  const tree = document.getElementById('rs-tree');
+  if (!tree) return;
+  // Remove old agent entries, keep chief
+  tree.querySelectorAll('.rs-tree-div, .rs-tree-agent').forEach(el => el.remove());
+  rsAgentNodes = {};
+
+  RS_DIVISIONS.forEach((div, di) => {
+    const divEl = document.createElement('div');
+    divEl.className = 'rs-tree-div';
+    divEl.innerHTML = `<div class="rs-tree-div-header" style="border-left-color:${div.color}"><span style="color:${div.color}">◆</span> ${div.name} <span style="color:var(--text3);margin-left:auto">${div.agents.length}</span></div>`;
+    tree.appendChild(divEl);
+
+    div.agents.forEach((name) => {
+      const isLead = name === div.lead;
+      const agentEl = document.createElement('div');
+      agentEl.className = 'rs-tree-agent';
+      agentEl.id = 'rs-agent-' + name.replace(/\s+/g, '-');
+      agentEl.title = div.name + (isLead ? ' (Lead)' : '');
+      agentEl.innerHTML = `<span class="name">${isLead ? '★ ' : ''}${name}</span><span class="st idle" id="rs-st-${name.replace(/\s+/g,'-')}" style="color:var(--teal)">●</span><span class="task" id="rs-tsk-${name.replace(/\s+/g,'-')}"></span>`;
+      agentEl.onclick = () => {
+        const m = document.getElementById('agent-modal');
+        if (m) { openAgentModal(name); }
+      };
+      tree.appendChild(agentEl);
+      rsAgentNodes[name] = { el: agentEl, div: div.name, lead: isLead };
+    });
+  });
+}
+
+function toggleRightSidebar() {
+  document.getElementById('right-sidebar').classList.toggle('hidden');
+}
+
+function updateRsAgentStatus(name, status, task) {
+  if (name === 'Chief Orchestrator') {
+    const chiefStatus = document.getElementById('rs-chief-status');
+    const chiefNode = document.getElementById('rs-node-chief');
+    if (chiefStatus) {
+      if (status === 'running') {
+        chiefStatus.textContent = '→ ' + (task || 'processing');
+        chiefStatus.style.color = 'var(--violet2)';
+      } else {
+        chiefStatus.textContent = '● idle';
+        chiefStatus.style.color = 'var(--teal)';
+      }
+    }
+    if (chiefNode) {
+      chiefNode.style.boxShadow = status === 'running' ? '0 0 20px rgba(108,99,255,0.5)' : 'none';
+      chiefNode.style.borderColor = status === 'running' ? 'var(--violet2)' : 'var(--border)';
+    }
+    if (status === 'running') spawnParticle();
+    return;
+  }
+
+  const id = name.replace(/\s+/g, '-');
+  const statusEl = document.getElementById('rs-st-' + id);
+  const taskEl = document.getElementById('rs-tsk-' + id);
+  const card = document.getElementById('rs-agent-' + id);
+  if (statusEl) {
+    statusEl.textContent = status === 'running' ? '◆' : status === 'error' ? '▲' : '●';
+    statusEl.style.color = status === 'running' ? 'var(--violet2)' : status === 'error' ? 'var(--red)' : 'var(--teal)';
+  }
+  if (taskEl) taskEl.textContent = (task || '').slice(0, 30);
+  if (card) {
+    card.style.borderLeftColor = status === 'running' ? 'var(--violet2)' : status === 'error' ? 'var(--red)' : 'var(--border)';
+    card.style.background = status === 'running' ? 'rgba(108,99,255,0.1)' : 'transparent';
+  }
+}
+
+function spawnParticle() {
+  const tree = document.getElementById('rs-tree');
+  if (!tree) return;
+  const p = document.createElement('div');
+  p.className = 'rs-flow-particle';
+  p.style.left = '50%';
+  p.style.top = '20px';
+  p.style.transform = 'translateX(-50%)';
+  tree.appendChild(p);
+  setTimeout(() => p.remove(), 2000);
+}
+
+function switchKbTab(name) {
+  document.querySelectorAll('.kb-tab').forEach(t => {
+    t.style.background = 'transparent';
+    t.style.color = 'var(--text2)';
+    t.style.borderColor = 'var(--border)';
+    t.style.borderBottom = '1px solid var(--border)';
+  });
+  document.querySelectorAll('.kb-tab-content').forEach(c => c.style.display = 'none');
+  const tab = document.querySelector(`.kb-tab[data-tab="${name}"]`);
+  if (tab) {
+    tab.style.background = 'rgba(108,99,255,0.12)';
+    tab.style.color = 'var(--violet2)';
+    tab.style.borderColor = 'rgba(108,99,255,0.2)';
+    tab.style.borderBottom = 'none';
+  }
+  const content = document.getElementById(`kb-tab-${name}`);
+  if (content) content.style.display = 'block';
+  if (name === 'workspace') wsRefresh();
+}
+
+async function loadKnowledge() {
+  const list = document.getElementById('kb-doc-list');
+  const count = document.getElementById('kb-doc-count');
+  const status = document.getElementById('kb-index-status');
+  const sourcesInfo = document.getElementById('kb-sources-info');
+  try {
+    const r = await fetch('/rag/status');
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    if (count) count.textContent = `${data.total_chunks || 0} chunks from ${data.documents || 0} documents`;
+    const badge = document.getElementById('kb-count');
+    if (badge) {
+      badge.textContent = String(data.documents || 0);
+      badge.style.display = (data.documents || 0) > 0 ? '' : 'none';
+    }
+    if (status) {
+      status.textContent = data.index_loaded ? '\u25CF Index loaded' : '\u25CB Index rebuilding';
+      status.className = 'pill ' + (data.index_loaded ? 'green' : '');
+    }
+    if (list && data.sources && data.sources.length) {
+      list.innerHTML = data.sources.map(s => {
+        const date = s.last_added ? new Date(s.last_added + 'Z').toLocaleDateString() : 'unknown';
+        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div>
+            <div style="color:var(--text);font-weight:500">${esc(s.source)}</div>
+            <div style="font-size:11px;color:var(--text3)">${s.chunks} chunks &middot; ${date}</div>
+          </div>
+        </div>`;
+      }).join('');
+    } else if (list) {
+      list.innerHTML = '<div style="color:var(--text3);padding:12px 0">No documents in knowledge base yet. Upload files or text in the Upload tab.</div>';
+    }
+    // Sources info section
+    if (sourcesInfo) {
+      if (data.sources && data.sources.length) {
+        const totalChunks = data.total_chunks || data.sources.reduce((a, s) => a + s.chunks, 0);
+        const extTypes = {};
+        data.sources.forEach(s => {
+          const ext = s.source.includes('.') ? s.source.split('.').pop().toUpperCase() : 'TEXT';
+          extTypes[ext] = (extTypes[ext] || 0) + 1;
+        });
+        const typeBreakdown = Object.entries(extTypes).map(([ext, count]) =>
+          `<span style="display:inline-block;background:var(--glass2);border:1px solid var(--border);border-radius:4px;padding:2px 8px;margin:2px;font-size:11px">${ext} <span style="color:var(--text3)">x${count}</span></span>`
+        ).join('');
+        sourcesInfo.innerHTML = `
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;padding:8px 0">
+            <div><span style="color:var(--text3)">Documents</span><br><span style="font-size:20px;font-weight:600;color:var(--teal)">${data.documents}</span></div>
+            <div><span style="color:var(--text3)">Total Chunks</span><br><span style="font-size:20px;font-weight:600;color:var(--violet2)">${totalChunks}</span></div>
+            <div><span style="color:var(--text3)">Index Size</span><br><span style="font-size:20px;font-weight:600;color:var(--text)">${data.index_size || 0}</span></div>
+          </div>
+          <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px">${typeBreakdown}</div>
+        `;
+      } else {
+        sourcesInfo.innerHTML = '<div style="color:var(--text3);padding:4px 0">No sources loaded yet. Upload documents to populate the knowledge base.</div>';
+      }
+    }
+  } catch (e) {
+    if (list) list.innerHTML = `<div style="color:var(--red)">Failed to load RAG status: ${esc(e.message)}</div>`;
+    if (sourcesInfo) sourcesInfo.innerHTML = `<div style="color:var(--red)">Failed to load sources: ${esc(e.message)}</div>`;
+  }
+}
+
+async function searchRag() {
+  const input = document.getElementById('kb-doc-search');
+  const list = document.getElementById('kb-doc-list');
+  const q = input ? input.value.trim() : '';
+  if (!q) { loadKnowledge(); return; }
+  if (list) list.innerHTML = 'Searching...';
+  try {
+    const r = await fetch('/rag/search', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({query: q, top_k: 10}) });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Search failed');
+    if (list) {
+      if (data.results && data.results.length) {
+        list.innerHTML = data.results.map((res, i) => {
+          const src = res.source || 'unknown';
+          const score = res.score !== undefined ? ` (${(res.score * 100).toFixed(0)}%)` : '';
+          return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+            <div style="color:var(--text);font-weight:500;margin-bottom:4px">${i+1}. ${esc(src)}${score}</div>
+            <div style="font-size:11px;color:var(--text2);line-height:1.5">${esc(res.chunk_text || res.text || '')}</div>
+          </div>`;
+        }).join('');
+      } else {
+        list.innerHTML = '<div style="color:var(--text3);padding:12px 0">No matches found.</div>';
+      }
+    }
+  } catch (e) {
+    if (list) list.innerHTML = `<div style="color:var(--red)">Search error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function ingestRagText() {
+  const input = document.getElementById('rag-upload-text');
+  const status = document.getElementById('rag-upload-status');
+  const text = input ? input.value.trim() : '';
+  if (!text) { if (status) status.textContent = 'Enter or paste text to ingest.'; return; }
+  if (status) status.textContent = 'Ingesting...';
+  try {
+    const r = await fetch('/rag/ingest', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: text}) });
+    const data = await r.json();
+    if (status) {
+      if (data.ok) {
+        status.textContent = `Ingested: ${data.chunks} chunk(s), ${data.text_length} chars`;
+        if (input) input.value = '';
+        loadKnowledge();
+      } else {
+        status.innerHTML = `<span style="color:var(--red)">Error: ${esc(data.error || 'Unknown')}</span>`;
+      }
+    }
+  } catch (e) {
+    if (status) status.textContent = `Ingest error: ${e.message}`;
+  }
+}
+
+async function uploadRagFile(el) {
+  const file = el && el.files && el.files[0];
+  const status = document.getElementById('rag-upload-status');
+  if (!file) return;
+  if (status) status.textContent = `Uploading ${file.name}...`;
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/upload/rag', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (status) {
+      if (data.ok) {
+        status.textContent = `Uploaded: ${data.chunks} chunk(s), ${data.text_length} chars`;
+        el.value = '';
+        loadKnowledge();
+      } else {
+        status.innerHTML = `<span style="color:var(--red)">Error: ${esc(data.error || 'Unknown')}</span>`;
+      }
+    }
+  } catch (e) {
+    if (status) status.textContent = `Upload error: ${e.message}`;
+  }
+}
+
+// ── Workspace / Computer ─────────────────────────────────────────────────────
+
+let wsPath = '';
+let wsPanelPath = '';
+
+function toggleComputer() {
+  const panel = document.getElementById('computer-panel');
+  const btn = document.getElementById('computer-toggle');
+  if (!panel) return;
+  const shown = panel.style.display !== 'none';
+  panel.style.display = shown ? 'none' : 'block';
+  if (btn) btn.style.background = shown ? 'var(--glass2)' : 'rgba(108,99,255,0.2)';
+  if (!shown) loadComputerPanel();
+}
+
+async function loadComputerPanel() {
+  const list = document.getElementById('computer-list');
+  if (list) list.innerHTML = 'Loading...';
+  const upBtn = document.getElementById('ws-up-btn');
+  try {
+    const p = wsPanelPath ? `?subdir=${encodeURIComponent(wsPanelPath)}` : '';
+    const r = await fetch(`/workspace${p}`);
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    if (upBtn) upBtn.style.display = wsPanelPath ? '' : 'none';
+    if (list) {
+      if (data.files && data.files.length) {
+        list.innerHTML = data.files.map(f => {
+          const icon = f.is_dir ? '📁' : getFileIcon(f.name);
+          const name = esc(f.name);
+          const path = esc(f.path);
+          if (f.is_dir) {
+            return `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span style="cursor:pointer;flex:1" onclick="wsPanelCd('${path}')">${icon} ${name}</span>
+              <span><button class="btn btn-sm" onclick="event.stopPropagation();wsPanelDelete('${path}')" title="Delete" style="font-size:9px;padding:1px 5px;background:transparent;border:1px solid var(--border);color:var(--red);border-radius:4px;cursor:pointer">🗑</button></span>
+            </div>`;
+          }
+          return `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">
+            <span style="cursor:pointer;flex:1" onclick="wsPanelOpen('${path}')">${icon} ${name}</span>
+            <span style="font-size:10px;color:var(--text3);margin-right:4px">${formatSize(f.size)}</span>
+            <span>
+              <button class="btn btn-sm" onclick="event.stopPropagation();wsPanelEdit('${path}')" title="Edit" style="font-size:9px;padding:1px 5px;background:transparent;border:1px solid var(--border);color:var(--text2);border-radius:4px;cursor:pointer">✏</button>
+              <button class="btn btn-sm" onclick="event.stopPropagation();wsPanelDelete('${path}')" title="Delete" style="font-size:9px;padding:1px 5px;background:transparent;border:1px solid var(--border);color:var(--red);border-radius:4px;cursor:pointer">🗑</button>
+            </span>
+          </div>`;
+        }).join('');
+      } else {
+        list.innerHTML = '<div style="color:var(--text3);padding:8px 0">Empty</div>';
+      }
+    }
+  } catch (e) {
+    if (list) list.innerHTML = `<span style="color:var(--red)">${esc(e.message)}</span>`;
+  }
+}
+
+function wsPanelNewFile() {
+  const name = prompt('Enter file name:');
+  if (!name) return;
+  const path = wsPanelPath ? `${wsPanelPath}/${name}` : name;
+  wsPanelEdit(path, true);
+}
+
+async function wsPanelEdit(path, isEmpty) {
+  try {
+    if (!isEmpty) {
+      const r = await fetch(`/workspace/read?path=${encodeURIComponent(path)}`);
+      const data = await r.json();
+      if (data.ok) {
+        const newContent = prompt(`Edit: ${path}`, data.content || '');
+        if (newContent === null) return;
+        await fetch('/workspace/write', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path, content: newContent}),
+        });
+      } else {
+        alert('Error: ' + (data.error || 'Failed'));
+      }
+    } else {
+      const newContent = prompt(`Create: ${path}`, '');
+      if (newContent === null) return;
+      await fetch('/workspace/write', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path, content: newContent}),
+      });
+    }
+    loadComputerPanel();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function wsPanelDelete(path) {
+  if (!confirm(`Delete "${path}"?`)) return;
+  try {
+    const r = await fetch(`/workspace?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+    const data = await r.json();
+    if (data.ok) loadComputerPanel();
+    else alert('Error: ' + (data.error || 'Failed'));
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function wsPanelMkdir() {
+  const name = prompt('Enter folder name:');
+  if (!name) return;
+  const path = wsPanelPath ? `${wsPanelPath}/${name}` : name;
+  try {
+    const r = await fetch('/workspace/mkdir', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const data = await r.json();
+    if (data.ok) loadComputerPanel();
+    else alert('Error: ' + (data.error || 'Failed'));
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+function wsPanelCd(subdir) {
+  wsPanelPath = subdir;
+  loadComputerPanel();
+}
+
+function wsPanelUp() {
+  const parts = wsPanelPath.split('/').filter(Boolean);
+  parts.pop();
+  wsPanelPath = parts.join('/');
+  loadComputerPanel();
+}
+
+async function wsPanelOpen(path) {
+  const content = prompt('Read file? File will be shown in chat. Path: ' + path);
+  if (!content) return;
+  try {
+    const r = await fetch(`/workspace/read?path=${encodeURIComponent(path)}`);
+    const data = await r.json();
+    if (data.ok) {
+      const input = document.getElementById('chat-input');
+      if (input) {
+        input.value = `[File: ${path}]\n\`\`\`\n${data.content.slice(0, 2000)}\n\`\`\`\n\n`;
+        sendChat();
+      }
+    } else {
+      alert('Error: ' + (data.error || 'Failed'));
+    }
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function wsRefresh() {
+  const list = document.getElementById('ws-list');
+  const pathLabel = document.getElementById('ws-path');
+  if (list) list.innerHTML = 'Loading...';
+  try {
+    const p = wsPath ? `?subdir=${encodeURIComponent(wsPath)}` : '';
+    const r = await fetch(`/workspace${p}`);
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    if (pathLabel) pathLabel.textContent = '/' + (wsPath || '');
+    const upBtn = document.getElementById('ws-up-btn');
+    if (upBtn) upBtn.style.display = wsPath ? '' : 'none';
+    if (list) {
+      if (data.files && data.files.length) {
+        list.innerHTML = data.files.map(f => {
+          const icon = f.is_dir ? '📁' : getFileIcon(f.name);
+          const sizeStr = f.is_dir ? '' : formatSize(f.size);
+          return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="${f.is_dir ? `wsCd('${esc(f.path)}')` : `wsOpen('${esc(f.path)}')`}">
+            <div><span>${icon}</span> <span style="color:var(--text);margin-left:6px">${esc(f.name)}</span></div>
+            <div style="font-size:11px;color:var(--text3)">${sizeStr}</div>
+          </div>`;
+        }).join('');
+      } else {
+        list.innerHTML = '<div style="color:var(--text3);padding:12px 0">Empty workspace. Create a new file or upload one.</div>';
+      }
+    }
+  } catch (e) {
+    if (list) list.innerHTML = `<div style="color:var(--red)">${esc(e.message)}</div>`;
+  }
+}
+
+function wsCd(subdir) {
+  wsPath = subdir;
+  wsRefresh();
+}
+
+function wsGoUp() {
+  const parts = wsPath.split('/').filter(Boolean);
+  parts.pop();
+  wsPath = parts.join('/');
+  wsRefresh();
+}
+
+async function wsOpen(path) {
+  const card = document.getElementById('ws-editor-card');
+  const title = document.getElementById('ws-editor-title');
+  const editor = document.getElementById('ws-editor');
+  if (card) card.style.display = 'block';
+  if (title) title.textContent = `📝 ${path}`;
+  if (editor) {
+    editor.value = 'Loading...';
+    editor.dataset.path = path;
+  }
+  try {
+    const r = await fetch(`/workspace/read?path=${encodeURIComponent(path)}`);
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    if (editor) editor.value = data.content || '';
+  } catch (e) {
+    if (editor) editor.value = `// Error: ${e.message}`;
+  }
+}
+
+async function wsSave() {
+  const editor = document.getElementById('ws-editor');
+  const path = editor ? editor.dataset.path : '';
+  const content = editor ? editor.value : '';
+  if (!path) return;
+  try {
+    const r = await fetch('/workspace/write', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path, content}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      wsRefresh();
+    } else {
+      alert('Save failed: ' + (data.error || 'Unknown'));
+    }
+  } catch (e) {
+    alert('Save error: ' + e.message);
+  }
+}
+
+function wsCloseEditor() {
+  const card = document.getElementById('ws-editor-card');
+  if (card) card.style.display = 'none';
+}
+
+async function wsNewFile() {
+  const name = prompt('Enter file name (e.g. script.py):');
+  if (!name) return;
+  const fullPath = wsPath ? `${wsPath}/${name}` : name;
+  const editor = document.getElementById('ws-editor');
+  const title = document.getElementById('ws-editor-title');
+  const card = document.getElementById('ws-editor-card');
+  if (card) card.style.display = 'block';
+  if (title) title.textContent = `📝 ${fullPath}`;
+  if (editor) {
+    editor.value = '';
+    editor.dataset.path = fullPath;
+  }
+}
+
+function getFileIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  const map = {
+    py: '🐍', js: '🟨', ts: '🔵', html: '🌐', css: '🎨', json: '📋',
+    md: '📝', txt: '📄', yml: '⚙️', yaml: '⚙️', toml: '⚙️', env: '🔒',
+    sh: '💻', bat: '🪟', ps1: '🪟', sql: '🗄️', xml: '📰', csv: '📊',
+    log: '📃', dockerfile: '🐳', gitignore: '🙈',
+  };
+  return map[ext] || '📄';
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
 </script>
 </body>
 </html>

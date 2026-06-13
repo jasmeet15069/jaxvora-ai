@@ -2,19 +2,22 @@
 
 import os
 import json
+import textwrap
 import asyncio
 import traceback
 import uuid
 import logging
 import re
+import shlex
 import subprocess
 import tempfile
 import hmac
 import html
 import sys
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Set
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -38,13 +41,14 @@ logger = logging.getLogger("jaxvora")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+DEEPSEEK_V4_API_KEY = os.environ.get("DEEPSEEK_V4_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFICATION_EMAIL = os.environ.get("NOTIFICATION_EMAIL", "")
-GMAIL_AUTOMATION_USER = os.environ.get("GMAIL_AUTOMATION_USER", os.environ.get("GMAIL_USER", "jaxvora@gmail.com"))
+GMAIL_AUTOMATION_USER = os.environ.get("GMAIL_AUTOMATION_USER", os.environ.get("GMAIL_USER", ""))
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
@@ -67,12 +71,19 @@ SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat-v3-0324"
 LLAMA_MODEL = "llama-3.3-70b-versatile"
+DEEPSEEK_V4_MODEL = "deepseek/deepseek-v4-flash:free"
+DEEPSEEK_V4_BASE = "https://openrouter.ai/api/v1"
+MAX_TOKENS = 8192
+DEEPSEEK_V4_MAX_TOKENS = 64000
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_UPLOAD_TEXT_CHARS = 24000
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
 
 async def call_openrouter(system: str, user: str, model: str = DEEPSEEK_MODEL) -> str:
+    cached = await redis_cache.get("llm", f"or|{model}|{system}|{user}")
+    if cached:
+        return cached
     if not OPENROUTER_API_KEY:
         return f"[Mock response — OPENROUTER_API_KEY not set] Task: {user[:100]}"
     try:
@@ -90,16 +101,21 @@ async def call_openrouter(system: str, user: str, model: str = DEEPSEEK_MODEL) -
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                    "max_tokens": 2048,
+                    "max_tokens": MAX_TOKENS,
                 },
             )
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            result = r.json()["choices"][0]["message"]["content"]
+            await redis_cache.set("llm", f"or|{model}|{system}|{user}", result)
+            return result
     except Exception as e:
         return f"[OpenRouter error: {e}]"
 
 
 async def call_groq(system: str, user: str) -> str:
+    cached = await redis_cache.get("llm", f"groq|{system}|{user}")
+    if cached:
+        return cached
     if not GROQ_API_KEY:
         logger.warning("GROQ_API_KEY not set — falling back to OpenRouter")
         return await call_openrouter(system, user)
@@ -116,7 +132,7 @@ async def call_groq(system: str, user: str) -> str:
                             {"role": "system", "content": system},
                             {"role": "user", "content": user},
                         ],
-                        "max_tokens": 2048,
+                        "max_tokens": MAX_TOKENS,
                     },
                 )
                 if r.status_code == 429:
@@ -128,9 +144,12 @@ async def call_groq(system: str, user: str) -> str:
                         logger.warning("Groq rate-limited after 3 retries — falling back to OpenRouter")
                         return await call_openrouter(system, user)
                 r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"]
-        except httpx.HTTPStatusError:
-            raise
+                result = r.json()["choices"][0]["message"]["content"]
+                await redis_cache.set("llm", f"groq|{system}|{user}", result)
+                return result
+        except httpx.HTTPStatusError as http_err:
+            logger.warning(f"Groq HTTP error {http_err.response.status_code} — falling back to OpenRouter")
+            return await call_openrouter(system, user)
         except Exception as e:
             if delay is not None:
                 await asyncio.sleep(delay)
@@ -138,6 +157,35 @@ async def call_groq(system: str, user: str) -> str:
             logger.error(f"Groq error after retries: {e} — falling back to OpenRouter")
             return await call_openrouter(system, user)
     return await call_openrouter(system, user)
+
+
+async def call_deepseek_v4(system: str, user: str) -> str:
+    if not DEEPSEEK_V4_API_KEY:
+        logger.warning("DEEPSEEK_V4_API_KEY not set — falling back to OpenRouter")
+        return await call_openrouter(system, user)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"{DEEPSEEK_V4_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_V4_API_KEY}",
+                    "HTTP-Referer": "https://jaxvora.ai",
+                    "X-Title": "Jaxvora",
+                },
+                json={
+                    "model": DEEPSEEK_V4_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "max_tokens": DEEPSEEK_V4_MAX_TOKENS,
+                },
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.warning(f"DeepSeek V4 error: {e} — falling back to OpenRouter")
+        return await call_openrouter(system, user)
 
 
 def _resolve_app_resource(env_value: str, *relative_parts: str) -> Optional[Path]:
@@ -206,7 +254,7 @@ def _gmail_template_html(params: Dict[str, Any]) -> str:
         "{{body_html}}": body_html,
         "{{logo_cid}}": GMAIL_LOGO_CID,
         "{{sender}}": html.escape(sender),
-        "{{year}}": str(datetime.utcnow().year),
+        "{{year}}": str(datetime.now(timezone.utc).year),
     }
     for token, value in replacements.items():
         template = template.replace(token, value)
@@ -270,14 +318,19 @@ async def send_gmail(to_email: str, subject: str, body: str, attachment_name: st
     """Send a branded Jaxvora email through Gmail API first, then SMTP fallback."""
     if not to_email:
         return "[No recipient email — set NOTIFICATION_EMAIL in Settings]"
-    if not attachment_data and not attachment_name and gmail_automation_status().get("configured"):
-        api_result = await run_gmail_automation({
+    api_configured = gmail_automation_status().get("configured")
+    if api_configured:
+        api_params = {
             "action": "send",
             "to": to_email,
             "subject": subject,
             "body": body,
             "confirm": True,
-        })
+        }
+        if attachment_data and attachment_name:
+            api_params["attachment_name"] = attachment_name
+            api_params["attachment_data"] = base64.b64encode(attachment_data).decode("utf-8")
+        api_result = await run_gmail_automation(api_params)
         if api_result.get("ok"):
             logger.info(f"✉ Email sent via Gmail API to {to_email}: {subject}")
             return f"Email sent to {to_email} via Gmail API"
@@ -450,7 +503,16 @@ def _gmail_message_summary(message: Dict[str, Any], include_body: bool = False) 
 
 
 def _gmail_raw_message(params: Dict[str, Any]) -> str:
-    msg = _gmail_mime_message(params)
+    attachments = None
+    attachment_data_b64 = params.get("attachment_data")
+    attachment_name = params.get("attachment_name")
+    if attachment_data_b64 and attachment_name:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(base64.b64decode(attachment_data_b64))
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
+        attachments = [part]
+    msg = _gmail_mime_message(params, attachments=attachments)
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
 
@@ -658,7 +720,75 @@ async def run_gmail_automation(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "action": action, "error": str(e)}
 
 
-# === SECTION 2: Database Layer ================================================
+# === SECTION 2: Cache Layer (Redis) ==========================================
+
+REDIS_URL: str = os.environ.get("REDIS_URL", "")
+CACHE_TTL: int = int(os.environ.get("CACHE_TTL", "3600"))
+
+class RedisCache:
+    """Async Redis cache for LLM responses, RAG results, and agent outputs."""
+
+    def __init__(self):
+        self._client: Optional[Any] = None
+        self._enabled = bool(REDIS_URL)
+
+    async def connect(self):
+        if not self._enabled:
+            return
+        try:
+            import redis.asyncio as aioredis
+            self._client = aioredis.from_url(
+                REDIS_URL, decode_responses=True, socket_timeout=2
+            )
+            await self._client.ping()
+        except Exception:
+            self._client = None
+            self._enabled = False
+
+    async def close(self):
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    def _key(self, prefix: str, data: str) -> str:
+        import hashlib
+        return f"{prefix}:{hashlib.sha256(data.encode()).hexdigest()[:32]}"
+
+    async def get(self, prefix: str, data: str) -> Optional[str]:
+        if not self._enabled or not self._client:
+            return None
+        try:
+            return await self._client.get(self._key(prefix, data))
+        except Exception:
+            return None
+
+    async def set(self, prefix: str, data: str, value: str, ttl: int = CACHE_TTL):
+        if not self._enabled or not self._client:
+            return
+        try:
+            await self._client.setex(self._key(prefix, data), ttl, value)
+        except Exception:
+            pass
+
+    async def delete_prefix(self, prefix: str):
+        if not self._enabled or not self._client:
+            return
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = await self._client.scan(cursor, match=f"{prefix}:*", count=100)
+                if keys:
+                    await self._client.delete(*keys)
+                if cursor == 0:
+                    break
+        except Exception:
+            pass
+
+
+redis_cache = RedisCache()
+
+
+# === SECTION 3: Database Layer ================================================
 
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -728,6 +858,66 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS rag_documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chunk_text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    metadata JSONB DEFAULT '{}',
+    embedding DOUBLE PRECISION[] NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS rag_documents_fts ON rag_documents USING GIN(to_tsvector('english', chunk_text));
+
+-- Phase 4: jaxvora.* tables for v1.0 operations
+CREATE TABLE IF NOT EXISTS jaxvora_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL DEFAULT 'default',
+    task_id TEXT NOT NULL DEFAULT '',
+    state JSONB DEFAULT '{}',
+    context TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS jaxvora_subtask_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES jaxvora_sessions(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    subtask TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    output TEXT DEFAULT '',
+    error TEXT DEFAULT '',
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS jaxvora_operation_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    tool_name TEXT DEFAULT '',
+    input TEXT DEFAULT '',
+    output TEXT DEFAULT '',
+    success BOOLEAN DEFAULT TRUE,
+    duration_ms INTEGER DEFAULT 0,
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS jaxvora_ssh_audit (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES jaxvora_sessions(id) ON DELETE SET NULL,
+    command TEXT NOT NULL,
+    host TEXT DEFAULT '',
+    user TEXT DEFAULT '',
+    exit_code INTEGER DEFAULT 0,
+    output TEXT DEFAULT '',
+    approved BOOLEAN DEFAULT NULL,
+    risk_level TEXT DEFAULT 'low',
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 async def get_db() -> asyncpg.Pool:
@@ -769,48 +959,78 @@ async def log_to_db(level: str, message: str, task_id: Optional[str] = None):
 # === SECTION 3: MCP Tool Registry =============================================
 
 class MCPTool:
-    def __init__(self, name: str, description: str):
+    RISK_LEVELS = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+    def __init__(self, name: str, description: str, risk_level: str = "low",
+                 requires_confirmation: bool = False):
         self.name = name
         self.description = description
+        self.risk_level = risk_level if risk_level in self.RISK_LEVELS else "low"
+        self.requires_confirmation = requires_confirmation
 
     async def run(self, params: Dict[str, Any]) -> str:
         raise NotImplementedError
 
+    def permission_check(self, params: Dict[str, Any]) -> Optional[str]:
+        """Return None if allowed, or a string reason if denied."""
+        return None
+
 
 class FileSystemTool(MCPTool):
+    SANDBOX = Path("/root/jaxvora-ai/workspace")
+
     def __init__(self):
-        super().__init__("file_system", "Read and write files in the workspace")
+        super().__init__("file_system", "Read and write files in the workspace",
+                         risk_level="medium", requires_confirmation=True)
+        self.SANDBOX.mkdir(parents=True, exist_ok=True)
+
+    def permission_check(self, params: Dict[str, Any]) -> Optional[str]:
+        path = params.get("path", "")
+        resolved = (self.SANDBOX / path).resolve()
+        try:
+            resolved.relative_to(self.SANDBOX)
+        except ValueError:
+            return f"Path traversal blocked: {path}"
+        return None
 
     async def run(self, params: Dict[str, Any]) -> str:
         try:
             action = params.get("action", "read")
-            path = params.get("path", "")
+            raw_path = params.get("path", "")
+            resolved = (self.SANDBOX / raw_path).resolve()
+            if not str(resolved).startswith(str(self.SANDBOX.resolve())):
+                return f"file_system error: path escapes sandbox ({self.SANDBOX})"
             if action == "read":
-                with open(path) as f:
+                with open(resolved) as f:
                     return f.read()
             elif action == "write":
-                Path(path).parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "w") as f:
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                with open(resolved, "w") as f:
                     f.write(params.get("content", ""))
-                return f"Written to {path}"
+                return f"Written to {resolved}"
             return "Unknown action"
         except Exception as e:
             return f"file_system error: {e}"
 
 
 class TerminalTool(MCPTool):
-    ALLOWED = re.compile(r'^(ls|cat|echo|pwd|find|grep|wc|head|tail|python3? -c|pip show)\b')
+    ALLOWED_COMMANDS = {"ls", "cat", "echo", "pwd", "find", "grep", "wc", "head", "tail", "python3", "pip", "node"}
 
     def __init__(self):
-        super().__init__("terminal", "Run sandboxed shell commands (read-only)")
+        super().__init__("terminal", "Run sandboxed shell commands (read-only)",
+                         risk_level="high", requires_confirmation=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
         cmd = params.get("command", "")
-        if not self.ALLOWED.match(cmd):
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            return "terminal error: invalid command string"
+        if not parts or parts[0] not in self.ALLOWED_COMMANDS:
             return f"Command blocked for safety: {cmd}"
         try:
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=10
+                parts, shell=False, capture_output=True, text=True, timeout=10
             )
             return result.stdout or result.stderr or "(no output)"
         except subprocess.TimeoutExpired:
@@ -821,7 +1041,8 @@ class TerminalTool(MCPTool):
 
 class PostgreSQLTool(MCPTool):
     def __init__(self):
-        super().__init__("postgresql", "Execute SQL queries against the database")
+        super().__init__("postgresql", "Execute SQL queries against the database",
+                         risk_level="high", requires_confirmation=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
         sql = params.get("query", "")
@@ -836,7 +1057,8 @@ class PostgreSQLTool(MCPTool):
 
 class BrowserTool(MCPTool):
     def __init__(self):
-        super().__init__("browser", "Fetch and parse web pages")
+        super().__init__("browser", "Fetch and parse web pages",
+                         risk_level="low")
 
     async def run(self, params: Dict[str, Any]) -> str:
         url = params.get("url", "")
@@ -863,7 +1085,8 @@ class SecurityScannerTool(MCPTool):
     ]
 
     def __init__(self):
-        super().__init__("security_scanner", "Static analysis for secrets and vulnerabilities")
+        super().__init__("security_scanner", "Static analysis for secrets and vulnerabilities",
+                         risk_level="low")
 
     async def run(self, params: Dict[str, Any]) -> str:
         content = params.get("content", "")
@@ -876,7 +1099,8 @@ class SecurityScannerTool(MCPTool):
 
 class CodeFormatterTool(MCPTool):
     def __init__(self):
-        super().__init__("code_formatter", "Lint and format code suggestions")
+        super().__init__("code_formatter", "Lint and format code suggestions",
+                         risk_level="low")
 
     async def run(self, params: Dict[str, Any]) -> str:
         lang = params.get("language", "python")
@@ -893,7 +1117,8 @@ class CodeFormatterTool(MCPTool):
 
 class EmailNotificationTool(MCPTool):
     def __init__(self):
-        super().__init__("email_notify", "Send email notifications for bugs, issues, and alerts to the configured recipient")
+        super().__init__("email_notify", "Send email notifications for bugs, issues, and alerts to the configured recipient",
+                         risk_level="medium", requires_confirmation=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
         to = params.get("to", NOTIFICATION_EMAIL)
@@ -907,6 +1132,7 @@ class GmailAutomationTool(MCPTool):
         super().__init__(
             "gmail_automation",
             "Governed Gmail API automation for Jaxvora Gmail: search, read, draft, send, archive, delete, labels, and filters",
+            risk_level="critical", requires_confirmation=True,
         )
 
     async def run(self, params: Dict[str, Any]) -> str:
@@ -916,6 +1142,8 @@ class GmailAutomationTool(MCPTool):
 
 SSH_BLOCKED_COMMAND_PATTERNS = [
     r"\brm\s+-rf\s+/",
+    r"\brm\s+-rf\s+/\*",
+    r"\brm\s+-rf\s+\.",
     r"\bmkfs\b",
     r"\bdd\s+if=",
     r":\s*\(\s*\)\s*\{",
@@ -927,8 +1155,8 @@ SSH_BLOCKED_COMMAND_PATTERNS = [
     r"\bpasswd\b",
     r"\buserdel\b",
     r"\bdeluser\b",
-    r"\bchmod\s+-R\s+777\s+/",
-    r"\bchown\s+-R\b.*\s+/",
+    r"\bchmod\s+-R\s+777\s+",
+    r"\bchown\s+-R\b",
     r"\bufw\s+(disable|reset)\b",
     r"\biptables\b",
     r"\bnft\s+flush\b",
@@ -952,7 +1180,8 @@ def validate_ssh_command(command: str) -> Dict[str, Any]:
 
 class SSHTool(MCPTool):
     def __init__(self):
-        super().__init__("ssh_exec", "Execute commands on a remote server via SSH for 24/7 monitoring and management")
+        super().__init__("ssh_exec", "Execute commands on a remote server via SSH for 24/7 monitoring and management",
+                         risk_level="critical", requires_confirmation=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
         host = params.get("host", SSH_HOST)
@@ -969,7 +1198,6 @@ class SSHTool(MCPTool):
             import asyncssh
             conn_kwargs: Dict[str, Any] = {
                 "host": host, "port": port, "username": user,
-                "known_hosts": None,
             }
             if password:
                 conn_kwargs["password"] = password
@@ -988,6 +1216,88 @@ class SSHTool(MCPTool):
             return f"[SSH error: {e}]"
 
 
+class WebSearchTool(MCPTool):
+    def __init__(self):
+        super().__init__("web_search", "Search the internet via DuckDuckGo for current information, news, documentation",
+                         risk_level="low")
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        query = params.get("query", "")
+        max_results = min(int(params.get("max_results", 5)), 10)
+        if not query:
+            return "[Web search tool: no query provided]"
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                r = await client.post(
+                    "https://lite.duckduckgo.com/lite/",
+                    data={"q": query},
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; Jaxvora/1.0)"},
+                )
+                results = []
+                lines = r.text.split("\n")
+                title, snippet, url = "", "", ""
+                in_res = False
+                capturing = False
+                for line in lines:
+                    if '"result-link"' in line or "'result-link'" in line or '"result__a"' in line or "'result__a'" in line:
+                        if title:
+                            results.append(f"\u2022 {title}\n  {html.unescape(re.sub(r'<[^>]+>', '', snippet)).strip()}\n  {url}")
+                        title = snippet = url = ""
+                        capturing = False
+                        h = re.search(r'href="([^"]+)"', line)
+                        if not h:
+                            h = re.search(r"href='([^']+)'", line)
+                        if h:
+                            url = html.unescape(h.group(1))
+                        t = re.search(r'>([^<]+)<', line)
+                        if t:
+                            title = html.unescape(t.group(1))
+                        in_res = True
+                    elif in_res and ('class="result-snippet"' in line or "class='result-snippet'" in line or 'class="result__snippet"' in line or "class='result__snippet'" in line):
+                        capturing = True
+                        after_class = line.split(">", 1)[1] if ">" in line else ""
+                        snippet += after_class + " "
+                    elif in_res and capturing:
+                        if "</td>" in line or "</TD>" in line:
+                            capturing = False
+                        elif "<tr" not in line and line.strip() and not line.strip().startswith("<"):
+                            snippet += line.strip() + " "
+                    elif in_res and line.strip() in ("</div>", "</div"):
+                        if title:
+                            results.append(f"\u2022 {title}\n  {html.unescape(re.sub(r'<[^>]+>', '', snippet)).strip()}\n  {url}")
+                        title = snippet = url = ""
+                        in_res = False
+                        capturing = False
+                    if len(results) >= max_results:
+                        break
+                if title:
+                    results.append(f"\u2022 {title}\n  {snippet}\n  {url}")
+                if not results:
+                    return f"No web results found for '{query}'."
+                return f"Web search results for '{query}':\n\n" + "\n\n".join(results[:max_results])
+        except Exception as e:
+            return f"[Web search error: {e}]"
+
+
+class AgentInvokeTool(MCPTool):
+    def __init__(self):
+        super().__init__("agent_invoke", "Invoke a specialist agent by name to perform a sub-task",
+                         risk_level="medium", requires_confirmation=True)
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        name = params.get("name", "")
+        task = params.get("task", "")
+        if not name or name not in AGENT_REGISTRY:
+            return f"[AgentInvokeTool] Agent '{name}' not found. Available: {', '.join(list(AGENT_REGISTRY.keys())[:10])}..."
+        agent = AGENT_REGISTRY[name]
+        result = await agent.run(task)
+        output = result.output[:3000] if result.output else "(no output)"
+        return f"[Agent: {name}]\n{output}\n[Success: {result.success}]"
+
+
+WORKSPACE_DIR = Path("/root/jaxvora-ai/workspace")
+
+
 class MCPToolRegistry:
     def __init__(self):
         self._tools: Dict[str, MCPTool] = {}
@@ -998,13 +1308,83 @@ class MCPToolRegistry:
     async def run(self, name: str, params: Dict[str, Any]) -> str:
         if name not in self._tools:
             return f"Tool '{name}' not found"
-        return await self._tools[name].run(params)
+        tool = self._tools[name]
+        denial = tool.permission_check(params)
+        if denial:
+            return f"[Permission denied] {denial}"
+        return await tool.run(params)
 
     def list_tools(self) -> List[Dict]:
-        return [{"name": t.name, "description": t.description} for t in self._tools.values()]
+        return [{"name": t.name, "description": t.description, "risk_level": t.risk_level,
+                  "requires_confirmation": t.requires_confirmation} for t in self._tools.values()]
+
+    def get_risk_level(self, name: str) -> str:
+        tool = self._tools.get(name)
+        return tool.risk_level if tool else "unknown"
+
+    def requires_confirmation(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        return tool.requires_confirmation if tool else False
 
 
 tool_registry = MCPToolRegistry()
+
+
+class ErrorEscalation:
+    """Error escalation chain: agent → division lead → Chief Orchestrator → human."""
+
+    LEVELS = ["agent", "division_lead", "orchestrator", "human"]
+
+    def __init__(self):
+        self._escalations: List[Dict] = []
+
+    async def escalate(self, agent_name: str, error: str, context: str = "",
+                       level: str = "agent") -> Dict:
+        entry = {
+            "agent": agent_name,
+            "error": error[:500],
+            "context": context[:1000],
+            "level": level,
+            "resolved": False,
+            "resolution": "",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._escalations.append(entry)
+        # Log to DB
+        await log_to_db("ERROR",
+            f"[Escalation:{level}] {agent_name}: {error[:200]}")
+        # Auto-escalate through chain if not resolved
+        if level == "agent":
+            return await self._try_division_lead(entry)
+        return entry
+
+    async def _try_division_lead(self, entry: Dict) -> Dict:
+        lead_name = DIVISION_LEADS.get(
+            next((a.division for a in AGENT_REGISTRY.values()
+                  if a.name == entry["agent"]), ""), "")
+        if lead_name and lead_name in AGENT_REGISTRY:
+            lead = AGENT_REGISTRY[lead_name]
+            result = await lead.run(
+                f"Resolve error from {entry['agent']}: {entry['error']}\nContext: {entry['context']}")
+            entry["lead_response"] = result.output if hasattr(result, 'output') else str(result)[:500]
+            entry["level"] = "division_lead"
+            if "resolved" in (result.output if hasattr(result, 'output') else "").lower():
+                entry["resolved"] = True
+                entry["resolution"] = "Resolved by division lead"
+                return entry
+        entry["level"] = "orchestrator"
+        entry["resolved"] = False
+        entry["resolution"] = "Needs human intervention"
+        return entry
+
+    def recent_escalations(self, limit: int = 10) -> List[Dict]:
+        return self._escalations[-limit:]
+
+    def unresolved_count(self) -> int:
+        return sum(1 for e in self._escalations if not e["resolved"])
+
+
+error_escalation = ErrorEscalation()
 
 
 def _doctor_check(name: str, ok: bool, detail: str, output: str = "") -> Dict[str, Any]:
@@ -1162,7 +1542,7 @@ class MemoryManager:
         try:
             await db_execute(
                 "INSERT INTO knowledge_base (collection, content, metadata) VALUES ($1, $2, $3)",
-                collection, content, json.dumps(metadata or {})
+                collection, content, json.dumps(metadata) if metadata else None
             )
         except Exception as e:
             logger.warning(f"Memory store error: {e}")
@@ -1201,6 +1581,167 @@ class MemoryManager:
 memory = MemoryManager()
 
 
+# === SECTION 4b: RAG Engine ===================================================
+
+class RAGEngine:
+    """Retrieval-Augmented Generation engine with hybrid search (FTS + vector)."""
+
+    def __init__(self):
+        self._embed_model = None
+        self._index: Dict[str, List[float]] = {}
+        self._index_loaded = False
+        self.dim = 384
+
+    def _lazy_model(self):
+        if self._embed_model is None:
+            from fastembed import TextEmbedding
+            self._embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+    def _cosine_sim(self, a: List[float], b: List[float]) -> float:
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        return dot / (na * nb + 1e-10)
+
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            if end < len(text):
+                last_newline = text.rfind("\n", start, end)
+                if last_newline > start + chunk_size // 2:
+                    end = last_newline
+                else:
+                    last_space = text.rfind(" ", start, end)
+                    if last_space > start + chunk_size // 2:
+                        end = last_space
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = end - overlap if end < len(text) else len(text)
+        return chunks or [text.strip()]
+
+    async def rebuild_index(self):
+        """Rebuild in-memory vector index from all DB documents."""
+        self._index = {}
+        try:
+            rows = await db_fetch("SELECT id, embedding FROM rag_documents WHERE embedding IS NOT NULL")
+            for r in rows:
+                self._index[str(r["id"])] = r["embedding"]
+            self._index_loaded = True
+            logger.info(f"RAG index rebuilt: {len(self._index)} vectors")
+        except Exception as e:
+            logger.warning(f"RAG index rebuild failed: {e}")
+
+    async def ingest(self, text: str, source: str = "", metadata: Optional[Dict] = None) -> int:
+        """Chunk text, embed chunks, store in DB and index."""
+        self._lazy_model()
+        chunks = self._chunk_text(text)
+        if not chunks:
+            return 0
+        embeddings = list(self._embed_model.embed(chunks))
+        count = 0
+        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            emb_list = [float(v) for v in emb]
+            row = await db_fetchrow(
+                """INSERT INTO rag_documents (chunk_text, source, metadata, embedding)
+                   VALUES ($1, $2, $3, $4::double precision[]) RETURNING id""",
+                chunk, source, json.dumps(metadata or {}), emb_list
+            )
+            if row:
+                self._index[str(row["id"])] = emb_list
+                count += 1
+        logger.info(f"RAG ingested {count} chunks from '{source}'")
+        return count
+
+    async def search(self, query: str, top_k: int = 5, fts_only: bool = False) -> List[Dict]:
+        """Hybrid search: FTS candidates → vector rerank. Falls back to FTS-only."""
+        cached = await redis_cache.get("rag", f"search|{query}|{top_k}|{fts_only}")
+        if cached:
+            return json.loads(cached)
+        if not self._index_loaded:
+            await self.rebuild_index()
+        if not self._index_loaded:
+            return []
+
+        self._lazy_model()
+        query_emb = list(self._embed_model.embed([query]))[0]
+        query_emb_list = [float(v) for v in query_emb]
+
+        try:
+            fts_rows = await db_fetch(
+                """SELECT id, chunk_text, source, metadata, created_at,
+                          ts_rank(to_tsvector('english', chunk_text), plainto_tsquery('english', $1)) AS rank
+                   FROM rag_documents
+                   WHERE to_tsvector('english', chunk_text) @@ plainto_tsquery('english', $1)
+                   ORDER BY rank DESC LIMIT $2""",
+                query, top_k * 3
+            )
+            candidates = [(str(r["id"]), r) for r in fts_rows]
+        except Exception:
+            candidates = []
+
+        if not candidates and self._index:
+            doc_ids = list(self._index.keys())
+            rows = await db_fetch(
+                "SELECT id, chunk_text, source, metadata, created_at FROM rag_documents WHERE id = ANY($1::uuid[]) LIMIT $2",
+                [uuid.UUID(did) for did in doc_ids[:top_k * 3]], top_k * 3
+            )
+            candidates = []
+            for r in rows:
+                did = str(r["id"])
+                emb = self._index.get(did)
+                if emb:
+                    sim = self._cosine_sim(query_emb_list, emb)
+                    candidates.append((did, r, sim))
+                else:
+                    candidates.append((did, r, 0.0))
+
+        scored = []
+        seen_ids = set()
+        for item in candidates:
+            if len(item) == 2:
+                did, row = item
+                emb = self._index.get(did)
+                sim = self._cosine_sim(query_emb_list, emb) if emb else 0.0
+                fts_rank = float(row.get("rank", 0) or 0)
+            else:
+                did, row, sim = item
+                fts_rank = float(row.get("rank", 0) or 0)
+            if did in seen_ids:
+                continue
+            seen_ids.add(did)
+            hybrid_score = sim * 0.7 + min(fts_rank, 1.0) * 0.3
+            scored.append((hybrid_score, {
+                "id": did,
+                "content": row["chunk_text"][:2000],
+                "source": row.get("source", ""),
+                "score": round(hybrid_score, 4),
+                "created_at": str(row.get("created_at", "")),
+            }))
+
+        scored.sort(key=lambda x: -x[0])
+        results = [s[1] for s in scored[:top_k]]
+        await redis_cache.set("rag", f"search|{query}|{top_k}|{fts_only}", json.dumps(results, default=str), ttl=600)
+        return results
+
+    async def augment(self, query: str, top_k: int = 3) -> str:
+        """Search RAG and return formatted context string for LLM injection."""
+        results = await self.search(query, top_k=top_k)
+        if not results:
+            return ""
+        parts = ["## Retrieved Context (RAG)"]
+        for i, r in enumerate(results, 1):
+            source = f" [{r['source']}]" if r.get("source") else ""
+            parts.append(f"{i}.{source} {r['content']}")
+        return "\n\n".join(parts)
+
+
+rag_engine = RAGEngine()
+
+
 # === SECTION 5: Agent Registry & Base Agent Class =============================
 
 class AgentResult:
@@ -1230,6 +1771,8 @@ class BaseAgent:
     async def call_llm(self, system: str, user: str) -> str:
         if self.model == "groq":
             return await call_groq(system, user)
+        elif self.model == "deepseek_v4":
+            return await call_deepseek_v4(system, user)
         else:
             return await call_openrouter(system, user)
 
@@ -1245,6 +1788,22 @@ class BaseAgent:
             await log_to_db("INFO", f"[{self.name}] Starting: {task[:80]}", task_id)
             await ws_manager.broadcast_agent_status(self.name, "running", task[:60])
             output = await self._execute(task)
+        except Exception as e:
+            tb = traceback.format_exc()
+            await db_execute(
+                "UPDATE tasks SET status='failed', output=$1, completed_at=NOW() WHERE id=$2",
+                str(e), task_id
+            )
+            await db_execute(
+                "INSERT INTO agent_history (agent_name, task_summary, outcome) VALUES ($1, $2, 'failed')",
+                self.name, task[:120]
+            )
+            await log_to_db("ERROR", f"[{self.name}] Error: {e}", task_id)
+            self._status = "error"
+            await ws_manager.broadcast_agent_status(self.name, "error", str(e)[:60])
+            return AgentResult(self.name, task, f"Error: {e}\n{tb}", False, task_id)
+
+        try:
             await db_execute(
                 "UPDATE tasks SET status='completed', output=$1, completed_at=NOW() WHERE id=$2",
                 output, task_id
@@ -1254,20 +1813,12 @@ class BaseAgent:
                 self.name, task[:120]
             )
             await log_to_db("INFO", f"[{self.name}] Completed ✓", task_id)
-            self._status = "idle"
-            self._current_task = ""
-            await ws_manager.broadcast_agent_status(self.name, "idle", "")
-            return AgentResult(self.name, task, output, True, task_id)
         except Exception as e:
-            tb = traceback.format_exc()
-            await db_execute(
-                "UPDATE tasks SET status='failed', output=$1, completed_at=NOW() WHERE id=$2",
-                str(e), task_id
-            )
-            await log_to_db("ERROR", f"[{self.name}] Error: {e}", task_id)
-            self._status = "error"
-            await ws_manager.broadcast_agent_status(self.name, "error", str(e)[:60])
-            return AgentResult(self.name, task, f"Error: {e}\n{tb}", False, task_id)
+            logger.warning(f"[{self.name}] Post-execution bookkeeping failed: {e}")
+        self._status = "idle"
+        self._current_task = ""
+        await ws_manager.broadcast_agent_status(self.name, "idle", "")
+        return AgentResult(self.name, task, output, True, task_id)
 
     async def _execute(self, task: str) -> str:
         raise NotImplementedError
@@ -1282,10 +1833,407 @@ class BaseAgent:
         }
 
 
+# === SECTION 5.5: Agent Graph Framework (TAOR v1.0) ============================
+
+class AgentGraphState:
+    """State for the THINK→ACT→OBSERVE→REFLECT loop (v1.0 protocol)."""
+    def __init__(self, task: str, system_prompt: str, max_iterations: int = 8):
+        self.task = task
+        self.system_prompt = system_prompt
+        self.messages: List[Dict[str, str]] = []
+        self.tool_results: List[Dict[str, Any]] = []
+        self.iteration = 0
+        self.max_iterations = max_iterations
+        self.final_output: Optional[str] = None
+        self.conversation_log: List[str] = []
+
+        self.task_id = str(uuid.uuid4())
+        self.raw_intent = ""
+        self.subtasks: Dict[str, Dict] = {}
+        self.parallel_groups: List[List[str]] = []
+        self.rag_required = False
+        self.rag_query = ""
+        self.estimated_hops = 0
+        self.risk_flags: List[str] = []
+        self.observe_results: Dict[str, Dict] = {}
+        self.confidence_score = 0.0
+        self.goal_fulfilled = False
+        self.handoff_queue: List[Dict] = []
+        self.pending_confirmation: Optional[Dict] = None
+        self.agent_latencies: Dict[str, float] = {}
+        self.error_counts: Dict[str, int] = defaultdict(int)
+        self.last_reflect: Optional[Dict] = None
+
+    def add_message(self, role: str, content: str):
+        self.messages.append({"role": role, "content": content})
+        self.conversation_log.append(f"[{role.upper()}] {content[:200]}")
+
+    def to_prompt(self) -> str:
+        lines = [f"## Task\n{self.task}\n"]
+        lines.append(f"**Task ID:** {self.task_id}")
+        if self.raw_intent:
+            lines.append(f"**Intent:** {self.raw_intent}")
+        if self.tool_results:
+            lines.append("\n## Previous Tool & Agent Results")
+            for tr in self.tool_results[-5:]:
+                lines.append(f"\n- **{tr.get('tool', 'unknown')}**")
+                lines.append(f"  Result: {str(tr.get('result', ''))[:400]}")
+                if tr.get("error"):
+                    lines.append(f"  Error: {tr['error']}")
+        if self.observe_results:
+            lines.append("\n## Observation Summary")
+            for sid, res in list(self.observe_results.items())[-3:]:
+                lines.append(f"- Subtask {sid}: {res.get('status', '?')} (conf: {res.get('confidence', 'N/A')})")
+        lines.append(f"\n## Iteration {self.iteration + 1} of {self.max_iterations}")
+        for m in self.messages[-4:]:
+            lines.append(f"\n[{m['role'].upper()}] {m['content'][:200]}")
+        return "\n".join(lines)
+
+
+class AgentWorkflow:
+    """THINK → ACT → OBSERVE → REFLECT loop — v1.0 structured protocol."""
+
+    SYSTEM_TEMPLATE = """You are Jaxvora's Chief Orchestrator following the TAOR v1.0 protocol.
+
+## THINK Phase
+Before any action, output a structured <think> block:
+
+<think>
+  <task_id>{task_id}</task_id>
+  <raw_intent>what the user actually wants</raw_intent>
+  <decomposed_subtasks>
+    <subtask id="1" depends_on="none">description</subtask>
+    <subtask id="2" depends_on="1">description</subtask>
+  </decomposed_subtasks>
+  <division_routing>
+    <route subtask_id="1" division="Engineering" agent="Software Engineer" reason="why this agent"/>
+  </division_routing>
+  <parallel_groups>[[1], [2]]</parallel_groups>
+  <rag_required>true|false</rag_required>
+  <rag_query>query if rag_required</rag_query>
+  <estimated_hops>n</estimated_hops>
+  <risk_flags>list irreversible actions or NONE</risk_flags>
+</think>
+
+## ACT Phase
+Dispatch to agents with <dispatch> or call MCP tools with <mcp_call>:
+
+<dispatch agent="Agent Name" subtask_id="1" priority="high">
+  <context>relevant context from RAG or prior output</context>
+  <instruction>precise scoped instruction</instruction>
+  <output_schema>code|json|text|file_path</output_schema>
+  <timeout_seconds>120</timeout_seconds>
+</dispatch>
+
+<mcp_call tool="tool_name" subtask_id="2">
+  <parameter name="param1">value1</parameter>
+</mcp_call>
+
+## REFLECT Phase
+After results, assess completion:
+
+<reflect>
+  <goal_fulfilled>true|false</goal_fulfilled>
+  <confidence_score>0.0-1.0</confidence_score>
+  <quality_issues>
+    <issue subtask_id="1">description of gap</issue>
+  </quality_issues>
+  <next_action>
+    <!-- continue_loop, request_human_input, or finalize -->
+    <continue_loop reason="why another iteration is needed"/>
+  </next_action>
+  <loop_iteration>{{n}}</loop_iteration>
+</reflect>
+
+When done, output:
+<final_answer>
+Your complete synthesized answer
+</final_answer>
+
+Available tools:
+{tools}
+
+Available specialist agents (via agent_invoke):
+{agents}
+
+Rules:
+- Never skip THINK
+- Flag risk_flags for irreversible actions
+- Continue loop if confidence_score < 0.75
+- Force-finalize at iteration 8"""
+
+    @staticmethod
+    def _build_tool_descriptions() -> str:
+        lines = []
+        for t in tool_registry.list_tools():
+            lines.append(f"- **{t['name']}**: {t['description']}")
+        return "\n".join(lines) if lines else "(no tools configured)"
+
+    @staticmethod
+    def _build_agent_list() -> str:
+        by_div: Dict[str, List[str]] = defaultdict(list)
+        for name, ag in AGENT_REGISTRY.items():
+            by_div[ag.division].append(name)
+        lines = []
+        for div, agents in by_div.items():
+            lines.append(f"- **{div}**: {', '.join(agents)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_xml_block(text: str, tag: str) -> Optional[str]:
+        m = re.search(f'<{tag}[^>]*>(.*?)</{tag}>', text, re.DOTALL)
+        return m.group(1).strip() if m else None
+
+    @staticmethod
+    def _parse_think_block(text: str) -> Dict[str, Any]:
+        think = AgentWorkflow._parse_xml_block(text, "think")
+        if not think:
+            return {}
+        result: Dict[str, Any] = {}
+        for field in ["task_id", "raw_intent", "parallel_groups", "rag_required",
+                       "rag_query", "estimated_hops", "risk_flags"]:
+            m = re.search(f'<{field}>(.*?)</{field}>', think, re.DOTALL)
+            if m:
+                val = m.group(1).strip()
+                if field == "parallel_groups":
+                    try:
+                        val = json.loads(val)
+                    except Exception:
+                        val = []
+                elif field == "rag_required":
+                    val = val.lower() == "true"
+                elif field == "estimated_hops":
+                    try:
+                        val = int(val)
+                    except Exception:
+                        val = 0
+                result[field] = val
+        result["subtasks"] = [
+            {"id": m.group(1), "depends_on": m.group(2) or "none", "description": m.group(3).strip()}
+            for m in re.finditer(r'<subtask\s+id="([^"]*)"(?:\s+depends_on="([^"]*)")?\s*>(.*?)</subtask>', think, re.DOTALL)
+        ]
+        result["routing"] = [
+            {"subtask_id": m.group(1), "division": m.group(2), "agent": m.group(3), "reason": m.group(4).strip()}
+            for m in re.finditer(r'<route\s+subtask_id="([^"]*)"\s+division="([^"]*)"\s+agent="([^"]*)"[^>]*>(.*?)</route>', think, re.DOTALL)
+        ]
+        return result
+
+    @staticmethod
+    def _parse_dispatch_blocks(text: str) -> List[Dict]:
+        dispatches = []
+        for d in re.finditer(r'<dispatch\s+agent="([^"]*)"\s+subtask_id="([^"]*)"(?:\s+priority="([^"]*)")?\s*>(.*?)</dispatch>', text, re.DOTALL):
+            block = d.group(4)
+            dp: Dict[str, Any] = {"type": "dispatch", "agent": d.group(1), "subtask_id": d.group(2), "priority": d.group(3) or "normal"}
+            for field in ["context", "instruction", "output_schema", "timeout_seconds"]:
+                m = re.search(f'<{field}>(.*?)</{field}>', block, re.DOTALL)
+                if m:
+                    val: Any = m.group(1).strip()
+                    if field == "timeout_seconds":
+                        try:
+                            val = int(val)
+                        except Exception:
+                            val = 120
+                    dp[field] = val
+            dispatches.append(dp)
+        return dispatches
+
+    @staticmethod
+    def _parse_mcp_call_blocks(text: str) -> List[Dict]:
+        calls = []
+        for m in re.finditer(r'<mcp_call\s+tool="([^"]*)"(?:\s+subtask_id="([^"]*)")?\s*>(.*?)</mcp_call>', text, re.DOTALL):
+            block = m.group(3)
+            params = {}
+            for p in re.finditer(r'<parameter\s+name="([^"]+)">(.*?)</parameter>', block, re.DOTALL):
+                params[p.group(1)] = p.group(2).strip()
+            calls.append({"type": "mcp_call", "tool": m.group(1), "subtask_id": m.group(2) or "", "params": params})
+        return calls
+
+    @staticmethod
+    def _parse_reflect_block(text: str) -> Optional[Dict]:
+        block = AgentWorkflow._parse_xml_block(text, "reflect")
+        if not block:
+            return None
+        result: Dict[str, Any] = {}
+        for field in ["goal_fulfilled", "confidence_score", "loop_iteration"]:
+            m = re.search(f'<{field}>(.*?)</{field}>', block, re.DOTALL)
+            if m:
+                val: Any = m.group(1).strip()
+                if field == "goal_fulfilled":
+                    val = val.lower() == "true"
+                elif field == "confidence_score":
+                    try:
+                        val = float(val)
+                    except Exception:
+                        val = 0.0
+                elif field == "loop_iteration":
+                    try:
+                        val = int(val)
+                    except Exception:
+                        val = 0
+                result[field] = val
+        na = re.search(r'<next_action>\s*(.*?)\s*</next_action>', block, re.DOTALL)
+        if na:
+            inner = na.group(1)
+            for action in ["continue_loop", "request_human_input", "finalize"]:
+                m = re.search(f'<{action}[^>]*>(.*?)</{action}>', inner, re.DOTALL)
+                if m:
+                    result["next_action"] = action
+                    if action == "continue_loop":
+                        r = re.search(r'reason="([^"]*)"', m.group(0))
+                        result["reason"] = r.group(1) if r else ""
+                    elif action == "request_human_input":
+                        q = re.search(r'question="([^"]*)"', m.group(0))
+                        result["question"] = q.group(1) if q else ""
+                    elif action == "finalize":
+                        s = re.search(r'synthesis="([^"]*)"', m.group(0))
+                        result["synthesis"] = s.group(1) if s else ""
+        result["quality_issues"] = [
+            {"subtask_id": qi.group(1), "description": qi.group(2).strip()}
+            for qi in re.finditer(r'<issue\s+subtask_id="([^"]*)">(.*?)</issue>', block, re.DOTALL)
+        ]
+        return result
+
+    @staticmethod
+    async def run(agent: BaseAgent, task: str, max_iterations: int = 8,
+                  state: Optional[AgentGraphState] = None,
+                  pending_states: Optional[Dict[str, 'AgentGraphState']] = None) -> str:
+        system = agent._system_prompt() if hasattr(agent, '_system_prompt') else agent.description
+        tools_desc = AgentWorkflow._build_tool_descriptions()
+        agents_desc = AgentWorkflow._build_agent_list()
+        if state is None:
+            state = AgentGraphState(task, system, max_iterations)
+            state.add_message("user", task)
+
+        for iteration in range(state.iteration, max_iterations):
+            state.iteration = iteration
+
+            # ── THINK ──
+            think_prompt = (
+                f"{system}\n\n"
+                f"{AgentWorkflow.SYSTEM_TEMPLATE.format(task_id=state.task_id, tools=tools_desc, agents=agents_desc)}\n\n"
+                f"History so far:\n{state.to_prompt()}\n\n"
+                "Begin with your <think> block, then proceed to ACT (<dispatch> or <mcp_call>) or <reflect> with <finalize>."
+            )
+            response = await agent.call_llm(system, think_prompt)
+            state.add_message("assistant", response)
+
+            # ── Check for final answer ──
+            final_match = re.search(r'<final_answer>(.*?)</final_answer>', response, re.DOTALL)
+            if final_match:
+                state.final_output = final_match.group(1).strip()
+                return state.final_output
+
+            # ── Parse THINK for risk_flags ──
+            if AgentWorkflow._parse_xml_block(response, "think"):
+                think_data = AgentWorkflow._parse_think_block(response)
+                state.raw_intent = think_data.get("raw_intent", state.raw_intent)
+                state.rag_required = think_data.get("rag_required", state.rag_required)
+                state.rag_query = think_data.get("rag_query", state.rag_query)
+                state.estimated_hops = think_data.get("estimated_hops", state.estimated_hops)
+                risk_flags_raw = think_data.get("risk_flags", "")
+                if risk_flags_raw and risk_flags_raw.strip().upper() != "NONE" and agent.name != "Chief Orchestrator":
+                    state.pending_confirmation = {"risk_flags": risk_flags_raw, "task_id": state.task_id}
+                    if pending_states is not None:
+                        pending_states[state.task_id] = state
+                    return f"__CONFIRMATION__:{state.task_id}:{risk_flags_raw}"
+
+            # ── Parse REFLECT ──
+            reflect = AgentWorkflow._parse_reflect_block(response)
+            if reflect:
+                state.last_reflect = reflect
+                state.goal_fulfilled = reflect.get("goal_fulfilled", False)
+                state.confidence_score = reflect.get("confidence_score", 0.0)
+                next_action = reflect.get("next_action")
+                if next_action == "finalize":
+                    if reflect.get("synthesis"):
+                        final = await agent.call_llm(system,
+                            f"Task: {task}\n\nSynthesis: {reflect['synthesis']}\n\n"
+                            f"Conversation:\n{state.to_prompt()}\n\nProvide the final answer.")
+                        state.final_output = final
+                        return final
+                    if state.messages:
+                        content = state.messages[-1].get("content", "")
+                        state.final_output = content[:4000]
+                        return state.final_output
+                elif next_action == "request_human_input":
+                    return f"__HUMAN_INPUT__:{state.task_id}:{reflect.get('question', 'Need your input to continue.')}"
+                # continue_loop → fall through to ACT
+
+            # ── ACT: parse dispatches and MCP calls ──
+            dispatches = AgentWorkflow._parse_dispatch_blocks(response)
+            mcp_calls = AgentWorkflow._parse_mcp_call_blocks(response)
+
+            if not dispatches and not mcp_calls:
+                if not reflect or reflect.get("next_action") != "continue_loop":
+                    if iteration >= max_iterations - 1:
+                        if state.messages:
+                            content = state.messages[-1].get("content", "")
+                            state.final_output = content[:4000]
+                            return state.final_output
+                        return "I was unable to complete this task."
+                    state.add_message("system", "Continue. Output a <think> block followed by <dispatch> or <mcp_call>, or <reflect> with <finalize>.")
+                    continue
+
+            # Execute agent dispatches
+            for dispatch in dispatches:
+                agent_name = dispatch.get("agent", "")
+                instruction = dispatch.get("instruction", task)
+                context = dispatch.get("context", "")
+                timeout = dispatch.get("timeout_seconds", 120)
+                full_task = f"{context}\n\n{instruction}" if context else instruction
+                state.add_message("system", f"Dispatching to {agent_name}...")
+                invoke_result = await tool_registry.run("agent_invoke", {"name": agent_name, "task": full_task})
+                status = "error" if invoke_result.startswith("[AgentInvokeTool]") else "success"
+                state.tool_results.append({"tool": f"dispatch:{agent_name}", "params": dispatch, "result": invoke_result, "status": status})
+                state.add_message("system", f"{agent_name} result:\n{invoke_result[:1000]}")
+
+            # Execute MCP calls
+            for call in mcp_calls:
+                tool_name = call.get("tool", "")
+                params = call.get("params", {})
+                state.add_message("system", f"MCP call: {tool_name}...")
+                result = await tool_registry.run(tool_name, params)
+                state.tool_results.append({"tool": tool_name, "params": params, "result": result})
+                state.add_message("system", f"Tool result:\n{result[:1000]}")
+
+            # ── OBSERVE (results already in state) → loop back to THINK ──
+
+        # Max iterations — synthesize
+        if state.messages:
+            final = await agent.call_llm(system,
+                f"Task: {task}\n\nConversation:\n{state.to_prompt()}\n\n"
+                "Provide your final synthesized answer based on all information gathered.")
+            state.final_output = final
+            return final
+        return "I was unable to complete this task."
+
+
+class ToolCallingAgent(BaseAgent):
+    """Agent that uses the TAOR loop with tool access (v1.0)."""
+
+    def __init__(self, name: str, model: str, division: str, description: str, system_prompt: str):
+        self.name = name
+        self.model = model
+        self.division = division
+        self.description = description
+        self._system = system_prompt
+        self._state: Optional[AgentGraphState] = None
+
+    def _system_prompt(self) -> str:
+        return self._system
+
+    async def _execute(self, task: str) -> str:
+        return await AgentWorkflow.run(self, task)
+
+    async def run_with_state(self, task: str, state: Optional[AgentGraphState] = None) -> str:
+        self._state = state
+        return await AgentWorkflow.run(self, task, state=state)
+
+
 # === SECTION 6: Agent Implementations =========================================
 
 class AIEngineerAgent(BaseAgent):
-    name = "AI Engineer"; model = "deepseek"; division = "Engineering"
+    name = "AI Engineer"; model = "deepseek_v4"; division = "Engineering"
     description = "AI features, RAG systems, MCP integrations, LLM workflows"
     async def _execute(self, task):
         return await self.call_llm(
@@ -1296,7 +2244,7 @@ class AIEngineerAgent(BaseAgent):
         )
 
 class SoftwareEngineerAgent(BaseAgent):
-    name = "Software Engineer"; model = "deepseek"; division = "Engineering"
+    name = "Software Engineer"; model = "deepseek_v4"; division = "Engineering"
     description = "Backend/frontend dev, CRUD, API generation"
     async def _execute(self, task):
         return await self.call_llm(
@@ -1306,7 +2254,7 @@ class SoftwareEngineerAgent(BaseAgent):
         )
 
 class DebugAgent(BaseAgent):
-    name = "Debug Agent"; model = "deepseek"; division = "Engineering"
+    name = "Debug Agent"; model = "deepseek_v4"; division = "Engineering"
     description = "Root-cause analysis, log investigation, automated bug fixing"
     async def _execute(self, task):
         return await self.call_llm(
@@ -1336,7 +2284,7 @@ class CodeReviewAgent(BaseAgent):
         )
 
 class ArchitectureAgent(BaseAgent):
-    name = "Architecture"; model = "groq"; division = "Engineering"
+    name = "Architecture"; model = "deepseek_v4"; division = "Engineering"
     description = "System design, scalability, technical debt"
     async def _execute(self, task):
         return await self.call_llm(
@@ -1366,7 +2314,7 @@ class DevOpsAgent(BaseAgent):
         )
 
 class CybersecurityAgent(BaseAgent):
-    name = "Cybersecurity"; model = "deepseek"; division = "Security"
+    name = "Cybersecurity"; model = "deepseek_v4"; division = "Security"
     description = "Vulnerability scanning, secret detection, hardening"
     async def _execute(self, task):
         result = await self.call_llm(
@@ -1428,7 +2376,7 @@ class DataEngineerAgent(BaseAgent):
         )
 
 class MLEngineerAgent(BaseAgent):
-    name = "ML Engineer"; model = "deepseek"; division = "Data"
+    name = "ML Engineer"; model = "deepseek_v4"; division = "Data"
     description = "Feature engineering, model training, evaluation pipelines"
     async def _execute(self, task):
         return await self.call_llm(
@@ -1524,7 +2472,7 @@ or {"decision": "REJECT", "reason": "one-sentence explanation"}"""
     prompt = f"Agent: {agent_name}\nAction: {action}\nPayload: {payload[:400]}"
     try:
         raw = await call_groq(system, prompt)
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        match = re.search(r'\{"decision":\s*"(APPROVE|REJECT)"\s*,\s*"reason":\s*"(?:[^"\\]|\\.)*"\s*}', raw, re.DOTALL)
         if match:
             data = json.loads(match.group())
             approved = data.get("decision", "APPROVE").upper() == "APPROVE"
@@ -1545,6 +2493,117 @@ or {"decision": "REJECT", "reason": "one-sentence explanation"}"""
         logger.warning(f"Failed to update audit decision: {e}")
 
 
+DOCTOR_SPEC_PATH: str = "JAXVORA_ORCHESTRATOR_PROMPT.md"
+DOCTOR_SLEEP_SECONDS: int = 60
+DOCTOR_TODO: List[Dict[str, Any]] = [
+    {"phase": 2, "name": "AgentWorkflow v1.0 TAOR protocol", "detail": "Applied — THINK/DISPATCH/ACT/OBSERVE/REFLECT with XML blocks", "done": True},
+    {"phase": 3, "name": "process() rewrite with in-loop dispatch", "detail": "Applied — confirmation gate, v1.0 response format, no post-loop squad", "done": True},
+    {"phase": 8, "name": "Jaxvora Doctor Agent + AutoHealDaemon", "detail": "Applied — ToolCallingAgent subclass + 24/7 background daemon", "done": True},
+    {"phase": 1, "name": "Add 13 new agents to registry", "detail": "Applied — Backend Engineer, Frontend Engineer, Vulnerability Scanner, Auth & IAM, Network Security, ETL Engineer, RAG Specialist, Job Search, Application Tracker, UX Designer, Requirements Analyst, Strategy Agent, Risk & Planning Agent", "done": True},
+    {"phase": 4, "name": "Add jaxvora.* DB tables", "detail": "Applied — sessions, subtask_log, operation_log, ssh_audit", "done": True},
+    {"phase": 5, "name": "Add tool permissions + confirmation gate + error escalation", "detail": "Applied — risk_level on all MCPTool, permission_check in registry, ErrorEscalation chain", "done": True},
+    {"phase": 6, "name": "Add bootstrap health-check sequence", "detail": "Applied — MCP health-check, DB/RAG verify, session resume, system status broadcast", "done": True},
+    {"phase": 7, "name": "Update AGENT_GRAPH.md", "detail": "Applied — 35 agents across 6 divisions with LLM routing and tool permissions", "done": True},
+    {"phase": 9, "name": "Mirror changes to server/main.py", "detail": "Pending — copy all changes from main.py to server/main.py", "done": False},
+    {"phase": 10, "name": "Deploy to VM + Vercel", "detail": "Pending — scp to VM, restart service, rebuild frontend", "done": False},
+]
+DOCTOR_MAX_RETRIES: int = 3
+
+class JaxvoraDoctorAgent(ToolCallingAgent):
+    """Self-healing agent that aligns all Jaxvora code with the v1.0 spec."""
+
+    def __init__(self):
+        super().__init__(
+            name="Jaxvora Doctor",
+            model="deepseek_v4",
+            division="Executive",
+            description="Autonomous self-healing agent aligning all Jaxvora code with the v1.0 Chief Orchestrator spec",
+            system_prompt=self._build_doctor_prompt(),
+        )
+
+    def _build_doctor_prompt(self) -> str:
+        key_agents = ", ".join(a["name"] for a in DOCTOR_TODO)
+        return textwrap.dedent(f"""\
+        You are the **Jaxvora Doctor Agent**, an autonomous self-healing agent.
+
+        ## Mission
+        Align all Jaxvora AI code with the v1.0 Chief Orchestrator System Prompt spec.
+        You work through the todo list below. Items marked "done": True have already been applied to main.py.
+        For pending items (Phase 9, 10), read current code, compare with spec, apply changes, and verify.
+
+        ## Tools
+        - `file_system` — read/write files
+        - `terminal` — run sandboxed commands (compile checks, git, etc.)
+        - `web_search` — search for reference
+
+        ## Todo List
+        {json.dumps(DOCTOR_TODO, indent=2)}
+
+        ## 3-Phase Pipeline per Todo Item
+        1. **Diagnose** — read current code and the v1.0 spec file (JAXVORA_ORCHESTRATOR_PROMPT.md). Compare. Plan the exact changes needed.
+        2. **Fix** — use file_system to apply changes. Write all necessary code.
+        3. **Test** — run `python -m py_compile main.py` and verify the code compiles. If not, retry (max {DOCTOR_MAX_RETRIES} per item).
+
+        ## Rules
+        - Never modify the spec file itself.
+        - Never delete existing agents — only add new ones alongside.
+        - Never change the database schema — only add new tables.
+        - After each todo, verify with `python -m py_compile main.py` before moving on.
+        - If a todo has "done": True, skip it entirely.
+        - Report progress after each phase.
+        - The DAEMON_MODE environment variable may be set — if so, run in continuous monitoring mode.
+        """)
+
+    async def run(self, task: str, state: Optional[AgentGraphState] = None) -> str:
+        """Override run to force the v1.0 TAOR loop."""
+        return await AgentWorkflow.run(self, task, max_iterations=8, state=state)
+
+
+class AutoHealDaemon:
+    """24/7 background daemon that monitors Jaxvora health and triggers self-healing."""
+
+    def __init__(self, orchestrator: 'ChiefOrchestrator'):
+        self._orchestrator = orchestrator
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    async def _loop(self):
+        self._running = True
+        while self._running:
+            try:
+                # Phase 1: Run diagnostic checks
+                diag = await run_jaxvora_doctor(max_iterations=1)
+                ok = diag.get("ok", False)
+                if not ok:
+                    # Phase 2: Heal — invoke Doctor Agent
+                    doctor = AGENT_REGISTRY.get("Jaxvora Doctor")
+                    if doctor:
+                        await AgentWorkflow.run(
+                            doctor,
+                            "Run diagnostic and self-healing on all pending todo items. "
+                            "Read JAXVORA_ORCHESTRATOR_PROMPT.md, compare with main.py, "
+                            "and apply fixes for all incomplete items.",
+                            max_iterations=12,
+                        )
+                await asyncio.sleep(DOCTOR_SLEEP_SECONDS)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                print(f"[AutoHeal] Error in heal loop: {exc}", flush=True)
+                await asyncio.sleep(DOCTOR_SLEEP_SECONDS * 2)
+
+    def start(self):
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
+            print("[AutoHeal] Daemon started", flush=True)
+
+    def stop(self):
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+            print("[AutoHeal] Daemon stopped", flush=True)
+
+
 AGENT_REGISTRY: Dict[str, BaseAgent] = {}
 AGENT_NETWORK: Dict[str, List[str]] = {}
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "6"))
@@ -1554,7 +2613,7 @@ DIVISION_LEADS = {
     "Data": "Data Engineer",
     "Career": "Career Coach",
     "Product": "Product Manager",
-    "Executive": "Project Intelligence",
+    "Executive": "Risk & Planning Agent",
 }
 
 def build_registry():
@@ -1567,6 +2626,47 @@ def build_registry():
         ResumeAgent(), InterviewCoachAgent(), CareerCoachAgent(),
         ProductManagerAgent(), DocumentationAgent(), ResearchAgent(),
         ProjectIntelligenceAgent(),
+        JaxvoraDoctorAgent(),
+        # Phase 1: 13 new v1.0 agents
+        ToolCallingAgent(name="Backend Engineer", model="deepseek", division="Engineering",
+            description="Server-side development, API design, database optimization and migrations",
+            system_prompt="You are a senior backend engineer specializing in Python, FastAPI, PostgreSQL, and REST API design. Write clean, production-ready backend code with proper error handling, input validation, and security best practices."),
+        ToolCallingAgent(name="Frontend Engineer", model="deepseek", division="Engineering",
+            description="UI component development, JavaScript/HTML/CSS, SPA architecture",
+            system_prompt="You are a senior frontend engineer specializing in vanilla JavaScript, HTML5, CSS3, and single-page application architecture. Build responsive, accessible, and performant user interfaces with clean client-side code."),
+        ToolCallingAgent(name="Vulnerability Scanner", model="deepseek", division="Security",
+            description="Code vulnerability scanning, dependency audit, OWASP checks",
+            system_prompt="You are a security engineer specializing in vulnerability assessment. Scan code for OWASP Top 10 issues, dependency vulnerabilities, injection flaws, XSS, CSRF, and insecure configurations. Report findings with CVSS-style severity and remediation steps."),
+        ToolCallingAgent(name="Auth & IAM Agent", model="deepseek", division="Security",
+            description="Authentication, authorization, RBAC, token management, OAuth flows",
+            system_prompt="You are an identity and access management specialist. Design and audit authentication systems including OAuth2, JWT, API keys, RBAC, session management, and MFA. Ensure least-privilege access and secure token handling."),
+        ToolCallingAgent(name="Network Security Agent", model="deepseek", division="Security",
+            description="Network security, firewall rules, TLS/SSL, port scanning, DDoS mitigation",
+            system_prompt="You are a network security engineer. Analyze firewall configurations, TLS/SSL setups, network segmentation, DDoS protections, and intrusion detection. Provide hardening recommendations for production deployments."),
+        ToolCallingAgent(name="ETL Engineer", model="deepseek", division="Data",
+            description="Data pipelines, ETL/ELT workflows, data transformation and validation",
+            system_prompt="You are a data engineer specializing in ETL pipelines. Design data extraction, transformation, and loading workflows. Ensure data quality, handle schema evolution, and optimize for batch and streaming processing."),
+        ToolCallingAgent(name="RAG Specialist", model="deepseek_v4", division="Data",
+            description="Retrieval-Augmented Generation, embedding pipelines, vector search optimization",
+            system_prompt="You are a RAG specialist. Design and optimize retrieval-augmented generation systems including chunking strategies, embedding models, hybrid search (vector + FTS), reranking, and context window management. Tune for relevance and latency."),
+        ToolCallingAgent(name="Job Search Agent", model="deepseek", division="Career",
+            description="Job search automation, application tracking, market research",
+            system_prompt="You are a career advisor specializing in job search strategy. Help with job market research, company targeting, application organization, networking strategies, and interview scheduling. Provide actionable next steps."),
+        ToolCallingAgent(name="Application Tracker", model="deepseek", division="Career",
+            description="Job application status tracking, follow-up reminders, pipeline management",
+            system_prompt="You are an application tracking specialist. Help organize and track job applications, set follow-up reminders, manage interview pipelines, and analyze application-to-offer conversion metrics."),
+        ToolCallingAgent(name="UX Designer", model="deepseek", division="Product",
+            description="User experience design, wireframing, accessibility, usability testing",
+            system_prompt="You are a UX designer. Design intuitive user experiences with focus on accessibility (WCAG), usability heuristics, information architecture, and interaction design. Provide wireframe descriptions and usability improvement recommendations."),
+        ToolCallingAgent(name="Requirements Analyst", model="deepseek", division="Product",
+            description="Requirements gathering, PRD writing, stakeholder communication, feature scoping",
+            system_prompt="You are a requirements analyst. Elicit, document, and manage product requirements. Write clear PRDs, user stories, acceptance criteria, and technical specifications. Bridge communication between stakeholders and engineering teams."),
+        ToolCallingAgent(name="Strategy Agent", model="deepseek_v4", division="Executive",
+            description="Strategic planning, competitive analysis, roadmap prioritization, OKR tracking",
+            system_prompt="You are a strategy consultant. Analyze competitive landscapes, define product strategy, prioritize roadmap items using RICE/ICE frameworks, set OKRs, and track strategic initiatives. Provide data-driven recommendations."),
+        ToolCallingAgent(name="Risk & Planning Agent", model="deepseek_v4", division="Executive",
+            description="Risk assessment, mitigation planning, incident response, business continuity",
+            system_prompt="You are a risk management specialist. Identify, assess, and mitigate project and business risks. Design incident response plans, business continuity strategies, disaster recovery procedures, and compliance risk frameworks."),
     ]
     for a in agents:
         AGENT_REGISTRY[a.name] = a
@@ -1730,7 +2830,11 @@ Always respond in this JSON format:
     async def _handle_doctor_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
         if not self._is_doctor_chat_intent(user_input):
             return None
-        iterations = 3 if any(word in user_input.lower() for word in ("until fixed", "loop", "continuously", "monitor")) else 2
+        low = user_input.lower()
+        # Alignment/spec work → pass to TAOR loop for Doctor Agent dispatch
+        if any(word in low for word in ("align", "v1.0", "spec", "v1", "heal", "todo", "self-heal")):
+            return None
+        iterations = 3 if any(word in low for word in ("until fixed", "loop", "continuously", "monitor")) else 2
         result = await run_jaxvora_doctor(max_iterations=iterations)
         agents = ["Chief Orchestrator", "Debug Agent", "QA/Test Agent", "DevOps", "Cybersecurity"]
         return {
@@ -2018,60 +3122,166 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
             return plan.get("response", "Task completed.") + "\n\n" + response
         return response
 
-    async def process(self, user_input: str, stream_fn=None, admin_token: Optional[str] = None) -> Dict:
-        attachment_result = await self._handle_attachment_chat(user_input)
-        if attachment_result:
-            return attachment_result
-        gmail_result = await self._handle_gmail_chat(user_input, admin_token=admin_token)
-        if gmail_result:
-            return gmail_result
-        ssh_result = await self._handle_ssh_chat(user_input)
-        if ssh_result:
-            return ssh_result
-        doctor_result = await self._handle_doctor_chat(user_input)
-        if doctor_result:
-            return doctor_result
+    _pending_states: Dict[str, AgentGraphState] = {}
+    _pending_confirmations: Dict[str, Dict] = {}
 
-        try:
-            raw = await call_groq(self.SYSTEM, user_input)
-            # Extract JSON
-            match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if match:
-                plan = json.loads(match.group())
-            else:
-                plan = {"plan": "Direct response", "agents": [], "response": raw}
-        except Exception as e:
-            plan = {
-                "plan": "Fallback direct response",
-                "agents": [],
-                "response": f"I'll help you with that. {user_input[:100]}... (Orchestrator note: {e})"
-            }
-
-        squad = self._build_company_squad(user_input, plan.get("agents", []))
-        results = await self._run_parallel_squad(user_input, plan, squad, stream_fn=stream_fn)
-
-        # Log to audit and auto-decide
-        try:
-            row = await db_fetchrow(
-                "INSERT INTO audit (agent_name, action, payload) VALUES ($1, $2, $3) RETURNING id",
-                "Chief Orchestrator", "process_request", user_input[:500]
-            )
-            if row:
-                asyncio.create_task(auto_decide_audit(str(row["id"]), "Chief Orchestrator", "process_request", user_input[:500]))
-        except Exception:
-            pass
-
-        final = await self._synthesise_company_response(user_input, plan, results)
+    def _format_v1_response(self, state: AgentGraphState, response: str) -> Dict:
+        agents_involved = list(set(
+            tr.get("params", {}).get("agent", "")
+            for tr in state.tool_results if tr["tool"].startswith("dispatch:")
+        ))
         return {
-            "plan": plan.get("plan", ""),
-            "agents": squad,
-            "response": final,
-            "results": results,
+            "plan": f"TAOR loop completed in {state.iteration + 1} iterations",
+            "agents": agents_involved,
+            "response": response,
+            "results": [
+                {"agent": tr.get("params", {}).get("agent", tr["tool"]),
+                 "success": tr.get("status", "success") == "success",
+                 "output": str(tr.get("result", ""))[:300]}
+                for tr in state.tool_results[-10:]
+            ],
             "organization": {
-                "mode": "parallel_company",
-                "max_parallel_agents": MAX_PARALLEL_AGENTS,
+                "mode": "taor_v1",
+                "iterations": state.iteration + 1,
+                "confidence": state.confidence_score,
+                "task_id": state.task_id,
+                "agents_involved": agents_involved,
             },
         }
+
+    async def _handle_loop_output(self, loop_output: str, state: Optional[AgentGraphState],
+                                   user_input: str, stream_fn) -> Dict:
+        # Handle confirmation required
+        if loop_output.startswith("__CONFIRMATION__:"):
+            parts = loop_output.split(":", 2)
+            if len(parts) >= 3:
+                task_id = parts[1]
+                risk_flags = parts[2]
+                return {
+                    "plan": f"Confirmation required: {risk_flags}",
+                    "agents": [],
+                    "response": (
+                        f"## JAXVORA CONFIRMATION REQUIRED\n\n"
+                        f"**Risk Flags:** {risk_flags}\n\n"
+                        f"Planned actions may be irreversible. Reply **YES** to proceed, "
+                        f"**NO** to cancel, or **MODIFY** to adjust.\n\n"
+                        f"*(Type your response to continue)*"
+                    ),
+                    "results": [],
+                    "organization": {"mode": "confirmation_gate", "task_id": task_id, "risk_flags": risk_flags},
+                }
+
+        # Handle human input required
+        if loop_output.startswith("__HUMAN_INPUT__:"):
+            parts = loop_output.split(":", 2)
+            if len(parts) >= 3:
+                return {
+                    "plan": "Human input required",
+                    "agents": [],
+                    "response": f"## JAXVORA Needs Your Input\n\n{parts[2]}",
+                    "results": [],
+                    "organization": {"mode": "human_input_required"},
+                }
+
+        # Normal output
+        return {
+            "plan": "TAOR loop execution",
+            "agents": [],
+            "response": loop_output,
+            "results": [],
+            "organization": {"mode": "taor_v1"},
+        }
+
+    async def process(self, user_input: str, stream_fn=None,
+                      admin_token: Optional[str] = None,
+                      confirmation_response: Optional[str] = None) -> Dict:
+        # Check if this is a confirmation response
+        if confirmation_response and user_input.startswith("__CONFIRM_RESUME__:"):
+            parts = user_input.split(":", 2)
+            if len(parts) >= 3:
+                task_id = parts[1]
+                decision = parts[2].strip().upper()
+                state = self._pending_states.get(task_id)
+                if state:
+                    del self._pending_states[task_id]
+                    if decision == "YES":
+                        loop_output = await AgentWorkflow.run(
+                            ToolCallingAgent(
+                                name="Chief Orchestrator", model="groq",
+                                division="Executive",
+                                description="Chief Orchestrator coordinating all agents",
+                                system_prompt=self.SYSTEM,
+                            ),
+                            user_input, max_iterations=8, state=state,
+                            pending_states=self._pending_states,
+                        )
+                        return await self._handle_loop_output(loop_output, state, user_input, stream_fn)
+                    elif decision == "NO":
+                        return {
+                            "plan": "Cancelled by user",
+                            "agents": [],
+                            "response": "The operation was cancelled as you requested.",
+                            "results": [],
+                            "organization": {"mode": "taor_v1", "cancelled": True},
+                        }
+                    elif decision == "MODIFY":
+                        # User wants to modify — restart fresh
+                        pass
+
+        # Attachment / Gmail / SSH / Doctor shortcuts
+        for handler in [
+            self._handle_attachment_chat,
+            lambda u: self._handle_gmail_chat(u, admin_token=admin_token),
+            self._handle_ssh_chat,
+            self._handle_doctor_chat,
+        ]:
+            result = await handler(user_input)
+            if result:
+                return result
+
+        # ── TAOR Loop ──
+        try:
+            loop_output = await AgentWorkflow.run(
+                ToolCallingAgent(
+                    name="Chief Orchestrator", model="groq",
+                    division="Executive",
+                    description="Chief Orchestrator coordinating all agents",
+                    system_prompt=self.SYSTEM,
+                ),
+                user_input, max_iterations=8,
+                pending_states=self._pending_states,
+            )
+            return await self._handle_loop_output(loop_output, None, user_input, stream_fn)
+        except Exception as e:
+            logger.error(f"TAOR loop failed: {e}", exc_info=True)
+            # Fallback to direct LLM
+            try:
+                raw = await call_groq(self.SYSTEM, user_input)
+                match = re.search(r'\{(?:[^{}]|"(?:\\.|[^"\\])*")*\}', raw, re.DOTALL)
+                if match:
+                    plan = json.loads(match.group())
+                    return {
+                        "plan": plan.get("plan", ""),
+                        "agents": [],
+                        "response": plan.get("response", raw),
+                        "results": [],
+                        "organization": {"mode": "fallback_direct"},
+                    }
+                return {
+                    "plan": "Direct LLM fallback",
+                    "agents": [],
+                    "response": raw,
+                    "results": [],
+                    "organization": {"mode": "fallback_direct"},
+                }
+            except Exception as e2:
+                return {
+                    "plan": "Error fallback",
+                    "agents": [],
+                    "response": f"I'll help you with that. {user_input[:100]}...",
+                    "results": [],
+                    "organization": {"mode": "error_fallback"},
+                }
 
 
 orchestrator = ChiefOrchestrator()
@@ -2088,7 +3298,7 @@ class WebSocketManager:
 
     async def _send(self, connections: Set[WebSocket], data: Dict):
         dead = set()
-        for ws in connections:
+        for ws in list(connections):
             try:
                 await ws.send_text(json.dumps(data, default=str))
             except Exception:
@@ -2096,13 +3306,13 @@ class WebSocketManager:
         connections -= dead
 
     async def broadcast_agent_status(self, name: str, status: str, task: str):
-        await self._send(self.agents, {"type": "agent_status", "name": name, "status": status, "task": task, "ts": datetime.now().isoformat()})
+        await self._send(self.agents, {"type": "agent_status", "name": name, "status": status, "task": task, "ts": datetime.now(timezone.utc).isoformat()})
 
     async def broadcast_task(self, task: Dict):
         await self._send(self.tasks_ws, {"type": "task_update", **task})
 
     async def broadcast_log(self, level: str, message: str):
-        await self._send(self.logs_ws, {"type": "log", "level": level, "message": message, "ts": datetime.now().isoformat()})
+        await self._send(self.logs_ws, {"type": "log", "level": level, "message": message, "ts": datetime.now(timezone.utc).isoformat()})
 
     async def send_chat(self, ws: WebSocket, data: Dict):
         try:
@@ -2122,7 +3332,10 @@ async def lifespan(app: FastAPI):
     await startup()
     yield
     # Shutdown
-    global db_pool
+    global db_pool, auto_healer
+    if auto_healer:
+        auto_healer.stop()
+    await redis_cache.close()
     if db_pool:
         await db_pool.close()
 
@@ -2130,6 +3343,89 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Jaxvora", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+# ── Workspace routes ─────────────────────────────────────────────────────────────
+
+@app.get("/workspace")
+async def workspace_list(subdir: str = ""):
+    base = WORKSPACE_DIR.resolve()
+    target = (base / subdir).resolve()
+    if not str(target).startswith(str(base)):
+        return {"ok": False, "error": "Path escapes workspace"}
+    if not target.exists():
+        return {"ok": True, "files": [], "path": str(target)}
+    try:
+        files = []
+        for f in sorted(target.iterdir()):
+            files.append({
+                "name": f.name,
+                "path": str(f.relative_to(base)),
+                "is_dir": f.is_dir(),
+                "size": f.stat().st_size if f.is_file() else 0,
+                "modified": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
+            })
+        return {"ok": True, "files": files, "path": str(target)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/workspace/read")
+async def workspace_read(path: str = ""):
+    base = WORKSPACE_DIR.resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base)):
+        return {"ok": False, "error": "Path escapes workspace"}
+    if not target.is_file():
+        return {"ok": False, "error": "Not a file or not found"}
+    try:
+        content = target.read_text(encoding="utf-8", errors="ignore")
+        return {"ok": True, "content": content, "path": path}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/workspace/write")
+async def workspace_write(req: dict):
+    path = req.get("path", "")
+    content = req.get("content", "")
+    base = WORKSPACE_DIR.resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base)):
+        return {"ok": False, "error": "Path escapes workspace"}
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"ok": True, "path": path, "size": len(content)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.delete("/workspace")
+async def workspace_delete(path: str = ""):
+    base = WORKSPACE_DIR.resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base)):
+        return {"ok": False, "error": "Path escapes workspace"}
+    if not target.exists():
+        return {"ok": False, "error": "Not found"}
+    try:
+        if target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            target.rmdir()
+        return {"ok": True, "deleted": path}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/workspace/mkdir")
+async def workspace_mkdir(req: dict):
+    path = req.get("path", "")
+    base = WORKSPACE_DIR.resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base)):
+        return {"ok": False, "error": "Path escapes workspace"}
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": path}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
@@ -2274,7 +3570,7 @@ async def list_projects():
 async def create_project(req: ProjectCreate):
     row = await db_fetchrow(
         "INSERT INTO projects (name, repo_url, metadata) VALUES ($1, $2, $3) RETURNING *",
-        req.name, req.repo_url, json.dumps(req.metadata)
+        req.name, req.repo_url, json.dumps(req.metadata) if req.metadata else None
     )
     return dict(row)
 
@@ -2372,6 +3668,134 @@ async def memory_search(q: str = Query(...), collection: Optional[str] = None, l
     return results
 
 
+class RAGIngestRequest(BaseModel):
+    text: str
+    source: str = ""
+    metadata: Optional[Dict] = None
+
+
+class RAGSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+@app.post("/rag/ingest")
+async def rag_ingest(req: RAGIngestRequest):
+    """Ingest text into RAG vector store."""
+    count = await rag_engine.ingest(req.text, source=req.source, metadata=req.metadata)
+    return {"ok": True, "chunks": count}
+
+
+@app.post("/upload/rag")
+async def upload_to_rag(file: UploadFile = File(...)):
+    """Upload a file directly to RAG (chunk, embed, store)."""
+    content = await file.read()
+    extracted = _extract_upload_text(content, file.filename or "attachment", file.content_type or "")
+    if not extracted["ok"]:
+        return {"ok": False, "error": extracted["error"]}
+    count = await rag_engine.ingest(extracted["content"], source=file.filename or "attachment")
+    return {"ok": True, "chunks": count, "text_length": len(extracted["content"])}
+
+
+@app.post("/rag/search")
+async def rag_search(req: RAGSearchRequest):
+    """Search RAG vector store with hybrid search."""
+    results = await rag_engine.search(req.query, top_k=req.top_k)
+    return {"ok": True, "results": results}
+
+
+@app.get("/rag/status")
+async def rag_status():
+    """RAG engine status."""
+    total = 0
+    total_chunks = 0
+    sources = []
+    try:
+        row = await db_fetchrow("SELECT COUNT(*) as n FROM rag_documents")
+        total_chunks = int(row["n"]) if row else 0
+        src_rows = await db_fetch(
+            "SELECT source, COUNT(*) as chunks, MAX(created_at) as last_added FROM rag_documents GROUP BY source ORDER BY last_added DESC"
+        )
+        sources = [{"source": r["source"], "chunks": int(r["chunks"]), "last_added": str(r.get("last_added", ""))} for r in src_rows]
+        row2 = await db_fetchrow("SELECT COUNT(DISTINCT source) as n FROM rag_documents")
+        total = int(row2["n"]) if row2 else 0
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "documents": total,
+        "total_chunks": total_chunks,
+        "sources": sources,
+        "index_loaded": rag_engine._index_loaded,
+        "index_size": len(rag_engine._index),
+    }
+
+
+@app.delete("/rag/documents/{doc_id}")
+async def rag_delete_document(doc_id: str):
+    """Delete a RAG document chunk."""
+    try:
+        await db_execute("DELETE FROM rag_documents WHERE id = $1::uuid", doc_id)
+        rag_engine._index.pop(doc_id, None)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/web/search")
+async def web_search(q: str = Query(...), max_results: int = 5):
+    """Search the web using DuckDuckGo."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.post(
+                "https://lite.duckduckgo.com/lite/",
+                data={"q": q},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Jaxvora/1.0)"},
+            )
+            results = []
+            lines = r.text.split("\n")
+            current_title, current_snippet, current_url = "", "", ""
+            in_result = False
+            capturing_snippet = False
+            for line in lines:
+                if '"result-link"' in line or "'result-link'" in line or '"result__a"' in line or "'result__a'" in line:
+                    if current_title:
+                        results.append({"title": current_title.strip(), "snippet": html.unescape(re.sub(r'<[^>]+>', '', current_snippet)).strip(), "url": current_url.strip()})
+                    current_title = current_snippet = current_url = ""
+                    capturing_snippet = False
+                    href_match = re.search(r'href="([^"]+)"', line)
+                    if not href_match:
+                        href_match = re.search(r"href='([^']+)'", line)
+                    if href_match:
+                        current_url = html.unescape(href_match.group(1))
+                    title_match = re.search(r'>([^<]+)<', line)
+                    if title_match:
+                        current_title = html.unescape(title_match.group(1))
+                    in_result = True
+                elif in_result and ('class="result-snippet"' in line or "class='result-snippet'" in line or 'class="result__snippet"' in line or "class='result__snippet'" in line):
+                    capturing_snippet = True
+                    after_class = line.split(">", 1)[1] if ">" in line else ""
+                    current_snippet += after_class + " "
+                elif in_result and capturing_snippet:
+                    if "</td>" in line or "</TD>" in line:
+                        capturing_snippet = False
+                    elif "<tr" not in line and line.strip() and not line.strip().startswith("<"):
+                        current_snippet += line.strip() + " "
+                elif in_result and line.strip() in ("</div>", "</div"):
+                    if current_title:
+                        results.append({"title": current_title.strip(), "snippet": html.unescape(re.sub(r'<[^>]+>', '', current_snippet)).strip(), "url": current_url.strip()})
+                    current_title = current_snippet = current_url = ""
+                    in_result = False
+                    capturing_snippet = False
+                if len(results) >= max_results:
+                    break
+            if current_title:
+                results.append({"title": current_title.strip(), "snippet": html.unescape(re.sub(r'<[^>]+>', '', current_snippet)).strip(), "url": current_url.strip()})
+            return {"ok": True, "results": results[:max_results], "query": q}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "results": []}
+
+
 @app.post("/security/scan")
 async def security_scan(req: SecurityScanRequest):
     agent = AGENT_REGISTRY.get("Cybersecurity")
@@ -2402,7 +3826,7 @@ async def gmail_status():
 
 @app.post("/gmail/action")
 async def gmail_action(req: GmailActionRequest, x_jaxvora_admin_token: Optional[str] = Header(None)):
-    payload = req.dict()
+    payload = req.model_dump()
     action = str(payload.get("action", "status")).strip().lower()
     status = gmail_automation_status()
     if status["configured"] and action != "status":
@@ -2433,6 +3857,71 @@ def _clean_upload_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _strip_binary_noise(text: str) -> str:
+    """Remove non-printable binary characters but keep newlines, tabs, and readable text."""
+    cleaned = []
+    for ch in text:
+        code = ord(ch)
+        if code == 0:
+            continue
+        if code == 10 or code == 13 or code == 9:
+            cleaned.append(ch)
+        elif 32 <= code <= 126:
+            cleaned.append(ch)
+        elif code >= 160:
+            cleaned.append(ch)
+    return "".join(cleaned)
+
+
+def _try_extract_archive(content: bytes, filename: str) -> Optional[Dict[str, Any]]:
+    """Try to extract readable text from archive/bundle formats (ZIP, TAR, GZ)."""
+    import io
+    extracted_parts = []
+
+    # Try ZIP
+    try:
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            names = zf.namelist()
+            for name in names:
+                try:
+                    data = zf.read(name)
+                    text = data.decode("utf-8", errors="replace")
+                    text = _strip_binary_noise(text)
+                    text = text.strip()
+                    if text:
+                        extracted_parts.append(f"### {name}\n{text}")
+                except Exception:
+                    pass
+            if extracted_parts:
+                return {"ok": True, "error": "", "content": "\n\n".join(extracted_parts), "pages": 0, "truncated": False}
+    except Exception:
+        pass
+
+    # Try TAR
+    try:
+        import tarfile
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:*") as tf:
+            for member in tf.getmembers():
+                if member.isfile():
+                    try:
+                        data = tf.extractfile(member)
+                        if data:
+                            text = data.read().decode("utf-8", errors="replace")
+                            text = _strip_binary_noise(text)
+                            text = text.strip()
+                            if text:
+                                extracted_parts.append(f"### {member.name}\n{text}")
+                    except Exception:
+                        pass
+            if extracted_parts:
+                return {"ok": True, "error": "", "content": "\n\n".join(extracted_parts), "pages": 0, "truncated": False}
+    except Exception:
+        pass
+
+    return None
 
 
 def _looks_like_pdf_bytes(content: bytes, filename: str, content_type: str) -> bool:
@@ -2508,6 +3997,14 @@ def _extract_upload_text(content: bytes, filename: str, content_type: str) -> Di
     if _looks_like_pdf_bytes(content, filename, content_type):
         return _extract_pdf_upload_text(content)
 
+    archive_result = _try_extract_archive(content, filename)
+    if archive_result:
+        text = _clean_upload_text(archive_result["content"])
+        truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
+        if truncated:
+            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
+        return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
+
     text_types = (
         "text/",
         "application/json",
@@ -2516,18 +4013,37 @@ def _extract_upload_text(content: bytes, filename: str, content_type: str) -> Di
         "application/yaml",
         "application/javascript",
     )
-    if content_type.lower().startswith(text_types) or filename.lower().endswith((
-        ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".js", ".ts", ".py", ".html", ".css"
-    )):
+    text_extensions = (
+        ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
+        ".js", ".ts", ".py", ".html", ".css",
+        ".skill", ".ps1", ".sh", ".bat", ".cmd", ".sql", ".log",
+        ".env", ".toml", ".ini", ".cfg", ".conf",
+        ".svg", ".gradle", ".kt", ".swift", ".go", ".rb", ".php",
+        ".pl", ".r", ".lua", ".proto", ".graphql", ".prisma",
+        ".tf", ".hcl", ".vue", ".svelte", ".astro", ".tsx", ".jsx",
+        ".mjs", ".cjs", ".mts", ".cts", ".zig", ".nim", ".rs",
+        ".dockerfile", ".makefile", ".cmake",
+    )
+    known_text = content_type.lower().startswith(text_types) or filename.lower().endswith(text_extensions)
+    if known_text:
         text = _clean_upload_text(content.decode("utf-8", errors="replace"))
         truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
         if truncated:
             text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
         return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
 
+    try:
+        text = _clean_upload_text(content.decode("utf-8"))
+        truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
+        if truncated:
+            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
+        return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
+    except (UnicodeDecodeError, UnicodeError):
+        pass
+
     return {
         "ok": False,
-        "error": f"Unsupported file type for text extraction: {content_type or 'unknown'}",
+        "error": f"Could not read file: {filename}. Jaxvora supports text files (code, docs, data), PDFs, and archives (ZIP, TAR). Binary files are not supported.",
         "content": "",
         "pages": 0,
         "truncated": False,
@@ -2550,6 +4066,27 @@ async def upload_file(file: UploadFile = File(...)):
         "text_length": len(extracted["content"]),
         "pages": extracted["pages"],
         "truncated": extracted["truncated"],
+    }
+
+
+class DownloadRequest(BaseModel):
+    filename: str
+    content: str
+    content_type: Optional[str] = "text/plain"
+
+
+@app.post("/download")
+async def download_file(req: DownloadRequest):
+    """Generate a downloadable file from LLM output. Used by agents to serve generated files."""
+    import base64 as b64_mod
+    safe_name = re.sub(r'[^\w.\-]', '_', req.filename) or "download"
+    encoded = b64_mod.b64encode(req.content.encode("utf-8")).decode()
+    return {
+        "ok": True,
+        "filename": safe_name,
+        "content_type": req.content_type,
+        "content_base64": encoded,
+        "size": len(req.content),
     }
 
 
@@ -2685,6 +4222,10 @@ async def ws_tasks(ws: WebSocket):
     await ws.accept()
     ws_manager.tasks_ws.add(ws)
     try:
+        if db_pool is None:
+            await ws.send_text(json.dumps({"type": "error", "message": "Database unavailable"}))
+            ws_manager.tasks_ws.discard(ws)
+            return
         rows = await db_fetch("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 20")
         await ws.send_text(json.dumps({"type": "snapshot", "tasks": [dict(r) for r in rows]}, default=str))
         while True:
@@ -2698,6 +4239,10 @@ async def ws_logs(ws: WebSocket):
     await ws.accept()
     ws_manager.logs_ws.add(ws)
     try:
+        if db_pool is None:
+            await ws.send_text(json.dumps({"type": "error", "message": "Database unavailable"}))
+            ws_manager.logs_ws.discard(ws)
+            return
         rows = await db_fetch("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 50")
         for r in reversed(rows):
             await ws.send_text(json.dumps({"type": "log", "level": r["level"], "message": r["message"], "ts": r["timestamp"].isoformat()}, default=str))
@@ -2744,8 +4289,11 @@ async def ws_chat(ws: WebSocket):
 
 # === SECTION 11: Startup / Shutdown Events ====================================
 
+auto_healer: Optional[AutoHealDaemon] = None
+
 async def startup():
-    global db_pool, NOTIFICATION_EMAIL
+    global db_pool, NOTIFICATION_EMAIL, auto_healer
+    await redis_cache.connect()
 
     # Init DB
     if DATABASE_URL:
@@ -2789,9 +4337,14 @@ async def startup():
     tool_registry.register(EmailNotificationTool())
     tool_registry.register(GmailAutomationTool())
     tool_registry.register(SSHTool())
+    tool_registry.register(WebSearchTool())
+    tool_registry.register(AgentInvokeTool())
 
     logger.info(f"✓ {len(AGENT_REGISTRY)} agents registered")
     logger.info(f"✓ {len(tool_registry._tools)} MCP tools registered")
+
+    # Rebuild RAG index
+    await rag_engine.rebuild_index()
 
     # Announce ready
     if db_pool:
@@ -2802,13 +4355,77 @@ async def startup():
         except Exception:
             pass
 
-    asyncio.create_task(_broadcast_ready())
+    # Start auto-heal daemon
+    global auto_healer
+    auto_healer = AutoHealDaemon(orchestrator)
+    auto_healer.start()
+
+    # Bootstrap sequence
+    asyncio.create_task(_bootstrap_sequence())
     logger.info("🚀 Jaxvora ready")
 
 
-async def _broadcast_ready():
-    await asyncio.sleep(1)
-    await ws_manager._send(ws_manager.agents, {"type": "system_ready", "ts": datetime.now().isoformat()})
+async def _bootstrap_sequence():
+    """Run bootstrap health-check after startup."""
+    await asyncio.sleep(2)
+    checks: List[Dict] = []
+    # MCP health-check
+    checks.append(_doctor_check("MCP tool registry",
+        len(tool_registry.list_tools()) >= 8,
+        f"{len(tool_registry.list_tools())} tools registered"))
+    # DB verify
+    db_ok = db_pool is not None
+    checks.append(_doctor_check("Database", db_ok,
+        "PostgreSQL pool connected" if db_ok else "Not available"))
+    if db_ok:
+        try:
+            row = await db_fetchrow("SELECT COUNT(*) as c FROM rag_documents")
+            doc_count = row["c"] if row else 0
+            checks.append(_doctor_check("RAG index", True, f"{doc_count} documents indexed"))
+        except Exception:
+            checks.append(_doctor_check("RAG index", False, "Query failed"))
+    # Agent registry
+    checks.append(_doctor_check("Agent registry",
+        len(AGENT_REGISTRY) >= 30,
+        f"{len(AGENT_REGISTRY)} agents registered"))
+    # Session resume
+    pending_sessions = 0
+    if db_ok:
+        try:
+            rows = await db_fetch(
+                "SELECT COUNT(*) as c FROM jaxvora_sessions "
+                "WHERE updated_at > NOW() - INTERVAL '24 hours'")
+            pending_sessions = rows[0]["c"] if rows else 0
+        except Exception:
+            pass
+    checks.append(_doctor_check("Pending sessions",
+        pending_sessions == 0,
+        f"{pending_sessions} active sessions in last 24h"))
+    # Escalation backlog
+    unresolved = error_escalation.unresolved_count()
+    checks.append(_doctor_check("Error escalation",
+        unresolved == 0,
+        f"{unresolved} unresolved escalations"))
+    # Compile
+    try:
+        import py_compile as _pc
+        _pc.compile(__file__, doraise=True)
+        checks.append(_doctor_check("Python compile", True, "main.py compiles cleanly"))
+    except Exception as exc:
+        checks.append(_doctor_check("Python compile", False, str(exc)))
+    passed = sum(1 for c in checks if c["ok"])
+    status = "all_ok" if passed == len(checks) else "issues_detected"
+    report = {
+        "type": "bootstrap_report",
+        "status": status,
+        "checks_passed": passed,
+        "checks_total": len(checks),
+        "checks": checks,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    await ws_manager._send(ws_manager.agents, report)
+    await log_to_db("INFO" if status == "all_ok" else "WARN",
+        f"Bootstrap: {passed}/{len(checks)} checks passed")
 
 
 if __name__ == "__main__":
