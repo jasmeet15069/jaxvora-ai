@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jax Todo List</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0e0f14; color: #e8e9f0; }
+h1 { font-size: 24px; margin-bottom: 24px; color: #6c63ff; }
+.add-row { display: flex; gap: 8px; margin-bottom: 24px; }
+input[type="text"] { flex: 1; padding: 10px 14px; border: 1px solid rgba(108,99,255,0.3); border-radius: 8px; background: #13141a; color: #e8e9f0; font-size: 14px; outline: none; }
+input[type="text"]:focus { border-color: #6c63ff; }
+button { padding: 10px 20px; background: #6c63ff; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
+button:hover { background: #8b85ff; }
+.todo { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid rgba(108,99,255,0.12); border-radius: 8px; margin-bottom: 8px; background: rgba(255,255,255,0.03); }
+.todo input[type="checkbox"] { width: 18px; height: 18px; accent-color: #00d4aa; cursor: pointer; }
+.todo .title { flex: 1; font-size: 14px; }
+.todo .title.done { text-decoration: line-through; color: #5a5e72; }
+.todo .del { background: transparent; color: #ff4d6a; border: 1px solid #ff4d6a; padding: 4px 10px; font-size: 12px; border-radius: 6px; }
+.todo .del:hover { background: #ff4d6a; color: #fff; }
+.empty { text-align: center; color: #5a5e72; padding: 40px 0; font-size: 14px; }
+</style>
+</head>
+<body>
+<h1>📋 Jax Todo List</h1>
+<div class="add-row">
+<input type="text" id="newTodo" placeholder="What needs to be done?" onkeydown="if(event.key==='Enter')addTodo()">
+<button onclick="addTodo()">Add</button>
+</div>
+<div id="todo-list"></div>
+<script>
+async function loadTodos() {
+  try {
+    const r = await fetch('/todos');
+    const todos = await r.json();
+    const list = document.getElementById('todo-list');
+    if (!todos.length) {
+      list.innerHTML = '<div class="empty">No todos yet. Add one above!</div>';
+      return;
+    }
+    list.innerHTML = todos.map(t => `
+      <div class="todo">
+        <input type="checkbox" ${t.completed ? 'checked' : ''} onchange="toggleTodo('${t.id}', this.checked)">
+        <span class="title ${t.completed ? 'done' : ''}">${esc(t.title)}</span>
+        <button class="del" onclick="deleteTodo('${t.id}')">✕</button>
+      </div>
+    `).join('');
+  } catch (e) {
+    document.getElementById('todo-list').innerHTML = '<div class="empty" style="color:#ff4d6a">Error loading todos: ' + e.message + '</div>';
+  }
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+async function addTodo() {
+  const input = document.getElementById('newTodo');
+  const title = input.value.trim();
+  if (!title) return;
+  input.value = '';
+  try {
+    await fetch('/todos', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({title, completed: false}) });
+    loadTodos();
+  } catch (e) { alert('Error: ' + e.message); }
+}
+async function toggleTodo(id, completed) {
+  try { await fetch('/todos/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({completed}) }); } catch (e) {}
+}
+async function deleteTodo(id) {
+  try { await fetch('/todos/' + id, { method: 'DELETE' }); loadTodos(); } catch (e) { alert('Error: ' + e.message); }
+}
+loadTodos();
+</script>
+</body>
+</html>

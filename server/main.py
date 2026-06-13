@@ -1569,6 +1569,160 @@ class SocialMediaTool(MCPTool):
         return f"[{SOCIAL_LABELS[platform]} post failed] {result.get('error') or result.get('response')}"
 
 
+class CodeRunnerTool(MCPTool):
+    SANDBOX = Path("/root/jaxvora-ai/workspace")
+
+    def __init__(self):
+        super().__init__("code_runner",
+            "Run Python, Node.js, or shell code in a sandboxed workspace. "
+            "params: language (python|node|shell), code (string of code to run), timeout_seconds (optional, max 120). "
+            "Returns stdout, stderr, and exit code. Use this to test snippets, evaluate logic, or execute scripts.",
+            risk_level="medium", requires_confirmation=True)
+
+    def permission_check(self, params: Dict[str, Any]) -> Optional[str]:
+        code = params.get("code", "")
+        blocked = ["rm -rf", "rm -rf /", "mkfs", "dd if=", "> /dev/", "chmod 777 /",
+                   "import os; os.remove", "import shutil; shutil.rmtree",
+                   "__import__('os').system", "subprocess.call"]
+        for pattern in blocked:
+            if pattern in code:
+                return f"Blocked dangerous pattern: {pattern}"
+        return None
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        lang = (params.get("language") or "python").lower().strip()
+        code = params.get("code", "")
+        timeout_s = min(int(params.get("timeout_seconds", 30)), 120)
+
+        self.SANDBOX.mkdir(parents=True, exist_ok=True)
+
+        if lang == "python":
+            cmd = ["python3", "-c", code]
+        elif lang == "node":
+            cmd = ["node", "-e", code]
+        elif lang == "shell":
+            cmd = ["bash", "-c", code]
+        else:
+            return f"code_runner error: unsupported language '{lang}'. Use python, node, or shell."
+
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(self.SANDBOX),
+                ),
+                timeout=timeout_s,
+            )
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode("utf-8", errors="replace").strip()
+            err = stderr.decode("utf-8", errors="replace").strip()
+            parts = []
+            if out:
+                parts.append(f"[stdout]\n{out}")
+            if err:
+                parts.append(f"[stderr]\n{err}")
+            parts.append(f"[exit code] {proc.returncode}")
+            return "\n\n".join(parts)
+        except asyncio.TimeoutError:
+            return f"code_runner error: timed out after {timeout_s}s"
+        except Exception as e:
+            return f"code_runner error: {e}"
+
+
+class PlaywrightTool(MCPTool):
+    def __init__(self):
+        super().__init__("playwright",
+            "Browser automation via Playwright. "
+            "params: action (navigate|screenshot|text|click|fill|evaluate), "
+            "url (for navigate), selector (for click/fill), value (for fill), "
+            "script (for evaluate), timeout_seconds (optional, max 60). "
+            "Use this to interact with web pages, take screenshots, extract content, or fill forms.",
+            risk_level="medium", requires_confirmation=True)
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        action = (params.get("action") or "").lower().strip()
+        url = params.get("url", "")
+        selector = params.get("selector", "")
+        value = params.get("value", "")
+        script = params.get("script", "")
+        timeout_s = min(int(params.get("timeout_seconds", 30)), 60)
+
+        try:
+            from playwright.async_api import async_playwright
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+                page = await browser.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 720})
+
+                if action == "navigate":
+                    if not url:
+                        return "playwright error: url required for navigate"
+                    await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded")
+                    title = await page.title()
+                    text = await page.inner_text("body")
+                    text = re.sub(r'\s+', ' ', text).strip()[:5000]
+                    await browser.close()
+                    return f"[{title}]\n{text}"
+
+                elif action == "screenshot":
+                    if not url:
+                        return "playwright error: url required for screenshot"
+                    await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(1000)
+                    screenshot_path = str(self.SANDBOX / f"screenshot_{int(time.time())}.png")
+                    await page.screenshot(path=screenshot_path, full_page=True)
+                    await browser.close()
+                    return f"Screenshot saved to {screenshot_path}"
+
+                elif action == "text":
+                    if not url:
+                        return "playwright error: url required for text"
+                    await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded")
+                    text = await page.inner_text("body")
+                    text = re.sub(r'\s+', ' ', text).strip()[:5000]
+                    await browser.close()
+                    return text
+
+                elif action == "click":
+                    if not selector:
+                        return "playwright error: selector required for click"
+                    await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded") if url else None
+                    await page.click(selector, timeout=timeout_s * 1000)
+                    await page.wait_for_timeout(500)
+                    text = await page.inner_text("body")
+                    text = re.sub(r'\s+', ' ', text).strip()[:3000]
+                    await browser.close()
+                    return f"Clicked {selector}\n{text}"
+
+                elif action == "fill":
+                    if not selector or not value:
+                        return "playwright error: selector and value required for fill"
+                    await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded") if url else None
+                    await page.fill(selector, value, timeout=timeout_s * 1000)
+                    await page.wait_for_timeout(500)
+                    await browser.close()
+                    return f"Filled {selector} with '{value}'"
+
+                elif action == "evaluate":
+                    if not script:
+                        return "playwright error: script required for evaluate"
+                    await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded") if url else None
+                    result = await page.evaluate(script)
+                    await browser.close()
+                    return str(result)[:5000]
+
+                else:
+                    await browser.close()
+                    return f"playwright error: unknown action '{action}'. Use navigate, screenshot, text, click, fill, or evaluate."
+
+        except Exception as e:
+            return f"playwright error: {e}"
+
+    SANDBOX = Path("/root/jaxvora-ai/workspace")
+
+
 class MCPToolRegistry:
     def __init__(self):
         self._tools: Dict[str, MCPTool] = {}
@@ -2555,232 +2709,6 @@ class ToolCallingAgent(BaseAgent):
 
 # === SECTION 6: Agent Implementations =========================================
 
-class AIEngineerAgent(BaseAgent):
-    name = "AI Engineer"; model = "deepseek_v4"; division = "Engineering"
-    description = "AI features, RAG systems, MCP integrations, LLM workflows"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are an expert AI engineer specialising in LLM integrations, RAG systems, "
-            "embeddings, vector databases, MCP tool design, and production AI workflows. "
-            "Provide detailed, actionable technical guidance.",
-            task
-        )
-
-class SoftwareEngineerAgent(BaseAgent):
-    name = "Software Engineer"; model = "deepseek_v4"; division = "Engineering"
-    description = "Backend/frontend dev, CRUD, API generation"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a senior full-stack software engineer. You write clean, production-ready "
-            "code with best practices, proper error handling, and comprehensive comments.",
-            task
-        )
-
-class DebugAgent(BaseAgent):
-    name = "Debug Agent"; model = "deepseek_v4"; division = "Engineering"
-    description = "Root-cause analysis, log investigation, automated bug fixing"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are an expert debugger. You perform systematic root-cause analysis, read "
-            "stack traces, investigate logs, and provide precise bug fixes with explanations.",
-            task
-        )
-
-class QATestAgent(BaseAgent):
-    name = "QA/Test Agent"; model = "deepseek"; division = "Engineering"
-    description = "Unit, integration, E2E, regression tests"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a QA automation engineer. You write comprehensive test suites covering "
-            "unit, integration, and E2E scenarios. Use pytest, Jest, or appropriate frameworks.",
-            task
-        )
-
-class CodeReviewAgent(BaseAgent):
-    name = "Code Review"; model = "groq"; division = "Engineering"
-    description = "Code quality, best practices, risk & security review"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a senior code reviewer. You evaluate code for quality, security, "
-            "performance, maintainability, and adherence to best practices. Be specific.",
-            task
-        )
-
-class ArchitectureAgent(BaseAgent):
-    name = "Architecture"; model = "deepseek_v4"; division = "Engineering"
-    description = "System design, scalability, technical debt"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a principal systems architect. You design scalable, resilient systems "
-            "and identify technical debt, single points of failure, and improvement areas.",
-            task
-        )
-
-class DatabaseAgent(BaseAgent):
-    name = "Database"; model = "deepseek"; division = "Engineering"
-    description = "Query optimisation, schema design, migrations"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a database expert specialising in PostgreSQL, query optimisation, "
-            "schema design, indexing strategies, and zero-downtime migrations.",
-            task
-        )
-
-class DevOpsAgent(BaseAgent):
-    name = "DevOps"; model = "deepseek"; division = "Engineering"
-    description = "CI/CD, Docker configs, Kubernetes manifests, deployments"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a DevOps/SRE engineer. You design CI/CD pipelines, write Dockerfiles, "
-            "Kubernetes manifests, Terraform configs, and automate deployments reliably.",
-            task
-        )
-
-class CybersecurityAgent(BaseAgent):
-    name = "Cybersecurity"; model = "deepseek_v4"; division = "Security"
-    description = "Vulnerability scanning, secret detection, hardening"
-    async def _execute(self, task):
-        result = await self.call_llm(
-            "You are a cybersecurity engineer. You identify vulnerabilities, detect exposed "
-            "secrets, recommend hardening measures, and produce actionable security reports.",
-            task
-        )
-        await memory.store("security_findings", f"Task: {task}\nFindings: {result[:500]}")
-        return result
-
-class RedTeamAgent(BaseAgent):
-    name = "Red Team"; model = "deepseek"; division = "Security"
-    description = "Threat modelling, attack simulation"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a red team security expert. You perform threat modelling, identify "
-            "attack vectors, and simulate adversarial scenarios to strengthen defences.",
-            task
-        )
-
-class ComplianceAgent(BaseAgent):
-    name = "Compliance"; model = "deepseek"; division = "Security"
-    description = "GDPR, SOC2, ISO27001 checklists"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a compliance officer specialising in GDPR, SOC2, ISO27001, and HIPAA. "
-            "Produce detailed compliance checklists and gap analysis reports.",
-            task
-        )
-
-class DataAnalystAgent(BaseAgent):
-    name = "Data Analyst"; model = "deepseek"; division = "Data"
-    description = "SQL analysis, KPI tracking, business insights"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a senior data analyst. You write SQL queries, build KPI dashboards, "
-            "interpret trends, and translate data into clear business insights.",
-            task
-        )
-
-class BIAgent(BaseAgent):
-    name = "BI Agent"; model = "deepseek"; division = "Data"
-    description = "Power BI reports, DAX generation, semantic model analysis"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a Business Intelligence expert specialising in Power BI, Tableau, "
-            "DAX formulas, semantic models, and executive dashboard design.",
-            task
-        )
-
-class DataEngineerAgent(BaseAgent):
-    name = "Data Engineer"; model = "deepseek"; division = "Data"
-    description = "ETL pipelines, data quality, warehouse optimisation"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a data engineer. You design ETL/ELT pipelines with dbt, Spark, or "
-            "Airflow, enforce data quality contracts, and optimise warehouse performance.",
-            task
-        )
-
-class MLEngineerAgent(BaseAgent):
-    name = "ML Engineer"; model = "deepseek_v4"; division = "Data"
-    description = "Feature engineering, model training, evaluation pipelines"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are an ML engineer. You design feature pipelines, train and evaluate models, "
-            "handle model versioning, and deploy ML systems to production.",
-            task
-        )
-
-class ResumeAgent(BaseAgent):
-    name = "Resume Agent"; model = "deepseek"; division = "Career"
-    description = "ATS-optimised resume and portfolio generation"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a professional resume writer and career coach. You create ATS-optimised "
-            "resumes and portfolios that highlight achievements with quantified impact.",
-            task
-        )
-
-class InterviewCoachAgent(BaseAgent):
-    name = "Interview Coach"; model = "deepseek"; division = "Career"
-    description = "Technical, behavioural, and mock interview prep"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are an expert interview coach for tech roles. You prepare candidates for "
-            "system design, coding, and behavioural interviews with detailed coaching.",
-            task
-        )
-
-class CareerCoachAgent(BaseAgent):
-    name = "Career Coach"; model = "deepseek"; division = "Career"
-    description = "Learning plans, skill-gap analysis, career guidance"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a senior tech career coach. You analyse skill gaps, design 90-day "
-            "learning plans, and provide strategic career progression guidance.",
-            task
-        )
-
-class ProductManagerAgent(BaseAgent):
-    name = "Product Manager"; model = "deepseek"; division = "Product"
-    description = "Roadmaps, feature planning, user stories"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a senior product manager. You create roadmaps, write user stories with "
-            "acceptance criteria, prioritise backlogs, and align stakeholders.",
-            task
-        )
-
-class DocumentationAgent(BaseAgent):
-    name = "Documentation"; model = "deepseek"; division = "Product"
-    description = "Technical docs, API docs, architecture docs"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a technical writer. You produce clear, comprehensive documentation "
-            "including API references, architecture docs, and developer guides.",
-            task
-        )
-
-class ResearchAgent(BaseAgent):
-    name = "Research"; model = "deepseek"; division = "Product"
-    description = "Technology research, framework comparison"
-    async def _execute(self, task):
-        return await self.call_llm(
-            "You are a technology researcher. You compare frameworks, evaluate libraries, "
-            "assess trade-offs, and produce well-structured research reports.",
-            task
-        )
-
-class ProjectIntelligenceAgent(BaseAgent):
-    name = "Project Intelligence"; model = "groq"; division = "Executive"
-    description = "Dependency graph, architecture graph, impact analysis"
-    async def _execute(self, task):
-        result = await self.call_llm(
-            "You are a project intelligence system. You analyse codebases, build dependency "
-            "graphs, assess change impact, and provide architectural context.",
-            task
-        )
-        await memory.store("architecture_knowledge", f"Analysis: {result[:600]}")
-        return result
-
-
 async def auto_decide_audit(audit_id: str, agent_name: str, action: str, payload: str):
     """LLM reviews every audit entry and auto-approves or rejects — no human needed."""
     system = """You are Jaxvora's autonomous decision engine. You review agent actions and decide whether to APPROVE or REJECT them.
@@ -2942,18 +2870,76 @@ DIVISION_LEADS = {
 def build_registry():
     global AGENT_NETWORK
     agents = [
-        AIEngineerAgent(), SoftwareEngineerAgent(), DebugAgent(), QATestAgent(),
-        CodeReviewAgent(), ArchitectureAgent(), DatabaseAgent(), DevOpsAgent(),
-        CybersecurityAgent(), RedTeamAgent(), ComplianceAgent(),
-        DataAnalystAgent(), BIAgent(), DataEngineerAgent(), MLEngineerAgent(),
-        ResumeAgent(), InterviewCoachAgent(), CareerCoachAgent(),
-        ProductManagerAgent(), DocumentationAgent(), ResearchAgent(),
-        ProjectIntelligenceAgent(),
-        JaxvoraDoctorAgent(),
-        # Phase 1: 13 new v1.0 agents
+        ToolCallingAgent(name="AI Engineer", model="deepseek_v4", division="Engineering",
+            description="AI features, RAG systems, MCP integrations, LLM workflows",
+            system_prompt="You are an expert AI engineer. Use the file_system tool to read existing code and terminal to run commands. Never guess file contents — always read them first. Specialize in LLM integrations, RAG systems, embeddings, vector databases, MCP tool design, and production AI workflows. Provide detailed, actionable technical guidance with real code changes."),
+        ToolCallingAgent(name="Software Engineer", model="deepseek_v4", division="Engineering",
+            description="Backend/frontend dev, CRUD, API generation",
+            system_prompt="You are a senior full-stack software engineer. Use file_system to read and edit code files, terminal to run builds and tests. Never guess file contents — always read the actual files first. Write clean, production-ready code with best practices, proper error handling, and comprehensive comments. When fixing bugs: read the code, identify the issue, make the edit, rebuild, restart, and verify."),
+        ToolCallingAgent(name="Debug Agent", model="deepseek_v4", division="Engineering",
+            description="Root-cause analysis, log investigation, automated bug fixing",
+            system_prompt="You are an expert debugger. Use file_system to read source code and logs, terminal to run diagnostic commands. Never guess what code looks like — read the actual files. Perform systematic root-cause analysis, investigate logs, and provide precise bug fixes with explanations. After identifying a fix, use file_system to edit the code and terminal to rebuild/restart."),
+        ToolCallingAgent(name="QA/Test Agent", model="groq", division="Engineering",
+            description="Unit, integration, E2E, regression tests",
+            system_prompt="You are a QA automation engineer. Use file_system to read existing test files and source code, terminal to run test suites. Never invent test results — run the actual tests. Write comprehensive test suites covering unit, integration, and E2E scenarios. Use pytest, Jest, or appropriate frameworks."),
+        ToolCallingAgent(name="Code Review", model="groq", division="Engineering",
+            description="Code quality, best practices, risk & security review",
+            system_prompt="You are a senior code reviewer. Use file_system to read the actual code files before reviewing. Never review from memory — always read the real files. Evaluate code for quality, security, performance, maintainability, and adherence to best practices. Be specific and reference actual line numbers."),
+        ToolCallingAgent(name="Architecture", model="deepseek_v4", division="Engineering",
+            description="System design, scalability, technical debt",
+            system_prompt="You are a principal systems architect. Use file_system to read project structure and key files before making recommendations. Never design in a vacuum — understand the actual codebase. Design scalable, resilient systems and identify technical debt, single points of failure, and improvement areas."),
+        ToolCallingAgent(name="Database", model="deepseek", division="Engineering",
+            description="Query optimisation, schema design, migrations",
+            system_prompt="You are a database expert. Use terminal to run SQL queries against the actual database, file_system to read schema files. Never guess schema or data — query the real database. Specialize in PostgreSQL, query optimisation, schema design, indexing strategies, and zero-downtime migrations."),
         ToolCallingAgent(name="Backend Engineer", model="deepseek", division="Engineering",
-            description="Server-side development, API design, database optimization and migrations",
-            system_prompt="You are a senior backend engineer specializing in Python, FastAPI, PostgreSQL, and REST API design. Write clean, production-ready backend code with proper error handling, input validation, and security best practices."),
+            description="Server-side API development, database design, service architecture, authentication",
+            system_prompt="You are a senior backend engineer. Use file_system to read existing backend code and terminal to run/fix servers. Never guess code — read actual files. Design and build REST/GraphQL APIs, database schemas, authentication flows, and server-side business logic with production-grade error handling, logging, and testing."),
+        ToolCallingAgent(name="DevOps", model="deepseek", division="Engineering",
+            description="CI/CD, Docker configs, Kubernetes manifests, deployments",
+            system_prompt="You are a DevOps/SRE engineer. Use terminal to run deployment commands, file_system to read config files. Never guess infrastructure state — check the actual system. Design CI/CD pipelines, write Dockerfiles, Kubernetes manifests, Terraform configs, and automate deployments reliably. Use screen for background processes."),
+        ToolCallingAgent(name="Cybersecurity", model="deepseek_v4", division="Security",
+            description="Vulnerability scanning, secret detection, hardening",
+            system_prompt="You are a cybersecurity engineer. Use file_system to read actual code for security review, terminal to run security scanners. Never guess vulnerabilities — inspect real files and run real scans. Identify vulnerabilities, detect exposed secrets, recommend hardening measures, and produce actionable security reports."),
+        ToolCallingAgent(name="Red Team", model="deepseek", division="Security",
+            description="Threat modelling, attack simulation",
+            system_prompt="You are a red team security expert. Perform threat modelling, identify attack vectors, and simulate adversarial scenarios to strengthen defences. Use file_system to read actual system configurations before making assessments."),
+        ToolCallingAgent(name="Compliance", model="groq", division="Security",
+            description="GDPR, SOC2, ISO27001 checklists",
+            system_prompt="You are a compliance officer specialising in GDPR, SOC2, ISO27001, and HIPAA. Produce detailed compliance checklists and gap analysis reports."),
+        ToolCallingAgent(name="Data Analyst", model="groq", division="Data",
+            description="SQL analysis, KPI tracking, business insights",
+            system_prompt="You are a senior data analyst. Write SQL queries, build KPI dashboards, interpret trends, and translate data into clear business insights."),
+        ToolCallingAgent(name="BI Agent", model="groq", division="Data",
+            description="Power BI reports, DAX generation, semantic model analysis",
+            system_prompt="You are a Business Intelligence expert specialising in Power BI, Tableau, DAX formulas, semantic models, and executive dashboard design."),
+        ToolCallingAgent(name="Data Engineer", model="deepseek", division="Data",
+            description="ETL pipelines, data quality, warehouse optimisation",
+            system_prompt="You are a data engineer. Use file_system to read pipeline code and terminal to run data pipelines. Never guess pipeline structure — read actual configs. Design ETL/ELT pipelines with dbt, Spark, or Airflow, enforce data quality contracts, and optimise warehouse performance."),
+        ToolCallingAgent(name="ML Engineer", model="deepseek_v4", division="Data",
+            description="Feature engineering, model training, evaluation pipelines",
+            system_prompt="You are an ML engineer. Use file_system to read model code and terminal to train/evaluate models. Never guess model performance — run actual evaluations. Design feature pipelines, train and evaluate models, handle model versioning, and deploy ML systems to production."),
+        ToolCallingAgent(name="Resume Agent", model="groq", division="Career",
+            description="ATS-optimised resume and portfolio generation",
+            system_prompt="You are a professional resume writer and career coach. Create ATS-optimised resumes and portfolios that highlight achievements with quantified impact."),
+        ToolCallingAgent(name="Interview Coach", model="groq", division="Career",
+            description="Technical, behavioural, and mock interview prep",
+            system_prompt="You are an expert interview coach for tech roles. Prepare candidates for system design, coding, and behavioural interviews with detailed coaching."),
+        ToolCallingAgent(name="Career Coach", model="groq", division="Career",
+            description="Learning plans, skill-gap analysis, career guidance",
+            system_prompt="You are a senior tech career coach. Analyse skill gaps, design 90-day learning plans, and provide strategic career progression guidance."),
+        ToolCallingAgent(name="Product Manager", model="groq", division="Product",
+            description="Roadmaps, feature planning, user stories",
+            system_prompt="You are a senior product manager. Create roadmaps, write user stories with acceptance criteria, prioritise backlogs, and align stakeholders."),
+        ToolCallingAgent(name="Documentation", model="groq", division="Product",
+            description="Technical docs, API docs, architecture docs",
+            system_prompt="You are a technical writer. Produce clear, comprehensive documentation including API references, architecture docs, and developer guides."),
+        ToolCallingAgent(name="Research", model="groq", division="Product",
+            description="Technology research, framework comparison",
+            system_prompt="You are a technology researcher. Compare frameworks, evaluate libraries, assess trade-offs, and produce well-structured research reports."),
+        ToolCallingAgent(name="Project Intelligence", model="groq", division="Executive",
+            description="Dependency graph, architecture graph, impact analysis",
+            system_prompt="You are a project intelligence system. Use file_system to read the actual codebase structure before making analyses. Analyse codebases, build dependency graphs, assess change impact, and provide architectural context."),
+        JaxvoraDoctorAgent(),
         ToolCallingAgent(name="Frontend Engineer", model="deepseek", division="Engineering",
             description="UI component development, JavaScript/HTML/CSS, SPA architecture",
             system_prompt="You are a senior frontend engineer specializing in vanilla JavaScript, HTML5, CSS3, and single-page application architecture. Build responsive, accessible, and performant user interfaces with clean client-side code."),
@@ -2972,16 +2958,16 @@ def build_registry():
         ToolCallingAgent(name="RAG Specialist", model="deepseek_v4", division="Data",
             description="Retrieval-Augmented Generation, embedding pipelines, vector search optimization",
             system_prompt="You are a RAG specialist. Design and optimize retrieval-augmented generation systems including chunking strategies, embedding models, hybrid search (vector + FTS), reranking, and context window management. Tune for relevance and latency."),
-        ToolCallingAgent(name="Job Search Agent", model="deepseek", division="Career",
+        ToolCallingAgent(name="Job Search Agent", model="groq", division="Career",
             description="Job search automation, application tracking, market research",
             system_prompt="You are a career advisor specializing in job search strategy. Help with job market research, company targeting, application organization, networking strategies, and interview scheduling. Provide actionable next steps."),
-        ToolCallingAgent(name="Application Tracker", model="deepseek", division="Career",
+        ToolCallingAgent(name="Application Tracker", model="groq", division="Career",
             description="Job application status tracking, follow-up reminders, pipeline management",
             system_prompt="You are an application tracking specialist. Help organize and track job applications, set follow-up reminders, manage interview pipelines, and analyze application-to-offer conversion metrics."),
-        ToolCallingAgent(name="UX Designer", model="deepseek", division="Product",
+        ToolCallingAgent(name="UX Designer", model="groq", division="Product",
             description="User experience design, wireframing, accessibility, usability testing",
             system_prompt="You are a UX designer. Design intuitive user experiences with focus on accessibility (WCAG), usability heuristics, information architecture, and interaction design. Provide wireframe descriptions and usability improvement recommendations."),
-        ToolCallingAgent(name="Requirements Analyst", model="deepseek", division="Product",
+        ToolCallingAgent(name="Requirements Analyst", model="groq", division="Product",
             description="Requirements gathering, PRD writing, stakeholder communication, feature scoping",
             system_prompt="You are a requirements analyst. Elicit, document, and manage product requirements. Write clear PRDs, user stories, acceptance criteria, and technical specifications. Bridge communication between stakeholders and engineering teams."),
         ToolCallingAgent(name="Strategy Agent", model="deepseek_v4", division="Executive",
@@ -3049,11 +3035,17 @@ class ChiefOrchestrator:
     name = "Chief Orchestrator"
     model = "groq"
 
-    SYSTEM = """You are Jaxvora's Chief Orchestrator powered by Llama 3.3 70B.
-Your role: parse user intent, create execution plans, route to specialist agents, and synthesise results.
-Write user-facing responses in clean markdown with short headings, bullets, and fenced code blocks when useful.
-Do not return raw JSON, internal traces, or long unstructured paragraphs in the final response.
-Never say Jaxvora cannot use a configured tool; route tool-specific requests before giving generic advice.
+    SYSTEM = """You are Jaxvora's Chief Orchestrator — the CEO of this AI command center. You think fast, decide smart, and execute without hesitation.
+
+Your role: understand user intent at a CEO level, create precise execution plans, dispatch the right specialist agents, and synthesise results into clear decisions.
+
+Write user-facing responses in clean markdown with short headings, bullets, and fenced code blocks when useful. Be direct and decisive — no fluff, no over-explaining.
+
+Decision-making rules:
+- When the user reports a bug: immediately dispatch Debug Agent + Software Engineer to read the code, identify the fix, edit files, rebuild, and verify.
+- When the user asks to build something: dispatch the right agents with file_system and terminal tools to actually create the project — don't just describe it.
+- When multiple approaches exist: pick the fastest path to a working result, note the trade-off briefly, and move on.
+- Never say Jaxvora cannot do something if you have the tools — route tool-specific requests before giving generic advice.
 
 WORKSPACE EXECUTION — act like a coding agent (Codex / Claude Code style). When the user asks you to build, create, scaffold, write, edit, or run code, apps, websites, scripts, or files, ACTUALLY do it with tools instead of only describing it:
 
@@ -3587,6 +3579,23 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
             "organization": {"mode": "taor_v1"},
         }
 
+    async def _enhance_prompt(self, raw: str) -> str:
+        if len(raw) < 10 or raw.startswith("__CONFIRM_"):
+            return raw
+        try:
+            enhanced = await call_groq(
+                "You reformat user input for an AI command center. Fix typos, clarify intent, "
+                "extract the core request concisely. Preserve all code snippets, URLs, and commands "
+                "verbatim. Output ONLY the enhanced version — no preamble, no meta-commentary.",
+                raw,
+            )
+            cleaned = enhanced.strip().strip('"\'')
+            if 5 < len(cleaned) < len(raw) * 3:
+                return cleaned
+            return raw
+        except Exception:
+            return raw
+
     async def process(self, user_input: str, stream_fn=None,
                       admin_token: Optional[str] = None,
                       confirmation_response: Optional[str] = None) -> Dict:
@@ -3602,7 +3611,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                     if decision == "YES":
                         loop_output = await AgentWorkflow.run(
                             ToolCallingAgent(
-                                name="Chief Orchestrator", model="groq",
+                                name="Chief Orchestrator", model="deepseek_v4",
                                 division="Executive",
                                 description="Chief Orchestrator coordinating all agents",
                                 system_prompt=self.SYSTEM,
@@ -3634,18 +3643,23 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
             if result:
                 return result
 
+        # ── Groq prompt enhancer (cheap prep for better TAOR results) ──
+        _enhanced_input = await self._enhance_prompt(user_input)
+        if _enhanced_input != user_input:
+            logger.info(f"Prompt enhanced: {len(user_input)}→{len(_enhanced_input)} chars")
+
         # ── TAOR Loop ──
         try:
-            _taor_state = AgentGraphState(user_input, self.SYSTEM, max_iterations=8)
-            _taor_state.add_message("user", user_input)
+            _taor_state = AgentGraphState(_enhanced_input, self.SYSTEM, max_iterations=8)
+            _taor_state.add_message("user", _enhanced_input)
             loop_output = await AgentWorkflow.run(
                 ToolCallingAgent(
-                    name="Chief Orchestrator", model="groq",
+                    name="Chief Orchestrator", model="deepseek_v4",
                     division="Executive",
                     description="Chief Orchestrator coordinating all agents",
                     system_prompt=self.SYSTEM,
                 ),
-                user_input, max_iterations=8,
+                _enhanced_input, max_iterations=8,
                 state=_taor_state,
                 pending_states=self._pending_states,
             )
@@ -5159,6 +5173,8 @@ async def startup():
     tool_registry.register(WebSearchTool())
     tool_registry.register(AgentInvokeTool())
     tool_registry.register(SocialMediaTool())
+    tool_registry.register(CodeRunnerTool())
+    tool_registry.register(PlaywrightTool())
 
     logger.info(f"✓ {len(AGENT_REGISTRY)} agents registered")
     logger.info(f"✓ {len(tool_registry._tools)} MCP tools registered")
