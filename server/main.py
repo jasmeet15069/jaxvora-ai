@@ -268,6 +268,18 @@ async def call_deepseek_v4(system: str, user: str) -> str:
     return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else "deepseek_v4")
 
 
+# The Chief Orchestrator runs many think-steps per request; OpenCode Zen
+# (deepseek-v4-flash-free) is high-quality but slow. Run the orchestrator on the
+# FASTEST free model — Groq (LPU inference, llama-3.3-70b) — FIRST, regardless of
+# OPENCODE_ZEN_PRIMARY, with the rest of the chain (incl. Zen) as fallback. Agents
+# still default to Zen as their brain.
+ORCHESTRATOR_PROVIDER = os.environ.get("ORCHESTRATOR_PROVIDER", "groq")
+
+
+async def call_orchestrator_llm(system: str, user: str, max_tokens: int = MAX_TOKENS) -> str:
+    return await call_llm_failover(system, user, max_tokens, prefer=ORCHESTRATOR_PROVIDER)
+
+
 def _resolve_app_resource(env_value: str, *relative_parts: str) -> Optional[Path]:
     app_dir = Path(__file__).resolve().parent
     candidates: List[Path] = []
@@ -1472,6 +1484,155 @@ class AgentInvokeTool(MCPTool):
         return f"[Agent: {name}]\n{output}\n[Success: {result.success}]"
 
 
+def _role_base_prompt(role_name: str) -> str:
+    """Expertise prompt for any agent role. Uses the registered agent's own system
+    prompt so parallel workers carry that role's real specialization."""
+    agent = AGENT_REGISTRY.get(role_name)
+    if agent is not None:
+        base = getattr(agent, "_system", None) or getattr(agent, "description", "")
+        if base:
+            return base
+    return f"You are a senior {role_name}. Apply expert, production-quality judgment in your domain."
+
+
+async def _run_parallel_team(role_name: str, task: str, parts: Any, project: str) -> Dict[str, Any]:
+    """Generic map-reduce over a role: split the task into independent slices, run
+    N workers of that role IN PARALLEL (fast direct LLM calls with provider
+    failover — no slow nested agent loops), then a Head/Lead of that role reviews
+    and MERGES every submission into one finalized deliverable. Works for ANY of
+    the 37 agent roles (Software Engineer, Data Analyst, QA, Research, ...)."""
+    role_name = (role_name or "Software Engineer").strip()
+    base = _role_base_prompt(role_name)
+    report: Dict[str, Any] = {"tool": "parallel_team", "role": role_name, "task": task[:200]}
+
+    worker_sys = (
+        f"{base}\n\nYou are ONE worker in a parallel team of {role_name}s. You own a single, focused "
+        f"slice of a larger task. Complete ONLY your slice with concrete, production-ready output — do "
+        f"not wait for or assume other workers. For code, put each file in a fenced block with its path "
+        f"on the opening fence. State briefly what your slice covers and any interface others depend on. "
+        f"Never claim something works that you did not actually produce.")
+    head_sys = (
+        f"{base}\n\nYou are the Head/Lead {role_name}. Several {role_name}s worked IN PARALLEL on separate "
+        f"slices of one task. Review every submission for correctness, conflicts, duplication, and gaps, "
+        f"then MERGE them into a single finalized, coherent deliverable with one consistent style and clean "
+        f"interfaces between slices. End with a '## Review notes' section: what each worker contributed, the "
+        f"conflicts you resolved, and any remaining risks. Be evidence-driven — never claim the merged result "
+        f"works unless the pieces actually fit; call out anything unverified.")
+
+    # 1. Decompose into independent, parallelizable slices.
+    subtasks: List[str] = []
+    if isinstance(parts, list) and parts:
+        subtasks = [str(p).strip() for p in parts if str(p).strip()][:6]
+    else:
+        try:
+            n = max(0, min(int(parts), 6)) if parts not in (None, "") else 0
+        except (TypeError, ValueError):
+            n = 0
+        want = f"exactly {n}" if n else "2 to 4"
+        ctx = f"\nProject/context: {project}" if project else ""
+        raw = await call_llm_failover(
+            f"You are a lead {role_name}. Split the task into independent, parallelizable slices — each a "
+            f"self-contained piece one {role_name} can own without blocking others. Return ONLY a JSON array "
+            f"of short slice descriptions.",
+            f"Task: {task}{ctx}\n\nReturn {want} slices as a JSON array of strings.")
+        m = re.search(r"\[.*\]", raw or "", re.DOTALL)
+        if m:
+            try:
+                subtasks = [str(x).strip() for x in json.loads(m.group(0)) if str(x).strip()][:6]
+            except Exception:
+                subtasks = []
+        if not subtasks:
+            subtasks = [task]  # fall back to a single slice
+    report["slices"] = subtasks
+
+    # 2. Workers run concurrently — they do NOT wait on each other.
+    sem = asyncio.Semaphore(max(1, MAX_PARALLEL_AGENTS))
+
+    async def _work(i: int, sub: str) -> Dict[str, Any]:
+        async with sem:
+            try:
+                out = await asyncio.wait_for(
+                    call_llm_failover(
+                        worker_sys,
+                        f"Overall task: {task}\n\nYour slice ({i + 1}/{len(subtasks)}): {sub}"),
+                    timeout=150)
+                ok = not str(out).startswith("[All LLM providers failed")
+            except asyncio.TimeoutError:
+                out, ok = f"[Worker {i + 1} TIMED OUT after 150s — Verification Incomplete]", False
+            except Exception as e:
+                out, ok = f"[Worker {i + 1} failed: {e}]", False
+        return {"worker": f"{role_name} Worker {i + 1}", "subtask": sub, "ok": ok, "output": out}
+
+    results = await asyncio.gather(*[_work(i, s) for i, s in enumerate(subtasks)])
+    report["workers"] = [
+        {"worker": r["worker"], "subtask": r["subtask"], "ok": r["ok"], "chars": len(str(r["output"]))}
+        for r in results]
+    ok_workers = [r for r in results if r["ok"]]
+    if not ok_workers:
+        report["verdict"] = "FAIL"
+        report["reason"] = f"all {role_name} workers failed (see workers[])"
+        return report
+
+    # 3. Head/Lead of the role reviews + merges every submission.
+    bundle = "\n\n".join(
+        f"### {r['worker']} — slice: {r['subtask']}\n{str(r['output'])[:6000]}" for r in results)
+    merged = await call_llm_failover(
+        head_sys,
+        f"Original task: {task}\n\nWorker submissions (parallel):\n\n{bundle}\n\n"
+        "Produce the final merged, reviewed deliverable.",
+        max_tokens=DEEPSEEK_V4_MAX_TOKENS)
+    merge_ok = not str(merged).startswith("[All LLM providers failed")
+    report["workers_succeeded"] = len(ok_workers)
+    report["workers_total"] = len(results)
+    report["verdict"] = "PASS" if merge_ok else "FAIL"
+    report["final"] = merged
+    return report
+
+
+class ParallelTeamTool(MCPTool):
+    """Run a big task with multiple workers of ANY agent role IN PARALLEL, then a
+    Head/Lead of that role reviews and merges their work into one finalized result."""
+
+    def __init__(self):
+        super().__init__("parallel_team",
+            "Run a BIG / multi-part task with multiple workers of ANY role IN PARALLEL (fast, no slow nested "
+            "agent loops), then a Head/Lead of that role reviews and MERGES all their work into one finalized "
+            "deliverable. Works for any agent role (Software Engineer, Data Analyst, QA/Test Agent, Research, "
+            "Cybersecurity, Documentation, ...). Use instead of dispatching one agent for large/multi-part work. "
+            "params: role (agent/role name, default 'Software Engineer'); task (required); parts (optional: "
+            "integer worker count 2-6, OR a list of subtask strings); project (optional context).",
+            risk_level="medium")
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        task = (params.get("task") or "").strip()
+        if not task:
+            return json.dumps({"ok": False, "error": "task is required", "verdict": "FAIL"})
+        role = (params.get("role") or params.get("agent") or "Software Engineer").strip()
+        project = (params.get("project") or "").strip()
+        report = await _run_parallel_team(role, task, params.get("parts"), project)
+        return json.dumps(report, indent=2)
+
+
+class ParallelEngineeringTool(MCPTool):
+    """Back-compat alias: parallel_engineering == parallel_team with role=Software Engineer."""
+
+    def __init__(self):
+        super().__init__("parallel_engineering",
+            "Run a BIG / multi-part coding task with multiple Software Engineer workers IN PARALLEL, then a "
+            "Head of Software Engineering reviews and merges all their work into one finalized result. "
+            "(Alias of parallel_team with role='Software Engineer'.) "
+            "params: task (required); parts (optional integer 2-6 or list of subtasks); project (optional).",
+            risk_level="medium")
+
+    async def run(self, params: Dict[str, Any]) -> str:
+        task = (params.get("task") or "").strip()
+        if not task:
+            return json.dumps({"ok": False, "error": "task is required", "verdict": "FAIL"})
+        report = await _run_parallel_team("Software Engineer", task, params.get("parts"),
+                                          (params.get("project") or "").strip())
+        return json.dumps(report, indent=2)
+
+
 WORKSPACE_DIR = Path("/root/jaxvora-ai/workspace")
 
 
@@ -2542,11 +2703,15 @@ class BaseAgent:
     description: str = ""
     _status: str = "idle"
     _current_task: str = ""
+    force_prefer: Optional[str] = None  # pin this agent to a provider (e.g. Chief -> groq)
 
     async def call_llm(self, system: str, user: str) -> str:
-        # Every agent runs through the multi-provider failover chain. When Zen is
-        # primary it leads; otherwise the agent's own model is tried first. If any
-        # provider is down/rate-limited, the call automatically shifts to the next.
+        # Every agent runs through the multi-provider failover chain. An agent can
+        # pin a provider via force_prefer (used to keep the Chief on fast Groq);
+        # otherwise Zen leads when primary, else the agent's own model. Any failure
+        # shifts to the next provider automatically.
+        if self.force_prefer:
+            return await call_llm_failover(system, user, prefer=self.force_prefer)
         prefer = {"groq": "groq", "deepseek_v4": "deepseek_v4"}.get(self.model, "openrouter")
         return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else prefer)
 
@@ -3042,12 +3207,14 @@ Rules:
 class ToolCallingAgent(BaseAgent):
     """Agent that uses the TAOR loop with tool access (v1.0)."""
 
-    def __init__(self, name: str, model: str, division: str, description: str, system_prompt: str):
+    def __init__(self, name: str, model: str, division: str, description: str, system_prompt: str,
+                 force_prefer: Optional[str] = None):
         self.name = name
         self.model = model
         self.division = division
         self.description = description
         self._system = system_prompt
+        self.force_prefer = force_prefer
         self._state: Optional[AgentGraphState] = None
 
     def _system_prompt(self) -> str:
@@ -3415,7 +3582,19 @@ FAST PROJECT RUNNER: If the project is already built and just needs to be starte
 use the direct endpoint POST /run/{name} (no need for full agent dispatch):
   curl -sS -X POST http://127.0.0.1:8090/run/jax-todolist
 This builds (if needed), starts via screen, registers in the app proxy, and returns the URL.
-The app is then accessible at /apps/{name}/.
+The app is then accessible at /apps/{name}/. To just run/preview an existing project, call this
+runner directly — do NOT dispatch Software Engineer (a single dispatch runs a slow nested loop and
+can time out).
+
+BIG / MULTI-PART CODING TASKS — use parallel workers, don't make one engineer do it all serially.
+Call the parallel_engineering MCP tool: it splits the task into independent slices, runs several
+Software Engineer workers IN PARALLEL (they don't wait on each other), then a Head of Software
+Engineering reviews and MERGES all their work into one finalized deliverable you can hand to other
+agents. Prefer this over dispatching Software Engineer directly for anything large or multi-file:
+<mcp_call tool="parallel_engineering" subtask_id="1">
+  <parameter name="task">Build a full REST todo API in Go with handlers, storage, and a static frontend</parameter>
+  <parameter name="parts">3</parameter>
+</mcp_call>
 
 RUNNING A SERVER (after building / manual method):
 1. Kill any previous instance: `screen -S <name> -X quit 2>/dev/null`
@@ -3830,7 +4009,7 @@ Parallel agent briefs:
 {briefs}
 
 Write one polished final answer. Do not dump raw traces. Mention the agents that contributed only when useful."""
-        response = await call_groq(
+        response = await call_orchestrator_llm(
             "You are Jaxvora's Chief Orchestrator. Synthesize parallel department work into a concise, decisive company response.",
             synthesis_prompt,
         )
@@ -3937,7 +4116,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         if len(raw) < 10 or raw.startswith("__CONFIRM_"):
             return raw
         try:
-            enhanced = await call_groq(
+            enhanced = await call_orchestrator_llm(
                 "You reformat user input for an AI command center. Fix typos, clarify intent, "
                 "extract the core request concisely. Preserve all code snippets, URLs, and commands "
                 "verbatim. Output ONLY the enhanced version — no preamble, no meta-commentary.",
@@ -3970,6 +4149,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                                 division="Executive",
                                 description="Chief Orchestrator coordinating all agents",
                                 system_prompt=self.SYSTEM,
+                                force_prefer=ORCHESTRATOR_PROVIDER,
                             ),
                             user_input, max_iterations=8, state=state,
                             pending_states=self._pending_states,
@@ -4025,6 +4205,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                     division="Executive",
                     description="Chief Orchestrator coordinating all agents",
                     system_prompt=self.SYSTEM,
+                    force_prefer=ORCHESTRATOR_PROVIDER,
                 ),
                 _enhanced_input, max_iterations=8,
                 state=_taor_state,
@@ -4374,6 +4555,12 @@ class TaskClearRequest(BaseModel):
     # 'finished' (completed+failed+cancelled) | 'all'
     scope: Optional[str] = "finished"
 
+class TeamRunRequest(BaseModel):
+    task: str
+    role: Optional[str] = "Software Engineer"
+    parts: Optional[Any] = None   # int worker count (2-6) OR a list of subtask strings
+    project: Optional[str] = ""
+
 class SecurityScanRequest(BaseModel):
     content: str
 
@@ -4695,6 +4882,20 @@ async def run_project(name: str):
         status = 200 if report.get("verdict") == "PASS" else 400
         return JSONResponse(content=report, status_code=status)
     return JSONResponse(content=result, status_code=400)
+
+
+@app.post("/team")
+async def team_run(req: TeamRunRequest):
+    """Direct, reliable parallel-team run for ANY role (bypasses the Chief loop):
+    splits the task into slices, runs workers of `role` in parallel, then a
+    Head/Lead of that role reviews + merges. Returns the structured report."""
+    task = (req.task or "").strip()
+    if not task:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "task is required", "verdict": "FAIL"})
+    report = await _run_parallel_team((req.role or "Software Engineer").strip(), task,
+                                      req.parts, (req.project or "").strip())
+    status = 200 if report.get("verdict") == "PASS" else 400
+    return JSONResponse(content=report, status_code=status)
 
 
 # ── Async chat jobs ───────────────────────────────────────────────────────────
@@ -5821,6 +6022,8 @@ async def startup():
     tool_registry.register(PlaywrightTool())
     tool_registry.register(FrontendPreviewTool())
     tool_registry.register(ServerRunnerTool())
+    tool_registry.register(ParallelTeamTool())
+    tool_registry.register(ParallelEngineeringTool())
 
     logger.info(f"✓ {len(AGENT_REGISTRY)} agents registered")
     logger.info(f"✓ {len(tool_registry._tools)} MCP tools registered")

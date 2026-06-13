@@ -33,6 +33,7 @@
     { "source": "/todolist/:path*", "destination": "http://172.105.41.151:8090/todolist/:path*" },
     { "source": "/todolist", "destination": "http://172.105.41.151:8090/todolist" },
     { "source": "/run/:path*", "destination": "http://172.105.41.151:8090/run/:path*" },
+    { "source": "/team", "destination": "http://172.105.41.151:8090/team" },
     { "source": "/apps", "destination": "http://172.105.41.151:8090/apps" },
     { "source": "/apps/:path/", "destination": "http://172.105.41.151:8090/apps/:path/" },
     { "source": "/apps/:path*", "destination": "http://172.105.41.151:8090/apps/:path*" },
