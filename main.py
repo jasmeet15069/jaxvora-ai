@@ -212,14 +212,20 @@ _PROVIDERS: Dict[str, Dict[str, Any]] = {
 
 
 def _build_provider_chain(prefer: Optional[str] = None) -> List[str]:
-    """Ordered list of provider names to try. Zen leads when it is primary;
-    `prefer` (an agent's own model) is moved to the front; configured-but-not-
-    cooled providers come first, with cooled ones kept only as a last resort."""
-    if OPENCODE_ZEN_PRIMARY:
+    """Ordered list of provider names to try. `LLM_PROVIDER_ORDER` (comma-separated)
+    pins the chain — set it to e.g. "zen,groq" to use OpenCode Zen instead of
+    OpenRouter. Otherwise Zen leads when primary; `prefer` (an agent's own model) is
+    moved to the front; configured-but-not-cooled providers come first."""
+    env_order = (os.environ.get("LLM_PROVIDER_ORDER", "") or "").strip()
+    if env_order:
+        order = [p.strip() for p in env_order.split(",") if p.strip() in _PROVIDERS]
+    elif OPENCODE_ZEN_PRIMARY:
         order = ["zen", "groq", "deepseek_v4", "openrouter"]
     else:
         order = ["groq", "deepseek_v4", "openrouter", "zen"]
-    if prefer in _PROVIDERS:
+    if not order:
+        order = ["zen", "groq"]
+    if prefer in _PROVIDERS and prefer in order:
         order = [prefer] + [p for p in order if p != prefer]
     enabled = [n for n in order if _PROVIDERS[n]["enabled"]()]
     now = time.time()
