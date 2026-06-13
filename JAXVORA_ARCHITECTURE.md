@@ -1,3 +1,7 @@
+# Jaxvora — System Architecture
+
+> **All 22 agents default to North Mini Code Free via OpenCode Zen (`north-mini-code-free`).** The Chief Orchestrator runs Groq-first for low latency; Groq and OpenRouter (DeepSeek) remain in the failover chain.
+
 ```mermaid
 %%{init: {"flowchart": {"htmlLabels": true, "curve": "basis"}, "theme": "dark", "themeVariables": {"primaryColor": "#1a1b26", "primaryTextColor": "#a9b1d6", "primaryBorderColor": "#565f89", "lineColor": "#7aa2f7", "tertiaryColor": "#24283b", "fontSize": "12px"}}}%%
 flowchart TB
@@ -17,7 +21,7 @@ flowchart TB
         VERCEL["Vercel Edge\nRewrites all /api/*\nto VM:8090"]
     end
 
-    subgraph Backend["Backend — VM (172.105.41.51:8090)\nUbuntu 24.04 · Linode 4GB"]
+    subgraph Backend["Backend — VM (172.105.41.151:8090)\nUbuntu 24.04 · Linode 4GB"]
         direction TB
         FASTAPI["⚡ FastAPI + Uvicorn\nmain.py / server/main.py"]
 
@@ -38,14 +42,14 @@ flowchart TB
         end
 
         subgraph Agents["22 Specialist Agents"]
-            AI_Eng["👨‍💻 AI Engineer\n(deepseek_v4)"]
-            SW_Eng["👩‍💻 Software Engineer\n(deepseek_v4)"]
-            Debug["🐛 Debug Agent\n(deepseek_v4)"]
-            Arch["🏗️ Architecture Agent\n(deepseek_v4)"]
-            Cyber["🛡️ Cybersecurity\n(deepseek_v4)"]
-            ML["📊 ML Engineer\n(deepseek_v4)"]
-            QA["✅ QA/Test Agent\n(deepseek)"]
-            Others["📋 15 Other Agents\n(deepseek / groq)"]
+            AI_Eng["👨‍💻 AI Engineer\n(north-mini-code-free)"]
+            SW_Eng["👩‍💻 Software Engineer\n(north-mini-code-free)"]
+            Debug["🐛 Debug Agent\n(north-mini-code-free)"]
+            Arch["🏗️ Architecture Agent\n(north-mini-code-free)"]
+            Cyber["🛡️ Cybersecurity\n(north-mini-code-free)"]
+            ML["📊 ML Engineer\n(north-mini-code-free)"]
+            QA["✅ QA/Test Agent\n(north-mini-code-free)"]
+            Others["📋 15 Other Agents\n(north-mini-code-free)"]
         end
 
         subgraph ToolRegistry["MCP Tool Registry"]
@@ -69,8 +73,9 @@ flowchart TB
         end
 
         subgraph Integrations["External Integrations"]
-            Groq["Groq API\nllama-3.3-70b-versatile"]
-            OpenRouter["OpenRouter\ndeepseek/deepseek-chat-v3-0324\ndeepseek/deepseek-v4-flash:free"]
+            Zen["OpenCode Zen 🏁\nnorth-mini-code-free\nPRIMARY brain — all agents"]
+            Groq["Groq API\nllama-3.3-70b-versatile\nOrchestrator-first + failover"]
+            OpenRouter["OpenRouter\nDeepSeek (failover)"]
             GoogleAI["Google Generative AI"]
             GmailAPI["Gmail API / SMTP\njaxvora@gmail.com"]
             DDG["DuckDuckGo\nLite Search (no API key)"]
@@ -118,8 +123,9 @@ flowchart TB
     Decider --> Agents
 
     Agents <--> ToolRegistry
-    Agents --> Groq
-    Agents --> OpenRouter
+    Agents --> Zen
+    ChiefOrchestrator --> Groq
+    Zen -.->|failover| Groq -.->|failover| OpenRouter
     Agents --> GoogleAI
 
     WebSearchTool --> DDG
@@ -145,7 +151,7 @@ flowchart TB
     classDef db fill:#1a1b26,stroke:#e0af68,stroke-width:1.5px
     classDef frontend fill:#1a1b26,stroke:#bb9af7,stroke-width:1.5px
     class FASTAPI,ChiefOrchestrator,Agents,ToolRegistry,RAGEngine,API vm
-    class Groq,OpenRouter,GoogleAI,GmailAPI,DDG external
+    class Zen,Groq,OpenRouter,GoogleAI,GmailAPI,DDG external
     class Projects,Tasks,Logs,Audit,AgentHistory,KnowledgeBase,AppSettings,RagDocuments db
     class Browser,CLI,HTML,JS,WS_FE,VERCEL frontend
 ```

@@ -1,3 +1,7 @@
+# Jaxvora — Agent Graph
+
+> **All agents default to North Mini Code Free via OpenCode Zen (`north-mini-code-free`).** The Chief Orchestrator runs Groq-first for low latency; Groq and OpenRouter (DeepSeek) remain in the failover chain.
+
 ```mermaid
 %%{init: {"flowchart": {"htmlLabels": true, "curve": "basis"}, "theme": "dark", "themeVariables": {"primaryColor": "#1a1b26", "primaryTextColor": "#a9b1d6", "primaryBorderColor": "#565f89", "lineColor": "#7aa2f7", "tertiaryColor": "#24283b"}}}%%
 flowchart TB
@@ -31,61 +35,61 @@ flowchart TB
 
         subgraph ENG["🟢 Engineering · 10 agents"]
             direction LR
-            AIEng["AI Engineer\n⚡ deepseek_v4"]
-            SWEng["Software Engineer\n⚡ deepseek_v4"]
-            Debug["Debug Agent\n⚡ deepseek_v4"]
-            QA["QA/Test Agent\n💠 deepseek"]
-            CR["Code Review\n🔵 groq"]
-            Arch["Architecture\n⚡ deepseek_v4\n🏁 Division Lead"]
-            DB["Database\n💠 deepseek"]
-            DevOps["DevOps\n💠 deepseek"]
-            BE["Backend Engineer\n💠 deepseek"]
-            FE["Frontend Engineer\n💠 deepseek"]
+            AIEng["AI Engineer\n⚡ north-mini-code-free"]
+            SWEng["Software Engineer\n⚡ north-mini-code-free"]
+            Debug["Debug Agent\n⚡ north-mini-code-free"]
+            QA["QA/Test Agent\n💠 north-mini-code-free"]
+            CR["Code Review\n🔵 north-mini-code-free"]
+            Arch["Architecture\n⚡ north-mini-code-free\n🏁 Division Lead"]
+            DB["Database\n💠 north-mini-code-free"]
+            DevOps["DevOps\n💠 north-mini-code-free"]
+            BE["Backend Engineer\n💠 north-mini-code-free"]
+            FE["Frontend Engineer\n💠 north-mini-code-free"]
         end
 
         subgraph SEC["🔴 Security · 6 agents"]
             direction LR
-            Cyber["Cybersecurity\n⚡ deepseek_v4\n🏁 Division Lead"]
-            Red["Red Team\n💠 deepseek"]
-            Compl["Compliance\n💠 deepseek"]
-            Vuln["Vulnerability Scanner\n💠 deepseek"]
-            IAM["Auth & IAM Agent\n💠 deepseek"]
-            NetSec["Network Security\n💠 deepseek"]
+            Cyber["Cybersecurity\n⚡ north-mini-code-free\n🏁 Division Lead"]
+            Red["Red Team\n💠 north-mini-code-free"]
+            Compl["Compliance\n💠 north-mini-code-free"]
+            Vuln["Vulnerability Scanner\n💠 north-mini-code-free"]
+            IAM["Auth & IAM Agent\n💠 north-mini-code-free"]
+            NetSec["Network Security\n💠 north-mini-code-free"]
         end
 
         subgraph DATA["🟡 Data · 6 agents"]
             direction LR
-            DA["Data Analyst\n💠 deepseek"]
-            BI["BI Agent\n💠 deepseek"]
-            DE["Data Engineer\n💠 deepseek\n🏁 Division Lead"]
-            ML["ML Engineer\n⚡ deepseek_v4"]
-            ETL["ETL Engineer\n💠 deepseek"]
-            RAG["RAG Specialist\n⚡ deepseek_v4"]
+            DA["Data Analyst\n💠 north-mini-code-free"]
+            BI["BI Agent\n💠 north-mini-code-free"]
+            DE["Data Engineer\n💠 north-mini-code-free\n🏁 Division Lead"]
+            ML["ML Engineer\n⚡ north-mini-code-free"]
+            ETL["ETL Engineer\n💠 north-mini-code-free"]
+            RAG["RAG Specialist\n⚡ north-mini-code-free"]
         end
 
         subgraph CAREER["🟣 Career · 5 agents"]
             direction LR
-            Resume["Resume Agent\n💠 deepseek"]
-            IC["Interview Coach\n💠 deepseek"]
-            CC["Career Coach\n💠 deepseek\n🏁 Division Lead"]
-            JobSearch["Job Search Agent\n💠 deepseek"]
-            AppTracker["Application Tracker\n💠 deepseek"]
+            Resume["Resume Agent\n💠 north-mini-code-free"]
+            IC["Interview Coach\n💠 north-mini-code-free"]
+            CC["Career Coach\n💠 north-mini-code-free\n🏁 Division Lead"]
+            JobSearch["Job Search Agent\n💠 north-mini-code-free"]
+            AppTracker["Application Tracker\n💠 north-mini-code-free"]
         end
 
         subgraph PROD["🟠 Product · 5 agents"]
             direction LR
-            PM["Product Manager\n💠 deepseek\n🏁 Division Lead"]
-            Docs["Documentation\n💠 deepseek"]
-            Research["Research\n💠 deepseek"]
-            UX["UX Designer\n💠 deepseek"]
-            ReqAnalyst["Requirements Analyst\n💠 deepseek"]
+            PM["Product Manager\n💠 north-mini-code-free\n🏁 Division Lead"]
+            Docs["Documentation\n💠 north-mini-code-free"]
+            Research["Research\n💠 north-mini-code-free"]
+            UX["UX Designer\n💠 north-mini-code-free"]
+            ReqAnalyst["Requirements Analyst\n💠 north-mini-code-free"]
         end
 
         subgraph EXEC["⚪ Executive · 4 agents"]
-            PI["Project Intelligence\n🔵 groq"]
-            Doctor["Jaxvora Doctor\n⚡ deepseek_v4"]
-            Strategy["Strategy Agent\n⚡ deepseek_v4"]
-            RiskPlan["Risk & Planning\n⚡ deepseek_v4\n🏁 Division Lead"]
+            PI["Project Intelligence\n🔵 north-mini-code-free"]
+            Doctor["Jaxvora Doctor\n⚡ north-mini-code-free"]
+            Strategy["Strategy Agent\n⚡ north-mini-code-free"]
+            RiskPlan["Risk & Planning\n⚡ north-mini-code-free\n🏁 Division Lead"]
         end
     end
 
@@ -115,9 +119,10 @@ flowchart TB
     end
 
     subgraph LLM["LLM Providers"]
-        GROQ["Groq\nllama-3.3-70b"]
-        OR_V3["OpenRouter\nDeepSeek V3"]
-        OR_V4["OpenRouter\nDeepSeek V4 Flash Free"]
+        ZEN["OpenCode Zen\nnorth-mini-code-free\n🏁 PRIMARY — all agents"]
+        GROQ["Groq\nllama-3.3-70b\nOrchestrator-first + failover"]
+        OR_V4["OpenRouter\nDeepSeek (failover)"]
+        OR_V3["OpenRouter\nDeepSeek V3 (failover)"]
     end
 
     subgraph External["External"]
@@ -164,11 +169,13 @@ flowchart TB
     GMAIL --> GMAIL_API
     SSH --> SSH_VM
 
-    %% LLM routing
-    AIEng & SWEng & Debug & Arch & Cyber & ML & RAG & Doctor & Strategy & RiskPlan --> OR_V4
-    QA & DB & DevOps & Red & Compl & DA & BI & DE & ETL & Resume & IC & CC & JobSearch & AppTracker --> OR_V3
-    BE & FE & Vuln & IAM & NetSec & UX & ReqAnalyst --> OR_V3
-    CR & PI & ChiefOrchestrator --> GROQ
+    %% LLM routing — all agents default to OpenCode Zen (north-mini-code-free); orchestrator is Groq-first
+    AIEng & SWEng & Debug & Arch & Cyber & ML & RAG & Doctor & Strategy & RiskPlan --> ZEN
+    QA & DB & DevOps & Red & Compl & DA & BI & DE & ETL & Resume & IC & CC & JobSearch & AppTracker --> ZEN
+    BE & FE & Vuln & IAM & NetSec & UX & ReqAnalyst --> ZEN
+    CR & PI --> ZEN
+    ChiefOrchestrator --> GROQ
+    ZEN -.->|failover| GROQ -.->|failover| OR_V4 -.->|failover| OR_V3
 
     %% RAG augmentation
     Loop --> RAG
@@ -203,7 +210,7 @@ flowchart TB
     class PM,Docs,Research,UX,ReqAnalyst prod
     class PI,Doctor,Strategy,RiskPlan exec
     class FS,TERM,PG,BR,SECTOOL,CODE,EMAIL,GMAIL,SSH,WEB,INVOKE,SOCIAL,CRUNNER,PW,FPREV,SRUNNER tool
-    class GROQ,OR_V3,OR_V4 llm
+    class ZEN,GROQ,OR_V3,OR_V4 llm
     class EMB,CHUNK,HYBRID,RAG rag
     class TASKS,AUDIT,AGENT_HIST,KB,RAG_DOCS,SESSIONS,SUBTASK_LOG,OP_LOG,SSH_AUDIT db
 ```
