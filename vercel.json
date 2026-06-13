@@ -9,6 +9,7 @@
     { "source": "/agents", "destination": "http://172.105.41.151:8090/agents" },
     { "source": "/organization", "destination": "http://172.105.41.151:8090/organization" },
     { "source": "/tasks", "destination": "http://172.105.41.151:8090/tasks" },
+    { "source": "/tasks/:path*", "destination": "http://172.105.41.151:8090/tasks/:path*" },
     { "source": "/projects", "destination": "http://172.105.41.151:8090/projects" },
     { "source": "/logs", "destination": "http://172.105.41.151:8090/logs" },
     { "source": "/analytics", "destination": "http://172.105.41.151:8090/analytics" },

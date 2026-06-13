@@ -577,8 +577,25 @@ body.chat-view #content { overflow: hidden; }
 .completed-badge { background: rgba(108,99,255,0.2); color: var(--violet2); }
 .task-card {
   background: rgba(0,0,0,0.2); border: 1px solid var(--border);
-  border-radius: 8px; padding: 10px; margin-bottom: 8px;
+  border-radius: 8px; padding: 10px; margin-bottom: 8px; position: relative;
 }
+.task-card-actions { position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; }
+.task-act { width: 20px; height: 20px; line-height: 1; padding: 0; border-radius: 5px;
+  border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: var(--text3);
+  cursor: pointer; font-size: 11px; font-family: var(--mono); display: flex; align-items: center; justify-content: center; }
+.task-act:hover { color: #fff; }
+.task-act.stop:hover { background: var(--red); border-color: var(--red); }
+.task-act.del:hover { background: var(--text3); border-color: var(--text3); }
+.task-col-clear { background: none; border: none; color: var(--text3); cursor: pointer;
+  font-size: 10px; font-family: var(--mono); text-decoration: underline; padding: 0; }
+.task-col-clear:hover { color: var(--red); }
+.toast-host { position: fixed; bottom: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+.toast { padding: 10px 14px; border-radius: 8px; font-size: 12px; font-family: var(--mono);
+  background: var(--card2, #1a1a24); border: 1px solid var(--border); color: var(--text);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4); opacity: 0; transform: translateY(8px); transition: all .2s; }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.success { border-color: var(--teal); }
+.toast.error { border-color: var(--red); }
 .task-agent { font-size: 11px; font-weight: 600; color: var(--violet2); font-family: var(--mono); }
 .task-desc { font-size: 11px; color: var(--text); margin-top: 4px; line-height: 1.4; }
 .task-time { font-size: 10px; color: var(--text3); margin-top: 6px; font-family: var(--mono); }
@@ -968,19 +985,32 @@ body.chat-view #content { overflow: hidden; }
           <div class="section-title">Task Queue</div>
           <div class="section-sub">Pending / Running / Completed</div>
         </div>
-        <button class="btn btn-teal btn-sm" onclick="loadTasks()">↻ Refresh</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-teal btn-sm" onclick="loadTasks()">↻ Refresh</button>
+          <button class="btn btn-sm" style="background:var(--red);color:#fff" onclick="stopAllTasks()" title="Cancel all running and pending tasks">■ Stop all</button>
+          <button class="btn btn-sm" onclick="clearTasks('all')" title="Delete every task from the queue">🗑 Clear all</button>
+        </div>
       </div>
       <div class="task-columns">
         <div class="task-col">
-          <div class="task-col-header"><span class="task-col-badge pending-badge" id="pending-col-count">0</span>Pending</div>
+          <div class="task-col-header" style="display:flex;align-items:center;justify-content:space-between">
+            <span><span class="task-col-badge pending-badge" id="pending-col-count">0</span>Pending</span>
+            <button class="task-col-clear" onclick="clearTasks('pending')" title="Clear pending tasks">clear</button>
+          </div>
           <div id="tasks-pending"></div>
         </div>
         <div class="task-col">
-          <div class="task-col-header"><span class="task-col-badge running-badge" id="running-col-count">0</span>Running</div>
+          <div class="task-col-header" style="display:flex;align-items:center;justify-content:space-between">
+            <span><span class="task-col-badge running-badge" id="running-col-count">0</span>Running</span>
+            <button class="task-col-clear" onclick="clearTasks('running')" title="Stop &amp; clear running tasks">stop</button>
+          </div>
           <div id="tasks-running"></div>
         </div>
         <div class="task-col">
-          <div class="task-col-header"><span class="task-col-badge completed-badge" id="completed-col-count">0</span>Completed</div>
+          <div class="task-col-header" style="display:flex;align-items:center;justify-content:space-between">
+            <span><span class="task-col-badge completed-badge" id="completed-col-count">0</span>Completed</span>
+            <button class="task-col-clear" onclick="clearTasks('finished')" title="Clear completed/failed tasks">clear</button>
+          </div>
           <div id="tasks-completed"></div>
         </div>
       </div>
@@ -1973,17 +2003,51 @@ function renderTasks(tasks) {
 function renderTaskCol(id, tasks) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.innerHTML = tasks.length ? tasks.map(t => `
+  el.innerHTML = tasks.length ? tasks.map(t => {
+    const stoppable = t.status === 'running' || t.status === 'pending';
+    return `
     <div class="task-card">
-      <div class="task-agent">${t.agent_name}</div>
+      <div class="task-card-actions">
+        ${stoppable ? `<button class="task-act stop" title="Stop this task" onclick="stopTask('${t.id}')">■</button>` : ''}
+        <button class="task-act del" title="Delete this task" onclick="deleteTask('${t.id}')">✕</button>
+      </div>
+      <div class="task-agent">${escHtml(t.agent_name || '')}</div>
       <div class="task-desc">${escHtml((t.input || '').slice(0, 80))}</div>
       <div class="task-time">${fmtDate(t.created_at)}</div>
-      ${id === 'tasks-completed' ? `<div class="outcome-badge ${t.status === 'completed' ? 'success' : 'failed'}">${t.status === 'completed' ? '✓ success' : '✗ failed'}</div>` : ''}
-    </div>`).join('') : '<div class="empty-state" style="padding:20px 0"><div>No tasks</div></div>';
+      ${id === 'tasks-completed' ? `<div class="outcome-badge ${t.status === 'completed' ? 'success' : 'failed'}">${t.status === 'completed' ? '✓ success' : (t.status === 'cancelled' ? '■ cancelled' : '✗ failed')}</div>` : ''}
+    </div>`; }).join('') : '<div class="empty-state" style="padding:20px 0"><div>No tasks</div></div>';
 }
 
 function loadTasks() {
   fetch('/tasks').then(r => r.json()).then(renderTasks).catch(console.error);
+}
+
+async function _taskAction(url, opts, okMsg) {
+  try {
+    const r = await fetch(url, opts);
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) { toast((d && d.error) ? d.error : 'Action failed', 'error'); }
+    else if (okMsg) { toast(typeof okMsg === 'function' ? okMsg(d) : okMsg, 'success'); }
+  } catch (e) { toast('Network error: ' + e, 'error'); }
+  loadTasks();
+}
+
+function stopTask(id) {
+  _taskAction('/tasks/' + encodeURIComponent(id) + '/stop', { method: 'POST' }, 'Task stopped');
+}
+function deleteTask(id) {
+  _taskAction('/tasks/' + encodeURIComponent(id), { method: 'DELETE' }, 'Task deleted');
+}
+function stopAllTasks() {
+  if (!confirm('Cancel ALL running and pending tasks?')) return;
+  _taskAction('/tasks/stop-all', { method: 'POST' }, d => `Stopped ${d.cancelled || 0} task(s)`);
+}
+function clearTasks(scope) {
+  const labels = { all: 'ALL tasks', finished: 'completed/failed tasks', pending: 'pending tasks', running: 'running tasks' };
+  if (!confirm('Clear ' + (labels[scope] || scope) + '?')) return;
+  _taskAction('/tasks/clear', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope })
+  }, d => `Cleared ${d.deleted || 0} task(s)`);
 }
 
 // ── Analytics ─────────────────────────────────────────────────────────────
@@ -2385,6 +2449,16 @@ async function searchKB() {
 // ── Helpers ────────────────────────────────────────────────────────────────
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function toast(msg, kind) {
+  let host = document.getElementById('toast-host');
+  if (!host) { host = document.createElement('div'); host.id = 'toast-host'; host.className = 'toast-host'; document.body.appendChild(host); }
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind || '');
+  el.textContent = msg;
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 250); }, 3000);
 }
 function fmtDate(ts) {
   if (!ts) return '';

@@ -4369,6 +4369,11 @@ class MemorySearch(BaseModel):
     collection: Optional[str] = None
     limit: Optional[int] = 5
 
+class TaskClearRequest(BaseModel):
+    # 'completed' | 'failed' | 'cancelled' | 'pending' | 'running' |
+    # 'finished' (completed+failed+cancelled) | 'all'
+    scope: Optional[str] = "finished"
+
 class SecurityScanRequest(BaseModel):
     content: str
 
@@ -4814,6 +4819,106 @@ async def list_tasks(status: Optional[str] = None, agent: Optional[str] = None, 
     return [dict(r) for r in rows]
 
 
+def _rowcount(tag: Optional[str]) -> int:
+    """Parse the affected-row count from an asyncpg command tag (e.g. 'DELETE 5')."""
+    try:
+        return int(str(tag).strip().split()[-1])
+    except Exception:
+        return 0
+
+
+def _valid_task_id(task_id: str) -> bool:
+    """tasks.id is a UUID; reject malformed ids up front so we return a clean 404
+    instead of a 500 from asyncpg."""
+    try:
+        uuid.UUID(str(task_id))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _signal_runtime_stop() -> Dict[str, int]:
+    """Best-effort: flip running agents to idle and cancel active chat jobs so an
+    in-flight TAOR loop actually winds down (the loop checks its cancel_flag)."""
+    agents = 0
+    for a in AGENT_REGISTRY.values():
+        if a._status == "running":
+            a._status = "idle"
+            a._current_task = ""
+            agents += 1
+    jobs = 0
+    for job in CHAT_JOBS.values():
+        if job.get("status") == "running":
+            job["cancel"] = True
+            job["status"] = "cancelled"
+            job["response"] = "Cancelled by user."
+            jobs += 1
+    return {"agents_signaled": agents, "chat_jobs_signaled": jobs}
+
+
+@app.post("/tasks/{task_id}/stop")
+async def stop_task(task_id: str):
+    """Stop a single running/pending task: mark it 'cancelled' and signal the
+    runtime to wind down. No fake success — reports what actually changed."""
+    if db_pool is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "no database"})
+    if not _valid_task_id(task_id):
+        return JSONResponse(status_code=404, content={"ok": False, "error": "task not found"})
+    row = await db_fetchrow("SELECT id, status FROM tasks WHERE id=$1", task_id)
+    if row is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "task not found"})
+    if row["status"] not in ("running", "pending"):
+        return {"ok": False, "error": f"task is '{row['status']}', not running/pending", "status": row["status"]}
+    await db_execute(
+        "UPDATE tasks SET status='cancelled', completed_at=NOW(), "
+        "output=COALESCE(output, '') || '\n[stopped by user]' WHERE id=$1", task_id)
+    runtime = _signal_runtime_stop()
+    return {"ok": True, "task_id": task_id, "new_status": "cancelled", **runtime}
+
+
+@app.post("/tasks/stop-all")
+async def stop_all_tasks():
+    """Cancel ALL running + pending tasks and signal the runtime to stop."""
+    if db_pool is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "no database"})
+    tag = await db_execute(
+        "UPDATE tasks SET status='cancelled', completed_at=NOW() WHERE status IN ('running','pending')")
+    runtime = _signal_runtime_stop()
+    return {"ok": True, "cancelled": _rowcount(tag), **runtime}
+
+
+@app.delete("/tasks/{task_id}")
+async def delete_task(task_id: str):
+    """Delete a single task row (any status)."""
+    if db_pool is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "no database"})
+    if not _valid_task_id(task_id):
+        return JSONResponse(status_code=404, content={"ok": False, "error": "task not found"})
+    tag = await db_execute("DELETE FROM tasks WHERE id=$1", task_id)
+    return {"ok": True, "task_id": task_id, "deleted": _rowcount(tag)}
+
+
+@app.post("/tasks/clear")
+async def clear_tasks(req: TaskClearRequest):
+    """Clear tasks by scope. Running/pending scopes (and 'all') also signal the
+    runtime to stop in-flight work before deleting the rows."""
+    if db_pool is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "no database"})
+    scope = (req.scope or "finished").lower().strip()
+    runtime: Dict[str, int] = {}
+    if scope == "all":
+        runtime = _signal_runtime_stop()
+        tag = await db_execute("DELETE FROM tasks")
+    elif scope == "finished":
+        tag = await db_execute("DELETE FROM tasks WHERE status IN ('completed','failed','cancelled')")
+    elif scope in ("running", "pending"):
+        runtime = _signal_runtime_stop()
+        tag = await db_execute("DELETE FROM tasks WHERE status=$1", scope)
+    elif scope in ("completed", "failed", "cancelled"):
+        tag = await db_execute("DELETE FROM tasks WHERE status=$1", scope)
+    else:
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"unknown scope '{scope}'"})
+    return {"ok": True, "scope": scope, "deleted": _rowcount(tag), **runtime}
 
 
 @app.get("/projects")
