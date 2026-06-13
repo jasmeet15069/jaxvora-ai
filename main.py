@@ -98,8 +98,28 @@ MAX_UPLOAD_TEXT_CHARS = 24000
 # explicit error, never a fabricated answer.
 
 PROVIDER_COOLDOWN_SECONDS = float(os.environ.get("LLM_PROVIDER_COOLDOWN", "45") or 45)
+# 429 recovers fast — bench briefly so we don't pile onto the other free providers.
+RATE_LIMIT_COOLDOWN_SECONDS = float(os.environ.get("LLM_RATE_LIMIT_COOLDOWN", "12") or 12)
+# 401/402/403 won't recover without a key/credits fix — bench long so the chain stops
+# wasting failover attempts on a permanently-broken provider.
+AUTH_COOLDOWN_SECONDS = float(os.environ.get("LLM_AUTH_COOLDOWN", "1800") or 1800)
 # name -> unix ts until which the provider is skipped after a failure.
 _PROVIDER_COOLDOWN: Dict[str, float] = {}
+
+# Cap simultaneous outbound LLM calls so the multi-agent / parallel-team bursts don't
+# trip free-tier rate limits (429). Tune with LLM_MAX_CONCURRENCY.
+LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "4") or 4)
+_llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+
+
+def _cooldown_for(msg: str) -> float:
+    """Pick a cooldown based on the failure: auth/payment = long, rate-limit = short."""
+    m = msg.lower()
+    if any(s in m for s in ("401", "402", "403", "unauthorized", "payment", "forbidden", "invalid api key")):
+        return AUTH_COOLDOWN_SECONDS
+    if "429" in m or "rate limit" in m or "too many requests" in m:
+        return RATE_LIMIT_COOLDOWN_SECONDS
+    return PROVIDER_COOLDOWN_SECONDS
 
 
 class _RetryableLLMError(Exception):
@@ -108,25 +128,31 @@ class _RetryableLLMError(Exception):
 
 async def _post_chat(url: str, headers: Dict[str, str], model: str,
                      system: str, user: str, max_tokens: int, timeout: float) -> str:
-    """One OpenAI-compatible chat call. Raises _RetryableLLMError on 429/timeout,
-    a plain Exception on any other failure; returns the message content on success."""
+    """One OpenAI-compatible chat call. Raises _RetryableLLMError on 429/5xx/timeout,
+    a plain Exception (with the HTTP status in the message) on any other failure;
+    returns the message content on success. Throttled by the global LLM semaphore so
+    bursts don't trip free-tier rate limits."""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(
-                url,
-                headers={"Content-Type": "application/json", **headers},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                },
-            )
+        async with _llm_semaphore:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    url,
+                    headers={"Content-Type": "application/json", **headers},
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                        "max_tokens": max_tokens,
+                    },
+                )
             if r.status_code == 429 or r.status_code >= 500:
                 raise _RetryableLLMError(f"HTTP {r.status_code}")
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # auth/payment/other client errors — non-retryable; keep the status code
+                # in the message so the failover can pick a long (auth) cooldown.
+                raise Exception(f"HTTP {r.status_code} {r.text[:120]}")
             content = (r.json()["choices"][0]["message"]["content"] or "").strip()
             if not content:
                 raise Exception("empty response")
@@ -243,9 +269,11 @@ async def call_llm_failover(system: str, user: str,
             await redis_cache.set("llm", cache_key, result)
             return result
         except Exception as e:
-            errors.append(f"{name}: {e}")
-            _PROVIDER_COOLDOWN[name] = time.time() + PROVIDER_COOLDOWN_SECONDS
-            logger.warning(f"LLM provider '{name}' failed ({e}) — shifting to next provider")
+            msg = str(e)
+            errors.append(f"{name}: {msg}")
+            cool = _cooldown_for(msg)
+            _PROVIDER_COOLDOWN[name] = time.time() + cool
+            logger.warning(f"LLM provider '{name}' failed ({msg}) — benched {int(cool)}s, shifting to next")
             continue
     logger.error(f"All LLM providers failed: {errors}")
     return f"[All LLM providers failed] {'; '.join(errors)[:400]}"
