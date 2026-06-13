@@ -3839,6 +3839,16 @@ def _alloc_port() -> int:
     return p
 
 
+async def _check_port(host: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        return True
+    except:
+        return False
+
+
 async def _proxy_to_app(request: Request, app_name: str, path: str):
     import httpx
     info = APP_REGISTRY.get(app_name)
@@ -3857,8 +3867,32 @@ async def _proxy_to_app(request: Request, app_name: str, path: str):
                 content=body if body else None,
             )
             return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+    except Exception:
+        # Port might have changed — scan 8080-8099 for the actual process
+        import socket
+        for scan_port in range(8080, 8100):
+            if scan_port == port:
+                continue
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                result = s.connect_ex(("127.0.0.1", scan_port))
+                s.close()
+                if result == 0:
+                    APP_REGISTRY[app_name]["port"] = scan_port
+                    new_target = f"http://127.0.0.1:{scan_port}/{path}" if path else f"http://127.0.0.1:{scan_port}"
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        resp = await client.request(
+                            method=request.method, url=new_target,
+                            headers=headers, content=body if body else None,
+                        )
+                        return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+            except:
+                continue
+        old_port = port
+        del APP_REGISTRY[app_name]
+        logger.warning(f"Auto-deregistered stale app '{app_name}' (port {old_port} not listening)")
+        return JSONResponse({"ok": False, "error": f"App '{app_name}' was registered on port {port} but nothing is listening there or on ports 8080-8099. Auto-deregistered."}, status_code=404)
 
 
 @app.post("/apps/register")
@@ -3870,8 +3904,11 @@ async def app_register(req: dict):
         return {"ok": False, "error": "name required"}
     if not port:
         port = _alloc_port()
+    if not await _check_port("127.0.0.1", port):
+        return {"ok": False, "error": f"Port {port} is not listening — start the app first, then register with the correct port"}
     info = {"name": name, "port": port, "directory": directory, "status": "running", "registered_at": datetime.now(timezone.utc).isoformat()}
     APP_REGISTRY[name] = info
+    logger.info(f"Registered app '{name}' on port {port}")
     return {"ok": True, "app": info}
 
 
