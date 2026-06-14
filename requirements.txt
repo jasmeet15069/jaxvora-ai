@@ -11,3 +11,4 @@ websockets==14.1
 pydantic-settings==2.7.0
 pydantic==2.10.4
 redis==5.2.1
+cryptography>=42.0.0

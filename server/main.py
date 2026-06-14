@@ -1634,6 +1634,143 @@ async def _run_parallel_team(role_name: str, task: str, parts: Any, project: str
     return report
 
 
+# === Career squad: end-to-end job-hunt workflow ==============================
+# Job Search Agent → Resume Agent (tailor) → Application Tracker (Playwright auto_fill)
+# → optional recruiter cold-email DRAFTS (never auto-sent). Every step is logged to
+# jaxvora_subtask_log so delegation is auditable. Count is bounded to keep volume sane.
+JOB_HUNT_MAX = 5
+
+
+async def _jobhunt_log(task_id: str, agent: str, subtask: str, status: str, output: str = "", error: str = ""):
+    if db_pool is None:
+        return
+    try:
+        await db_execute(
+            "INSERT INTO jaxvora_subtask_log (task_id, agent_name, subtask, status, output, error, completed_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6, CASE WHEN $4 IN ('done','error') THEN NOW() ELSE NULL END)",
+            task_id, agent[:120], subtask[:500], status, str(output)[:4000], str(error)[:1000])
+    except Exception as e:
+        logger.warning(f"jobhunt subtask log failed: {e}")
+
+
+async def _jobhunt_find_listings(query: str, location: str, count: int, task_id: str) -> List[Dict[str, Any]]:
+    """Job Search Agent: web_search → LLM-structured listings."""
+    search_q = f"{query} jobs {location} apply".strip()
+    await _jobhunt_log(task_id, "Job Search Agent", f"Search: {search_q}", "running")
+    try:
+        raw = await tool_registry.run("web_search", {"query": search_q, "max_results": max(count * 2, 8)})
+    except Exception as e:
+        await _jobhunt_log(task_id, "Job Search Agent", search_q, "error", error=str(e))
+        return []
+    structured = await call_llm_failover(
+        "You are the Job Search Agent. From raw web-search results, extract real job postings as a JSON "
+        "array. Each item: {\"title\", \"company\", \"url\", \"recruiter_email\" (or empty)}. Only include "
+        "items with a plausible application URL. Return ONLY the JSON array.",
+        f"Query: {query} in {location}\n\nRaw results:\n{raw}\n\nReturn up to {count} postings as a JSON array.")
+    listings: List[Dict[str, Any]] = []
+    m = re.search(r"\[.*\]", structured or "", re.DOTALL)
+    if m:
+        try:
+            for it in json.loads(m.group(0)):
+                if isinstance(it, dict) and it.get("url"):
+                    listings.append({
+                        "title": str(it.get("title", "")).strip(),
+                        "company": str(it.get("company", "")).strip(),
+                        "url": str(it["url"]).strip(),
+                        "recruiter_email": str(it.get("recruiter_email", "")).strip(),
+                    })
+        except Exception:
+            pass
+    listings = listings[:count]
+    await _jobhunt_log(task_id, "Job Search Agent", search_q, "done",
+                       output=json.dumps(listings))
+    return listings
+
+
+async def _run_job_hunt(query: str, location: str = "", count: int = 3, project: str = "",
+                        apply: bool = False, draft_emails: bool = False) -> Dict[str, Any]:
+    """Run the Career squad. apply=True submits applications via Playwright auto_fill
+    (uses the saved encrypted profile + LinkedIn session if available). draft_emails=True
+    drafts recruiter cold emails for your approval — it NEVER sends them automatically."""
+    count = max(1, min(int(count or 3), JOB_HUNT_MAX))
+    task_id = "jobhunt-" + uuid.uuid4().hex[:8]
+    report: Dict[str, Any] = {
+        "workflow": "job_hunt", "task_id": task_id, "query": query, "location": location,
+        "apply": bool(apply), "draft_emails": bool(draft_emails),
+        "linkedin_session": linkedin_session_status(), "applications": [],
+    }
+
+    profile = await job_profile_load()
+    report["profile_loaded"] = bool(profile)
+    if apply and not profile:
+        report["warning"] = "apply requested but no saved /jobs/profile — fields can't be auto-filled."
+
+    listings = await _jobhunt_find_listings(query, location, count, task_id)
+    report["listings"] = listings
+    if not listings:
+        report["verdict"] = "FAIL"
+        report["reason"] = "no job listings found"
+        return report
+
+    pw = PlaywrightTool()
+    for job in listings:
+        entry: Dict[str, Any] = {"title": job["title"], "company": job["company"], "url": job["url"]}
+
+        # Resume Agent — tailor a short cover note for this specific role.
+        await _jobhunt_log(task_id, "Resume Agent", f"Tailor cover note: {job['title']} @ {job['company']}", "running")
+        cover = await call_llm_failover(
+            "You are the Resume Agent. Write a concise (90-130 word), specific cover note for this role, "
+            "first-person, no placeholders, ready to paste. Return only the note.",
+            f"Role: {job['title']} at {job['company']}\nCandidate profile: {json.dumps(job_profile_public(profile))}\n"
+            f"Context: {project}")
+        cover_ok = not str(cover).startswith("[All LLM providers failed")
+        await _jobhunt_log(task_id, "Resume Agent", job["title"], "done" if cover_ok else "error",
+                           output=(cover[:1200] if cover_ok else ""), error=("" if cover_ok else cover))
+        entry["cover_note"] = cover if cover_ok else ""
+
+        # Application Tracker — auto-fill / apply via Playwright.
+        await _jobhunt_log(task_id, "Application Tracker", f"Auto-fill: {job['url']}", "running")
+        fill_fields = dict(profile)
+        if cover_ok:
+            fill_fields["cover_letter"] = cover
+        af_raw = await pw.run({
+            "action": "auto_fill", "url": job["url"], "fields": fill_fields,
+            "use_session": "linkedin.com" in job["url"].lower(), "submit": bool(apply),
+        })
+        try:
+            af = json.loads(af_raw)
+        except Exception:
+            af = {"ok": False, "raw": af_raw[:500]}
+        entry["application"] = af
+        status = "done" if af.get("ok") else "error"
+        if af.get("needs_manual"):
+            status = "done"  # surfaced for the human; not an internal failure
+        await _jobhunt_log(task_id, "Application Tracker", job["url"], status,
+                           output=json.dumps(af)[:3000])
+
+        # Optional recruiter cold-email DRAFT (never auto-sent).
+        if draft_emails and job.get("recruiter_email"):
+            await _jobhunt_log(task_id, "Job Search Agent", f"Draft email → {job['recruiter_email']}", "running")
+            subject = f"Application — {job['title']} at {job['company']}".strip(" -")
+            draft = await run_gmail_automation({
+                "action": "draft", "confirm": True, "to": job["recruiter_email"],
+                "subject": subject, "body": (cover if cover_ok else
+                    f"Hello,\n\nI'm interested in the {job['title']} role at {job['company']} and would love to connect.\n\nBest regards"),
+            })
+            entry["email_draft"] = draft
+            await _jobhunt_log(task_id, "Job Search Agent", f"Draft → {job['recruiter_email']}",
+                               "done" if draft.get("ok") else "error", output=json.dumps(draft)[:1500])
+
+        report["applications"].append(entry)
+
+    applied = sum(1 for a in report["applications"] if a.get("application", {}).get("submitted"))
+    filled = sum(1 for a in report["applications"] if a.get("application", {}).get("ok"))
+    manual = sum(1 for a in report["applications"] if a.get("application", {}).get("needs_manual"))
+    report["summary"] = {"listings": len(listings), "auto_filled": filled, "submitted": applied, "needs_manual": manual}
+    report["verdict"] = "PASS" if filled or not apply else "FAIL"
+    return report
+
+
 class ParallelTeamTool(MCPTool):
     """Run a big task with multiple workers of ANY agent role IN PARALLEL, then a
     Head/Lead of that role reviews and merges their work into one finalized result."""
@@ -1847,16 +1984,13 @@ class CodeRunnerTool(MCPTool):
             return f"code_runner error: unsupported language '{lang}'. Use python, node, or shell."
 
         try:
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(self.SANDBOX),
-                ),
-                timeout=timeout_s,
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.SANDBOX),
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
             out = stdout.decode("utf-8", errors="replace").strip()
             err = stderr.decode("utf-8", errors="replace").strip()
             parts = []
@@ -1872,15 +2006,198 @@ class CodeRunnerTool(MCPTool):
             return f"code_runner error: {e}"
 
 
+# === SECTION: Job auto-apply — secure config, resume profile, LinkedIn session ===
+# Resume PII is stored ENCRYPTED at rest (Fernet, key from the VM systemd drop-in).
+# LinkedIn session cookies live ONLY in a chmod-600 VM file / env var — never in the
+# DB, git, or Markdown (per the TRD's "no secrets in Markdown" rule). This module does
+# honest browser automation of the owner's OWN accounts; it does NOT bypass captchas
+# or add anti-bot evasion — a detected block is surfaced for manual handling.
+
+# Fernet key for resume-PII encryption at rest. Set in the VM drop-in only:
+#   Environment=JAXVORA_SECRET_KEY=<python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())">
+JAXVORA_SECRET_KEY = os.environ.get("JAXVORA_SECRET_KEY", "").strip()
+# LinkedIn cookies: a JSON list of Playwright cookie dicts. Prefer a chmod-600 file
+# referenced by path; an inline env var also works. Exported from your own browser.
+LINKEDIN_COOKIES_PATH = os.environ.get("LINKEDIN_COOKIES_PATH", "/etc/jaxvora/linkedin_cookies.json")
+LINKEDIN_COOKIES_JSON = os.environ.get("LINKEDIN_COOKIES_JSON", "").strip()
+
+# Canonical resume fields → regex hints used to match arbitrary application-form inputs.
+JOB_FIELD_HINTS: Dict[str, str] = {
+    "first_name": r"first[\s_-]*name|fname|given[\s_-]*name",
+    "last_name": r"last[\s_-]*name|lname|surname|family[\s_-]*name",
+    "full_name": r"full[\s_-]*name|^name$|your[\s_-]*name|applicant[\s_-]*name|candidate[\s_-]*name",
+    "email": r"e-?mail",
+    "phone": r"phone|mobile|tel(ephone)?\b|contact[\s_-]*number",
+    "linkedin": r"linked\s?in",
+    "github": r"git\s?hub|portfolio|personal[\s_-]*(site|website)|website[\s_-]*url",
+    "location": r"location|city|address|where.*based|current[\s_-]*location",
+    "current_title": r"current.*title|job[\s_-]*title|present[\s_-]*role|designation|current[\s_-]*role",
+    "current_company": r"current.*(company|employer)|present[\s_-]*company|organi[sz]ation",
+    "experience_years": r"years.*experience|experience.*years|total[\s_-]*experience|\byoe\b",
+    "salary": r"salary|compensation|\bctc\b|expected[\s_-]*(pay|salary)",
+    "cover_letter": r"cover[\s_-]*letter|message|why.*(you|interested|join)|tell[\s_-]*us|additional[\s_-]*info|note|summary",
+}
+
+
+def _jobs_fernet():
+    """Return a Fernet instance if a key is configured and cryptography is present, else None."""
+    if not JAXVORA_SECRET_KEY:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(JAXVORA_SECRET_KEY.encode())
+    except Exception as e:
+        logger.warning(f"job-profile encryption unavailable: {e}")
+        return None
+
+
+def encrypt_secret(plaintext: str) -> Optional[str]:
+    """Encrypt with the 'enc:' marker. Returns None if no key — callers MUST refuse to
+    persist PII in that case rather than silently storing plaintext."""
+    f = _jobs_fernet()
+    if f is None:
+        return None
+    return "enc:" + f.encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(blob: str) -> Optional[str]:
+    if not blob:
+        return None
+    if blob.startswith("enc:"):
+        f = _jobs_fernet()
+        if f is None:
+            return None
+        try:
+            return f.decrypt(blob[4:].encode("ascii")).decode("utf-8")
+        except Exception as e:
+            logger.warning(f"job-profile decrypt failed: {e}")
+            return None
+    return blob  # legacy/plaintext value written before a key existed
+
+
+def _normalize_profile(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept a loose resume dict and derive name variants so form-matching is robust."""
+    d = {str(k).strip().lower(): v for k, v in (data or {}).items() if v not in (None, "")}
+    fn, ln, full = d.get("first_name"), d.get("last_name"), d.get("full_name")
+    if not full and (fn or ln):
+        d["full_name"] = " ".join(x for x in [fn, ln] if x).strip()
+    if full and not fn:
+        parts = str(full).split()
+        if parts:
+            d.setdefault("first_name", parts[0])
+            if len(parts) > 1:
+                d.setdefault("last_name", " ".join(parts[1:]))
+    return d
+
+
+async def job_profile_save(data: Dict[str, Any]) -> Dict[str, Any]:
+    clean = _normalize_profile(data)
+    if not clean:
+        return {"ok": False, "error": "no resume fields provided"}
+    blob = encrypt_secret(json.dumps(clean))
+    if blob is None:
+        return {"ok": False, "error": (
+            "JAXVORA_SECRET_KEY is not set on the VM (or cryptography is missing) — refusing to "
+            "store resume PII unencrypted. Add a Fernet key to the systemd drop-in, then retry.")}
+    if db_pool is None:
+        return {"ok": False, "error": "database unavailable"}
+    try:
+        await db_execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('job_profile_enc', $1, NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()", blob)
+    except Exception as e:
+        return {"ok": False, "error": f"save failed: {e}"}
+    return {"ok": True, "fields": sorted(clean.keys()), "encrypted": True}
+
+
+async def job_profile_load() -> Dict[str, Any]:
+    if db_pool is None:
+        return {}
+    try:
+        row = await db_fetchrow("SELECT value FROM app_settings WHERE key='job_profile_enc'")
+    except Exception as e:
+        logger.warning(f"job_profile_load failed: {e}")
+        return {}
+    if not row or not row["value"]:
+        return {}
+    raw = decrypt_secret(row["value"])
+    if not raw:
+        return {}
+    try:
+        return _normalize_profile(json.loads(raw))
+    except Exception:
+        return {}
+
+
+def job_profile_public(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Masked view — never echo full PII back over the API."""
+    sensitive = {"email", "phone", "full_name", "first_name", "last_name", "linkedin", "address"}
+
+    def mask(v: Any) -> str:
+        s = str(v)
+        if "@" in s:
+            u, _, dom = s.partition("@")
+            return (u[:2] + "…@" + dom) if u else s
+        return (s[:2] + "…" + s[-2:]) if len(s) > 6 else "set"
+
+    return {k: (mask(v) if k in sensitive else v) for k, v in (data or {}).items()}
+
+
+def load_linkedin_cookies() -> List[Dict[str, Any]]:
+    """Load Playwright-format cookies from the VM env/file ONLY (never DB/git/Markdown)."""
+    raw = LINKEDIN_COOKIES_JSON
+    if not raw:
+        try:
+            p = Path(LINKEDIN_COOKIES_PATH)
+            if p.exists():
+                raw = p.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"linkedin cookie read failed: {e}")
+            return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.warning("linkedin cookies: invalid JSON")
+        return []
+    cookies = data.get("cookies", data) if isinstance(data, dict) else data
+    out: List[Dict[str, Any]] = []
+    for c in cookies or []:
+        if not isinstance(c, dict) or "name" not in c or "value" not in c:
+            continue
+        ck: Dict[str, Any] = {
+            "name": c["name"], "value": c["value"],
+            "domain": c.get("domain", ".linkedin.com"), "path": c.get("path", "/"),
+        }
+        for opt in ("expires", "httpOnly", "secure", "sameSite"):
+            if opt in c:
+                ck[opt] = c[opt]
+        out.append(ck)
+    return out
+
+
+def linkedin_session_status() -> Dict[str, Any]:
+    cookies = load_linkedin_cookies()
+    src = "env" if LINKEDIN_COOKIES_JSON else ("file" if cookies else "none")
+    has_auth = any(c.get("name") == "li_at" for c in cookies)  # li_at = LinkedIn auth cookie
+    return {"present": bool(cookies), "count": len(cookies), "source": src, "has_auth_cookie": has_auth}
+
+
 class PlaywrightTool(MCPTool):
     def __init__(self):
         super().__init__("playwright",
             "Browser automation via Playwright. "
-            "params: action (navigate|screenshot|text|click|fill|evaluate), "
+            "params: action (navigate|screenshot|text|click|fill|evaluate|auto_fill), "
             "url (for navigate), selector (for click/fill), value (for fill), "
             "script (for evaluate), timeout_seconds (optional, max 60). "
+            "auto_fill: maps a resume profile onto a job-application form's inputs — params: url, "
+            "fields (JSON dict of resume data; omit to use the saved /jobs/profile), submit (bool, "
+            "click the apply/submit button), use_session (bool, inject LinkedIn cookies to act as the "
+            "signed-in owner). Captchas/anti-bot walls are NOT bypassed — a block returns "
+            "needs_manual=true with a screenshot for you to handle. "
             "Use this to interact with web pages, take screenshots, extract content, or fill forms.",
-            risk_level="medium", requires_confirmation=True)
+            risk_level="critical", requires_confirmation=True)
 
     async def run(self, params: Dict[str, Any]) -> str:
         action = (params.get("action") or "").lower().strip()
@@ -1954,14 +2271,192 @@ class PlaywrightTool(MCPTool):
                     await browser.close()
                     return str(result)[:5000]
 
+                elif action == "auto_fill":
+                    if not url:
+                        await browser.close()
+                        return "playwright auto_fill error: url required"
+                    fields = params.get("fields")
+                    if isinstance(fields, str):
+                        try:
+                            fields = json.loads(fields)
+                        except Exception:
+                            fields = None
+                    if not isinstance(fields, dict) or not fields:
+                        fields = await job_profile_load()
+                    fields = _normalize_profile(fields or {})
+                    if not fields:
+                        await browser.close()
+                        return ("playwright auto_fill error: no fields given and no saved job profile "
+                                "(POST /jobs/profile first).")
+
+                    context = await browser.new_context(
+                        user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"))
+                    if bool(params.get("use_session")):
+                        cookies = load_linkedin_cookies()
+                        if cookies:
+                            try:
+                                await context.add_cookies(cookies)
+                            except Exception as e:
+                                logger.warning(f"auto_fill add_cookies failed: {e}")
+                    fpage = await context.new_page()
+                    await fpage.set_viewport_size({"width": 1280, "height": 900})
+                    await fpage.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded")
+                    await fpage.wait_for_timeout(900)
+
+                    block = await _detect_block(fpage)
+                    if block:
+                        shot = str(self.SANDBOX / f"autofill_block_{int(time.time())}.png")
+                        try:
+                            await fpage.screenshot(path=shot, full_page=True)
+                        except Exception:
+                            shot = ""
+                        await browser.close()
+                        return json.dumps({
+                            "ok": False, "needs_manual": True, "reason": block, "screenshot": shot,
+                            "note": ("Anti-bot / captcha / login wall hit. Jaxvora does not bypass these — "
+                                     "open the page in your own browser, clear it, refresh the session "
+                                     "cookies if needed, then retry.")}, indent=2)
+
+                    result = await _auto_fill_form(fpage, fields)
+                    result["submitted"] = False
+                    if bool(params.get("submit")):
+                        sub = await _submit_form(fpage, timeout_s)
+                        result["submitted"] = bool(sub.get("ok"))
+                        result["submit_detail"] = sub
+                    shot = str(self.SANDBOX / f"autofill_{int(time.time())}.png")
+                    try:
+                        await fpage.screenshot(path=shot, full_page=True)
+                        result["screenshot"] = shot
+                    except Exception:
+                        pass
+                    result["url"] = fpage.url
+                    await browser.close()
+                    return json.dumps({"ok": True, **result}, indent=2)
+
                 else:
                     await browser.close()
-                    return f"playwright error: unknown action '{action}'. Use navigate, screenshot, text, click, fill, or evaluate."
+                    return (f"playwright error: unknown action '{action}'. Use navigate, screenshot, "
+                            "text, click, fill, evaluate, or auto_fill.")
 
         except Exception as e:
             return f"playwright error: {e}"
 
     SANDBOX = Path("/root/jaxvora-ai/workspace")
+
+
+# ── Job-application form auto-fill helpers (used by PlaywrightTool.auto_fill) ──
+_BLOCK_SIGNALS = [
+    "verify you are human", "are you a robot", "unusual activity", "security check",
+    "captcha", "recaptcha", "hcaptcha", "press & hold", "complete the challenge",
+    "let's do a quick security check", "please enable javascript and cookies",
+]
+
+
+async def _detect_block(page) -> str:
+    """Return a short reason if an anti-bot / captcha / login wall is detected, else ''.
+    We DETECT and surface these — we never try to defeat them."""
+    try:
+        # captcha iframes / widgets
+        has_captcha = await page.evaluate(
+            "() => !!(document.querySelector('iframe[src*=\"recaptcha\"],iframe[src*=\"hcaptcha\"],"
+            "iframe[title*=\"captcha\" i],div.g-recaptcha,#captcha,[class*=\"captcha\" i]'))")
+        if has_captcha:
+            return "captcha widget present"
+        body = (await page.inner_text("body")) if await page.query_selector("body") else ""
+        low = re.sub(r"\s+", " ", body).lower()[:6000]
+        for sig in _BLOCK_SIGNALS:
+            if sig in low:
+                return f"page text indicates a block: '{sig}'"
+        # LinkedIn login wall (session cookies missing/expired)
+        if "linkedin.com" in (page.url or "") and ("/login" in page.url or "sign in to linkedin" in low):
+            return "LinkedIn login wall — session cookies missing or expired"
+    except Exception as e:
+        logger.warning(f"_detect_block error: {e}")
+    return ""
+
+
+async def _auto_fill_form(page, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Heuristically map a resume profile onto the page's fillable inputs.
+    Tags each candidate with data-jx-idx, matches by name/id/placeholder/aria/label."""
+    try:
+        descriptors = await page.evaluate(r"""() => {
+          const out = [];
+          let i = 0;
+          document.querySelectorAll('input, textarea, select').forEach(el => {
+            const type = (el.type || '').toLowerCase();
+            if (['hidden','submit','button','image','reset','file','checkbox','radio'].includes(type)) return;
+            if (el.disabled || el.readOnly) return;
+            el.setAttribute('data-jx-idx', String(i));
+            let label = '';
+            if (el.id) { const l = document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]'); if (l) label = l.innerText; }
+            if (!label && el.closest('label')) label = el.closest('label').innerText;
+            out.push({ idx: i, tag: el.tagName.toLowerCase(), type,
+                       name: el.name || '', id: el.id || '', placeholder: el.placeholder || '',
+                       aria: el.getAttribute('aria-label') || '', label: (label || '').trim().slice(0, 140) });
+            i++;
+          });
+          return out;
+        }""")
+    except Exception as e:
+        return {"filled": [], "skipped": [], "candidates": 0, "error": f"scan failed: {e}"}
+
+    filled: List[Dict[str, str]] = []
+    skipped: List[str] = []
+    used: set = set()
+    for canon_key, value in fields.items():
+        hint = JOB_FIELD_HINTS.get(canon_key)
+        if not hint or value in (None, ""):
+            continue
+        match = None
+        for d in descriptors:
+            if d["idx"] in used:
+                continue
+            hay = " ".join([d["name"], d["id"], d["placeholder"], d["aria"], d["label"]]).lower()
+            if hay.strip() and re.search(hint, hay):
+                match = d
+                break
+        if match is None:
+            skipped.append(canon_key)
+            continue
+        sel = f'[data-jx-idx="{match["idx"]}"]'
+        try:
+            if match["tag"] == "select":
+                try:
+                    await page.select_option(sel, label=str(value))
+                except Exception:
+                    await page.select_option(sel, value=str(value))
+            else:
+                await page.fill(sel, str(value))
+            used.add(match["idx"])
+            filled.append({"field": canon_key, "matched": (match["label"] or match["name"] or match["id"] or match["placeholder"])[:80]})
+        except Exception as e:
+            skipped.append(f"{canon_key} (fill error: {str(e)[:60]})")
+    return {"filled": filled, "skipped": skipped, "candidates": len(descriptors)}
+
+
+async def _submit_form(page, timeout_s: int = 30) -> Dict[str, Any]:
+    """Click the most likely apply/submit control. Honest click only — no retries to
+    defeat validation. Returns the post-submit URL and a short body excerpt."""
+    selectors = [
+        "button[type=submit]", "input[type=submit]",
+        "button[aria-label*='submit' i]", "button[aria-label*='apply' i]",
+        "button:has-text('Submit application')", "button:has-text('Submit')",
+        "button:has-text('Apply')", "button:has-text('Send application')",
+        "a:has-text('Submit application')",
+    ]
+    before = page.url
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if not el:
+                continue
+            await el.click(timeout=min(timeout_s, 15) * 1000)
+            await page.wait_for_timeout(1500)
+            return {"ok": True, "clicked": sel, "url_before": before, "url_after": page.url}
+        except Exception:
+            continue
+    return {"ok": False, "reason": "no submit/apply button found", "url": page.url}
 
 
 def _http_health_check(port: int, timeout_s: float = 3) -> Optional[Dict]:
@@ -4638,6 +5133,30 @@ class TeamRunRequest(BaseModel):
     role: Optional[str] = "Software Engineer"
     parts: Optional[Any] = None   # int worker count (2-6) OR a list of subtask strings
     project: Optional[str] = ""
+    # job_hunt workflow (role='job_hunt'): task is treated as the search query
+    location: Optional[str] = ""
+    count: Optional[int] = 3
+    apply: Optional[bool] = False
+    draft_emails: Optional[bool] = False
+
+
+class JobProfileRequest(BaseModel):
+    # Resume fields used to auto-fill applications. Stored ENCRYPTED at rest.
+    profile: Dict[str, Any]
+
+
+class JobLinkedInSessionRequest(BaseModel):
+    cookies: Any                      # JSON list of Playwright cookie dicts (exported from your browser)
+    admin_token: Optional[str] = ""
+
+
+class JobHuntRequest(BaseModel):
+    query: str
+    location: Optional[str] = ""
+    count: Optional[int] = 3
+    apply: Optional[bool] = False
+    draft_emails: Optional[bool] = False
+    project: Optional[str] = ""
 
 class SecurityScanRequest(BaseModel):
     content: str
@@ -4970,10 +5489,86 @@ async def team_run(req: TeamRunRequest):
     task = (req.task or "").strip()
     if not task:
         return JSONResponse(status_code=400, content={"ok": False, "error": "task is required", "verdict": "FAIL"})
-    report = await _run_parallel_team((req.role or "Software Engineer").strip(), task,
-                                      req.parts, (req.project or "").strip())
+    role = (req.role or "Software Engineer").strip()
+    if role.lower().replace("-", "_").replace(" ", "_") in ("job_hunt", "career_squad", "jobhunt"):
+        report = await _run_job_hunt(query=task, location=(req.location or "").strip(),
+                                     count=req.count or 3, project=(req.project or "").strip(),
+                                     apply=bool(req.apply), draft_emails=bool(req.draft_emails))
+        status = 200 if report.get("verdict") == "PASS" else 400
+        return JSONResponse(content=report, status_code=status)
+    report = await _run_parallel_team(role, task, req.parts, (req.project or "").strip())
     status = 200 if report.get("verdict") == "PASS" else 400
     return JSONResponse(content=report, status_code=status)
+
+
+# ── Job auto-apply settings & run ──────────────────────────────────────────────
+@app.get("/jobs/status")
+async def jobs_status():
+    """Readiness of the job auto-apply pipeline (no secrets echoed)."""
+    profile = await job_profile_load()
+    return {
+        "encryption_key_set": bool(JAXVORA_SECRET_KEY),
+        "profile_set": bool(profile),
+        "profile_fields": sorted(profile.keys()) if profile else [],
+        "linkedin_session": linkedin_session_status(),
+        "max_per_run": JOB_HUNT_MAX,
+    }
+
+
+@app.get("/jobs/profile")
+async def jobs_profile_get():
+    """Masked view of the saved resume profile — never returns raw PII."""
+    profile = await job_profile_load()
+    return {"set": bool(profile), "profile": job_profile_public(profile)}
+
+
+@app.post("/jobs/profile")
+async def jobs_profile_set(req: JobProfileRequest):
+    """Save resume fields, ENCRYPTED at rest. Refuses if no encryption key is configured."""
+    result = await job_profile_save(req.profile or {})
+    return JSONResponse(content=result, status_code=200 if result.get("ok") else 400)
+
+
+@app.post("/jobs/linkedin-session")
+async def jobs_linkedin_session(req: JobLinkedInSessionRequest):
+    """Store LinkedIn session cookies in a chmod-600 VM file (never DB/git/Markdown).
+    Admin-token gated and intended to be VM-only (don't proxy via Vercel)."""
+    expected = GMAIL_AUTOMATION_API_TOKEN
+    if expected and (req.admin_token or "") != expected:
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Valid admin_token required."})
+    cookies = req.cookies
+    if isinstance(cookies, str):
+        try:
+            cookies = json.loads(cookies)
+        except Exception:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "cookies must be JSON"})
+    payload = cookies.get("cookies", cookies) if isinstance(cookies, dict) else cookies
+    if not isinstance(payload, list) or not payload:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "cookies must be a non-empty list"})
+    try:
+        p = Path(LINKEDIN_COOKIES_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"cookies": payload}), encoding="utf-8")
+        try:
+            os.chmod(p, 0o600)
+        except Exception as e:
+            logger.warning(f"chmod 600 on cookie file failed: {e}")
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"write failed: {e}"})
+    return {"ok": True, "path": str(LINKEDIN_COOKIES_PATH), **linkedin_session_status()}
+
+
+@app.post("/jobs/hunt")
+async def jobs_hunt(req: JobHuntRequest):
+    """Run the Career squad end-to-end. apply submits via Playwright auto_fill;
+    draft_emails drafts (never sends) recruiter cold emails."""
+    query = (req.query or "").strip()
+    if not query:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "query is required", "verdict": "FAIL"})
+    report = await _run_job_hunt(query=query, location=(req.location or "").strip(),
+                                 count=req.count or 3, project=(req.project or "").strip(),
+                                 apply=bool(req.apply), draft_emails=bool(req.draft_emails))
+    return JSONResponse(content=report, status_code=200 if report.get("verdict") == "PASS" else 400)
 
 
 # ── Async chat jobs ───────────────────────────────────────────────────────────
@@ -5810,6 +6405,16 @@ async def upload_file(file: UploadFile = File(...)):
     content = await file.read()
     content_type = file.content_type or ""
     extracted = _extract_upload_text(content, file.filename or "attachment", content_type)
+    
+    try:
+        if file.filename:
+            safe_name = re.sub(r'[^\w.\-]', '_', file.filename)
+            workspace_path = FileSystemTool.SANDBOX / safe_name
+            workspace_path.parent.mkdir(parents=True, exist_ok=True)
+            workspace_path.write_bytes(content)
+    except Exception as e:
+        logger.error(f"Failed to save uploaded file to workspace: {e}")
+
     return {
         "filename": file.filename,
         "size": len(content),
