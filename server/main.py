@@ -238,15 +238,28 @@ async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
     # "hidden" keeps message.content as the clean final answer. Harmless for non-reasoning
     # Groq models. Override the model via GROQ_MODEL / reasoning via GROQ_REASONING_FORMAT.
     extra = {"reasoning_format": os.environ.get("GROQ_REASONING_FORMAT", "hidden")}
+    url = "https://api.groq.com/openai/v1/chat/completions"
     key = _next_groq_key()                       # round-robin across the key pool
     try:
         return await _post_chat(
-            "https://api.groq.com/openai/v1/chat/completions",
-            {"Authorization": f"Bearer {key}"},
+            url, {"Authorization": f"Bearer {key}"},
             LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60,
             extra_body=extra)
     except Exception as e:
-        _bench_groq_key(key, str(e))             # bench this key on rate/size error, keep others hot
+        m = str(e)
+        _bench_groq_key(key, m)                   # bench this key on rate/size error
+        # qwen free tier counts requested max_tokens toward its ~6000 TPM budget, so a big
+        # output ask alone can 413. Retry once on a fresh key with a tiny output budget —
+        # this slips under the ceiling whenever the INPUT itself fits.
+        if "413" in m or "too large" in m:
+            k2 = _next_groq_key()
+            try:
+                return await _post_chat(
+                    url, {"Authorization": f"Bearer {k2}"},
+                    LLAMA_MODEL, system, user, 512, timeout=60, extra_body=extra)
+            except Exception as e2:
+                _bench_groq_key(k2, str(e2))
+                raise
         raise
 
 
@@ -1169,7 +1182,7 @@ async def db_fetchrow(query: str, *args) -> Optional[asyncpg.Record]:
 # Postgres (Neon) is the source of truth; a short Redis-cached window keeps recall
 # fast on the hot path. Toggle with CONVERSATION_MEMORY=0; window = MEMORY_TURNS.
 CONVERSATION_MEMORY = os.environ.get("CONVERSATION_MEMORY", "1") not in ("0", "false", "False", "no")
-MEMORY_TURNS = int(os.environ.get("MEMORY_TURNS", "10") or 10)
+MEMORY_TURNS = int(os.environ.get("MEMORY_TURNS", "6") or 6)
 _MEM_CACHE_NS = "chatmem"
 _MEM_CACHE_KEY = "recent"
 
@@ -1218,15 +1231,22 @@ async def memory_recent(limit: int = MEMORY_TURNS) -> List[Dict[str, str]]:
 
 
 def memory_format(turns: List[Dict[str, str]]) -> str:
-    """Render recent turns as a compact context block for the orchestrator prompt."""
+    """Render recent turns as a COMPACT context block. Kept small on purpose — the Chief
+    prompt is already large and qwen's free Groq tier has a tight ~6000 TPM per-request
+    budget, so a fat memory block here causes HTTP 413. Skip error/placeholder replies."""
     if not turns:
         return ""
     lines = []
-    for t in turns:
-        who = "User" if t["role"] == "user" else (t["agent"] or "Assistant")
-        lines.append(f"{who}: {t['content'][:600]}")
-    return ("=== Recent conversation (for context — do not repeat verbatim) ===\n"
-            + "\n".join(lines) + "\n=== End recent conversation ===")
+    for t in turns[-6:]:
+        c = (t.get("content") or "").strip()
+        if not c or c.startswith(("⚠️", "[error", "[All LLM")):
+            continue  # don't feed failed/placeholder turns back as "context"
+        who = "User" if t["role"] == "user" else (t.get("agent") or "Assistant")
+        lines.append(f"{who}: {c[:240]}")
+    if not lines:
+        return ""
+    return ("=== Recent conversation (context only; do not repeat) ===\n"
+            + "\n".join(lines) + "\n=== End ===")
 
 
 # === Live thought-stream =======================================================
