@@ -4546,46 +4546,75 @@ Always respond in this JSON format:
         if len(t) > 400:
             return None
         low = t.lower()
-        mentions_ws = bool(re.search(r'\b(computer|workspace|files?|folder|directory|documents?)\b', low))
         try:
-            entries = [f for f in WORKSPACE_DIR.iterdir() if not _ws_is_noise(f)]
+            top = [f for f in WORKSPACE_DIR.iterdir() if not _ws_is_noise(f)]
         except Exception:
             return None
 
-        # ── LIST intent: "what can you see in computer", "list my files", "what's in workspace"
-        list_q = mentions_ws and bool(re.search(r'\b(what|which|list|show|see|view|have|contents?|inside|browse)\b', low))
-        read_q = bool(self._WS_READ_VERB.search(t) and self._WS_READ_NOUN.search(t))
-        wants_specific = any(k in low for k in ("resume", "cv", "summari", "analy", "open ", "read "))
-        if list_q and not (read_q and wants_specific):
-            if not entries:
-                resp = "Your Computer workspace is currently empty — drop a file in and I can read it."
+        list_verb = bool(re.search(r'\b(what|which|list|show|see|view|have|contents?|inside|browse)\b', low))
+        mentions_ws = bool(re.search(r'\b(computer|workspace|files?|folder|directory|documents?)\b', low))
+
+        # Resolve a named sub-directory (depth ≤2) if the message references one, e.g.
+        # "what's inside jax-todolist" → list that folder, not the root.
+        sub_dirs: List[Path] = []
+        for d in top:
+            if d.is_dir():
+                sub_dirs.append(d)
+                try:
+                    sub_dirs += [g for g in d.iterdir() if g.is_dir() and not _ws_is_noise(g)]
+                except Exception:
+                    pass
+        named_dir = None
+        for d in sorted(sub_dirs, key=lambda x: -len(x.name)):
+            nm = d.name.lower()
+            if nm and (nm in low or nm.replace("-", " ") in low or nm.replace("-", "") in low.replace(" ", "")):
+                named_dir = d
+                break
+
+        # ── LIST intent (root or a named subfolder) ──
+        if list_verb and (named_dir or mentions_ws):
+            target = named_dir or WORKSPACE_DIR
+            try:
+                items = sorted([f for f in target.iterdir() if not _ws_is_noise(f)],
+                               key=lambda x: (not x.is_dir(), x.name.lower()))
+            except Exception:
+                items = []
+            label = "your Computer workspace" if target == WORKSPACE_DIR else f"`{target.relative_to(WORKSPACE_DIR).as_posix()}/`"
+            if not items:
+                resp = f"{label[0].upper() + label[1:]} is empty."
             else:
                 lines = []
-                for f in sorted(entries, key=lambda x: (not x.is_dir(), x.name.lower())):
+                for f in items:
                     if f.is_dir():
                         lines.append(f"📁 {f.name}/")
                     else:
                         try:
-                            kb = f.stat().st_size / 1024
-                            lines.append(f"📄 {f.name} ({kb:.0f} KB)")
+                            lines.append(f"📄 {f.name} ({f.stat().st_size / 1024:.0f} KB)")
                         except Exception:
                             lines.append(f"📄 {f.name}")
-                resp = ("Here's what I can see in your Computer workspace:\n\n" + "\n".join(lines)
-                        + "\n\nAsk me to read or summarize any of these — e.g. \"summarize my resume\".")
-            record_thought("Chief Orchestrator", "📂 listed workspace", "observe")
+                resp = f"Here's what's in {label}:\n\n" + "\n".join(lines)
+                if target == WORKSPACE_DIR:
+                    resp += "\n\nAsk me to open a folder or read/summarize any file — e.g. \"summarize my resume\"."
+            record_thought("Chief Orchestrator", f"📂 listed {label}", "observe")
             await memory_append("user", user_input)
             await memory_append("assistant", resp)
-            return {"plan": "List the Computer workspace", "agents": ["Chief Orchestrator"],
-                    "response": resp, "results": [{"agent": "file_system", "success": True, "output": f"{len(entries)} items"}],
+            return {"plan": f"List {label}", "agents": ["Chief Orchestrator"], "response": resp,
+                    "results": [{"agent": "file_system", "success": True, "output": f"{len(items)} items"}],
                     "steps": [], "organization": {"mode": "workspace_list"}}
 
-        # ── READ intent: read the best-matching file and answer about it
-        if not read_q:
+        # ── READ intent: read the best-matching file (searches subfolders too) ──
+        if not (self._WS_READ_VERB.search(t) and self._WS_READ_NOUN.search(t)):
             return None
-        files = [f for f in entries if f.is_file()]
+        files = [f for f in top if f.is_file()]
+        for d in top:
+            if d.is_dir():
+                try:
+                    files += [g for g in d.iterdir() if g.is_file() and not _ws_is_noise(g)]
+                except Exception:
+                    pass
         if not files:
             return None
-        toks = [w for w in re.findall(r'[a-z0-9_]+', low) if len(w) > 3]
+        toks = [w for w in re.findall(r'[a-z0-9_.]+', low) if len(w) > 3]
 
         def score(f: Path) -> int:
             n = f.name.lower(); s = 0
@@ -4606,29 +4635,30 @@ Always respond in this JSON format:
                 best = docs[0]
             else:
                 return None  # ambiguous — let the full loop handle it
-        content = (await FileSystemTool().run({"action": "read", "path": best.name}) or "")[:8000]
+        rel = best.relative_to(WORKSPACE_DIR).as_posix()
+        content = (await FileSystemTool().run({"action": "read", "path": rel}) or "")[:8000]
         if content.startswith("file_system:"):
             return None
-        record_thought("Chief Orchestrator", f"📄 read {best.name} from workspace", "observe")
+        record_thought("Chief Orchestrator", f"📄 read {rel} from workspace", "observe")
         mem = memory_format(await memory_recent())
         sys_p = ("You are Jaxvora. The user asked about a file in their workspace and you ALREADY "
                  "have its content below — never ask them to paste it. Answer accurately and "
                  "concisely using only that content.")
-        up = (f"{mem}\n\n" if mem else "") + f"File: {best.name}\n--- file content ---\n{content}\n--- end ---\n\nUser request: {user_input}"
+        up = (f"{mem}\n\n" if mem else "") + f"File: {rel}\n--- file content ---\n{content}\n--- end ---\n\nUser request: {user_input}"
         try:
             reply = await call_orchestrator_llm(sys_p, up)
         except Exception as e:
-            reply = f"[error reading {best.name}: {e}]"
+            reply = f"[error reading {rel}: {e}]"
         if not reply or reply.startswith("[All LLM"):
             return None  # let the loop / fallback try
         await memory_append("user", user_input)
         await memory_append("assistant", reply)
         return {
-            "plan": f"Read {best.name} from the workspace",
+            "plan": f"Read {rel} from the workspace",
             "agents": ["Chief Orchestrator"],
             "response": reply,
-            "results": [{"agent": "file_system", "success": True, "output": best.name}],
-            "steps": [], "organization": {"mode": "workspace_read", "file": best.name},
+            "results": [{"agent": "file_system", "success": True, "output": rel}],
+            "steps": [], "organization": {"mode": "workspace_read", "file": rel},
         }
 
     async def _handle_attachment_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
