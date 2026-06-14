@@ -44,6 +44,52 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 DEEPSEEK_V4_API_KEY = os.environ.get("DEEPSEEK_V4_API_KEY", "")
 
+# Groq key POOL — each key has its own ~6000 TPM free-tier budget, so round-robining
+# across N keys multiplies throughput and avoids one key getting rate-limited (413/429)
+# when several agents run at once. Set GROQ_API_KEYS=key1,key2,... in the VM env;
+# GROQ_API_KEY is folded in for back-compat.
+def _parse_groq_keys() -> List[str]:
+    # An explicit GROQ_API_KEYS pool wins outright — we do NOT fold in the legacy single
+    # GROQ_API_KEY, which may be stale/invalid and would poison round-robin with 401s.
+    keys = [k.strip() for k in os.environ.get("GROQ_API_KEYS", "").split(",") if k.strip()]
+    if keys:
+        # de-dupe, preserve order
+        seen, out = set(), []
+        for k in keys:
+            if k not in seen:
+                seen.add(k); out.append(k)
+        return out
+    return [GROQ_API_KEY.strip()] if GROQ_API_KEY.strip() else []
+
+GROQ_API_KEYS: List[str] = _parse_groq_keys()
+GROQ_KEY_COOLDOWN_S = int(os.environ.get("GROQ_KEY_COOLDOWN_S", "20") or 20)
+_groq_key_idx = 0
+_GROQ_KEY_COOLDOWN: Dict[str, float] = {}
+
+
+def _next_groq_key() -> str:
+    """Round-robin the Groq key pool, skipping keys that are briefly benched after a
+    rate/size error. Consecutive calls (e.g. parallel agents) get different keys."""
+    global _groq_key_idx
+    if not GROQ_API_KEYS:
+        return ""
+    now = time.time()
+    hot = [k for k in GROQ_API_KEYS if _GROQ_KEY_COOLDOWN.get(k, 0) <= now]
+    pool = hot or GROQ_API_KEYS
+    _groq_key_idx = (_groq_key_idx + 1) % len(pool)
+    return pool[_groq_key_idx]
+
+
+def _bench_groq_key(key: str, error: str):
+    if not key:
+        return
+    m = (error or "").lower()
+    if "401" in m or "403" in m or "invalid" in m:
+        # bad/expired key — bench it much longer so it stops poisoning round-robin
+        _GROQ_KEY_COOLDOWN[key] = time.time() + max(GROQ_KEY_COOLDOWN_S * 30, 600)
+    elif "429" in m or "413" in m or "rate" in m or "too large" in m or "too many" in m:
+        _GROQ_KEY_COOLDOWN[key] = time.time() + GROQ_KEY_COOLDOWN_S
+
 # OpenCode Zen — free North Mini Code, used as the default brain for all agents.
 OPENCODE_ZEN_API_KEY = os.environ.get("OPENCODE_ZEN_API_KEY", "")
 OPENCODE_ZEN_BASE = os.environ.get("OPENCODE_ZEN_BASE", "https://opencode.ai/zen/v1")
@@ -192,11 +238,16 @@ async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
     # "hidden" keeps message.content as the clean final answer. Harmless for non-reasoning
     # Groq models. Override the model via GROQ_MODEL / reasoning via GROQ_REASONING_FORMAT.
     extra = {"reasoning_format": os.environ.get("GROQ_REASONING_FORMAT", "hidden")}
-    return await _post_chat(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {"Authorization": f"Bearer {GROQ_API_KEY}"},
-        LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60,
-        extra_body=extra)
+    key = _next_groq_key()                       # round-robin across the key pool
+    try:
+        return await _post_chat(
+            "https://api.groq.com/openai/v1/chat/completions",
+            {"Authorization": f"Bearer {key}"},
+            LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60,
+            extra_body=extra)
+    except Exception as e:
+        _bench_groq_key(key, str(e))             # bench this key on rate/size error, keep others hot
+        raise
 
 
 async def _raw_deepseek_v4(system: str, user: str, max_tokens: int) -> str:
@@ -220,7 +271,7 @@ async def _raw_openrouter(system: str, user: str, max_tokens: int) -> str:
 # not configured and the provider is skipped instead of failing every request.
 _PROVIDERS: Dict[str, Dict[str, Any]] = {
     "zen": {"enabled": lambda: bool((OPENCODE_ZEN_API_KEY or "").strip()), "fn": _raw_zen},
-    "groq": {"enabled": lambda: bool((GROQ_API_KEY or "").strip()), "fn": _raw_groq},
+    "groq": {"enabled": lambda: bool(GROQ_API_KEYS), "fn": _raw_groq},
     "deepseek_v4": {"enabled": lambda: bool((DEEPSEEK_V4_API_KEY or "").strip()), "fn": _raw_deepseek_v4},
     "openrouter": {"enabled": lambda: bool((OPENROUTER_API_KEY or "").strip()), "fn": _raw_openrouter},
 }
@@ -255,6 +306,7 @@ def llm_provider_status() -> Dict[str, Any]:
         "primary": AGENTS_FORCE_PROVIDER or ("zen" if OPENCODE_ZEN_PRIMARY else "per-agent"),
         "forced_provider": AGENTS_FORCE_PROVIDER or None,
         "groq_model": LLAMA_MODEL,
+        "groq_keys": len(GROQ_API_KEYS),
         "chain": _build_provider_chain(),
         "providers": {
             n: {
