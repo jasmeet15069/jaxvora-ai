@@ -63,6 +63,9 @@ def _parse_groq_keys() -> List[str]:
 
 GROQ_API_KEYS: List[str] = _parse_groq_keys()
 GROQ_KEY_COOLDOWN_S = int(os.environ.get("GROQ_KEY_COOLDOWN_S", "20") or 20)
+# Multimodal models on the Groq key pool — vision (image understanding/text) + Whisper (audio).
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+GROQ_WHISPER_MODEL = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 _groq_key_idx = 0
 _GROQ_KEY_COOLDOWN: Dict[str, float] = {}
 
@@ -1426,6 +1429,15 @@ class FileSystemTool(MCPTool):
                         return f"file_system: could not extract Excel data from {rel}: {info.get('error', 'no data')}"
                     except Exception as e:
                         return f"file_system: Excel read error for {rel}: {e}"
+                # images / audio / video → OCR + vision / Whisper transcription
+                if resolved.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff",
+                                               ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac",
+                                               ".mp4", ".mov", ".mkv", ".webm", ".avi"):
+                    try:
+                        info = await extract_file_async(resolved.read_bytes(), resolved.name, "")
+                        return f"[{rel}]\n{info.get('content', '')[:20000]}"
+                    except Exception as e:
+                        return f"file_system: media read error for {rel}: {e}"
                 return resolved.read_text(encoding="utf-8", errors="ignore")[:20000]
             if action == "write":
                 resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -4544,7 +4556,7 @@ Always respond in this JSON format:
         return "%PDF" in sample or ("/Type /Catalog" in sample and "endobj" in sample and "stream" in sample)
 
     _WS_READ_VERB = re.compile(r'\b(read|open|show|view|summari[sz]e|analy[sz]e|review|look at|extract|parse|check)\b', re.IGNORECASE)
-    _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report|data|dataset|excel|spreadsheet|xlsx?|sheet|csv|stock)\b', re.IGNORECASE)
+    _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report|data|dataset|excel|spreadsheet|xlsx?|sheet|csv|stock|image|photo|picture|screenshot|audio|video|recording|png|jpe?g|mp3|mp4|transcri)\b', re.IGNORECASE)
 
     async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
         """Deterministically answer about the Computer workspace: LIST what's there
@@ -4639,7 +4651,9 @@ Always respond in this JSON format:
 
         best = max(files, key=score)
         if score(best) == 0:
-            docs = [f for f in files if f.suffix.lower() in (".pdf", ".txt", ".md", ".docx", ".csv", ".xlsx", ".xls", ".xlsm")]
+            docs = [f for f in files if f.suffix.lower() in (
+                ".pdf", ".txt", ".md", ".docx", ".csv", ".xlsx", ".xls", ".xlsm",
+                ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp3", ".wav", ".m4a", ".mp4", ".mov")]
             if len(docs) == 1:
                 best = docs[0]
             else:
@@ -6542,7 +6556,7 @@ async def rag_ingest(req: RAGIngestRequest):
 async def upload_to_rag(file: UploadFile = File(...)):
     """Upload a file directly to RAG (chunk, embed, store)."""
     content = await file.read()
-    extracted = _extract_upload_text(content, file.filename or "attachment", file.content_type or "")
+    extracted = await extract_file_async(content, file.filename or "attachment", file.content_type or "")
     if not extracted["ok"]:
         return {"ok": False, "error": extracted["error"]}
     count = await rag_engine.ingest(extracted["content"], source=file.filename or "attachment")
@@ -7099,13 +7113,157 @@ def _describe_binary(content: bytes, filename: str, content_type: str) -> Dict[s
     lines = [f"**File type:** {kind}", f"**Size:** {size_kb:.1f} KB", f"**Header (hex):** {hex_head}"]
     if note:
         lines.append(f"**Note:** {note}")
-    if strings.strip():
-        lines.append("\n**Embedded printable strings:**\n```\n" + strings[:8000] + "\n```")
-    else:
-        lines.append("\n_No printable text found in this file._")
+    # For images/audio/video the raw byte-strings are noise — OCR/vision/transcription
+    # (added by extract_file_async) carry the real content instead.
+    k = kind.lower()
+    is_media = any(x in k for x in ("image", "audio", "video"))
+    if not is_media:
+        if strings.strip():
+            lines.append("\n**Embedded printable strings:**\n```\n" + strings[:8000] + "\n```")
+        else:
+            lines.append("\n_No printable text found in this file._")
     text = "\n".join(lines)
     return {"ok": True, "error": "", "content": text[:MAX_UPLOAD_TEXT_CHARS], "pages": 0,
             "truncated": len(text) > MAX_UPLOAD_TEXT_CHARS, "binary": True, "kind": kind}
+
+
+# ── Media understanding: OCR (tesseract), vision (Groq llama-4), Whisper (Groq) ──
+def _ocr_image(content: bytes) -> str:
+    """Offline OCR of an image via tesseract. Returns '' if unavailable/empty."""
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(BytesIO(content))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        return (pytesseract.image_to_string(img) or "").strip()
+    except Exception as e:
+        logger.warning(f"OCR failed: {e}")
+        return ""
+
+
+def _image_dimensions(content: bytes) -> str:
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(content))
+        return f"{img.width}×{img.height} {img.format or ''}".strip()
+    except Exception:
+        return ""
+
+
+async def _groq_vision(content: bytes, mime: str,
+                       prompt: str = "Describe this image in detail, and transcribe any visible text verbatim.") -> str:
+    """Image understanding via a Groq multimodal model (key pool). Returns description text."""
+    if not GROQ_API_KEYS:
+        return ""
+    import base64 as _b64
+    data_uri = f"data:{mime or 'image/png'};base64,{_b64.b64encode(content).decode('ascii')}"
+    key = _next_groq_key()
+    body = {"model": GROQ_VISION_MODEL, "max_tokens": 1024, "temperature": 0.2,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_uri}}]}]}
+    try:
+        async with _llm_semaphore:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                                      json=body)
+        if r.status_code >= 400:
+            _bench_groq_key(key, f"HTTP {r.status_code}")
+            return f"[vision unavailable: HTTP {r.status_code}]"
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        return f"[vision error: {e}]"
+
+
+async def _groq_transcribe(content: bytes, filename: str) -> str:
+    """Audio transcription via Groq Whisper (key pool)."""
+    if not GROQ_API_KEYS:
+        return ""
+    key = _next_groq_key()
+    files = {"file": (filename or "audio.mp3", content),
+             "model": (None, GROQ_WHISPER_MODEL),
+             "response_format": (None, "json")}
+    try:
+        async with _llm_semaphore:
+            async with httpx.AsyncClient(timeout=180) as client:
+                r = await client.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                                      headers={"Authorization": f"Bearer {key}"}, files=files)
+        if r.status_code >= 400:
+            _bench_groq_key(key, f"HTTP {r.status_code}")
+            return f"[transcription unavailable: HTTP {r.status_code} {r.text[:120]}]"
+        return (r.json().get("text") or "").strip()
+    except Exception as e:
+        return f"[transcription error: {e}]"
+
+
+def _video_to_audio(content: bytes, filename: str) -> Optional[bytes]:
+    """Extract a compact mono audio track from a video via ffmpeg (for transcription)."""
+    import shutil as _sh, subprocess as _sp, tempfile as _tf, os as _os
+    if not _sh.which("ffmpeg"):
+        return None
+    inp = out = None
+    try:
+        with _tf.NamedTemporaryFile(suffix=(Path(filename).suffix or ".mp4"), delete=False) as f:
+            f.write(content); inp = f.name
+        out = inp + ".mp3"
+        _sp.run(["ffmpeg", "-y", "-i", inp, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k", out],
+                capture_output=True, timeout=180)
+        if _os.path.exists(out) and _os.path.getsize(out) > 0:
+            with open(out, "rb") as fh:
+                return fh.read()
+    except Exception as e:
+        logger.warning(f"video→audio failed: {e}")
+    finally:
+        for p in (inp, out):
+            try:
+                if p:
+                    _os.remove(p)
+            except Exception:
+                pass
+    return None
+
+
+async def extract_file_async(content: bytes, filename: str, content_type: str) -> Dict[str, Any]:
+    """Full file extraction incl. media understanding. Text/PDF/XLSX/DOCX use the sync
+    extractor; images get OCR + vision, audio/video get Whisper transcription."""
+    base = _extract_upload_text(content, filename, content_type)
+    if not base.get("binary"):
+        return base
+    kind = (base.get("kind") or "").lower()
+    extra: List[str] = []
+    try:
+        if "image" in kind:
+            dims = _image_dimensions(content)
+            if dims:
+                extra.append(f"**Dimensions:** {dims}")
+            ocr = await asyncio.to_thread(_ocr_image, content)
+            if ocr:
+                extra.append("**OCR text (tesseract):**\n```\n" + ocr[:6000] + "\n```")
+            desc = await _groq_vision(content, content_type or "image/png")
+            if desc:
+                extra.append("**Vision description:**\n" + desc)
+        elif "audio" in kind:
+            tr = await _groq_transcribe(content, filename)
+            if tr:
+                extra.append("**Transcript:**\n" + tr)
+        elif "video" in kind:
+            audio = await asyncio.to_thread(_video_to_audio, content, filename)
+            if audio is not None:
+                tr = await _groq_transcribe(audio, "audio.mp3")
+                if tr:
+                    extra.append("**Transcript (from video audio):**\n" + tr)
+            else:
+                extra.append("_Could not extract audio for transcription (ffmpeg unavailable)._")
+    except Exception as e:
+        logger.warning(f"media enrichment failed: {e}")
+    if extra:
+        merged = base["content"] + "\n\n" + "\n\n".join(extra)
+        base["content"] = merged[:MAX_UPLOAD_TEXT_CHARS]
+        base["truncated"] = base["truncated"] or len(merged) > MAX_UPLOAD_TEXT_CHARS
+        base["enriched"] = True
+    return base
 
 
 def _try_decode_text(content: bytes) -> Optional[str]:
@@ -7201,7 +7359,7 @@ async def upload_file(file: UploadFile = File(...)):
     """Accept file upload and return its text content for agent context."""
     content = await file.read()
     content_type = file.content_type or ""
-    extracted = _extract_upload_text(content, file.filename or "attachment", content_type)
+    extracted = await extract_file_async(content, file.filename or "attachment", content_type)
     
     try:
         if file.filename:
