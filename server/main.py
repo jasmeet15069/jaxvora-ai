@@ -1325,10 +1325,20 @@ _TASK_HINTS = re.compile(
     r"(feature|endpoint|page|tool|agent)|ssh|commit|push)\b", re.IGNORECASE)
 
 
+# Requests that need a TOOL (read a file/pdf in the workspace, list the computer, etc.)
+# must NOT take the toolless fast-path — they go to the full loop so an agent can act.
+_NEEDS_TOOLS = re.compile(
+    r"\b(read|open|show|view|look at|analy[sz]e|summari[sz]e|review|check|list|extract|parse)\b"
+    r".*\b(file|files|pdf|docx?|document|resume|cv|workspace|computer|folder|screenshot|repo|code base|codebase)\b"
+    r"|\b(my|the|this)\s+(resume|cv|pdf|file|document|code)\b", re.IGNORECASE)
+
+
 def is_simple_chat(msg: str) -> bool:
     """True for short conversational/Q&A messages that don't need the agent team."""
     m = (msg or "").strip()
     if not m or len(m) > 280:
+        return False
+    if _NEEDS_TOOLS.search(m):
         return False
     return not _TASK_HINTS.search(m)
 
@@ -1399,6 +1409,15 @@ class FileSystemTool(MCPTool):
             if action == "read":
                 if not resolved.exists():
                     return f"file_system: not found: {rel}"
+                # PDFs are binary — extract real text instead of returning mojibake.
+                if resolved.suffix.lower() == ".pdf":
+                    try:
+                        info = _extract_pdf_upload_text(resolved.read_bytes())
+                        if info.get("ok") and info.get("content"):
+                            return f"[PDF {rel} — {info.get('pages', '?')} page(s)]\n{info['content'][:20000]}"
+                        return f"file_system: could not extract PDF text from {rel}: {info.get('error', 'no text')}"
+                    except Exception as e:
+                        return f"file_system: PDF read error for {rel}: {e}"
                 return resolved.read_text(encoding="utf-8", errors="ignore")[:20000]
             if action == "write":
                 resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -4516,6 +4535,69 @@ Always respond in this JSON format:
         sample = user_input[:12000]
         return "%PDF" in sample or ("/Type /Catalog" in sample and "endobj" in sample and "stream" in sample)
 
+    _WS_READ_VERB = re.compile(r'\b(read|open|show|view|summari[sz]e|analy[sz]e|review|look at|extract|parse|check)\b', re.IGNORECASE)
+    _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report)\b', re.IGNORECASE)
+
+    async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
+        """Deterministically read a file from the workspace and answer about it — instead
+        of hoping the TAOR loop calls the file_system tool. Finds the best-matching file
+        (resume/cv/pdf/named), reads its text (PDF-aware), and answers in one call."""
+        t = (user_input or "").strip()
+        if len(t) > 400 or not (self._WS_READ_VERB.search(t) and self._WS_READ_NOUN.search(t)):
+            return None
+        try:
+            files = [f for f in WORKSPACE_DIR.iterdir() if f.is_file() and not _ws_is_noise(f)]
+        except Exception:
+            return None
+        if not files:
+            return None
+        low = t.lower()
+        toks = [w for w in re.findall(r'[a-z0-9_]+', low) if len(w) > 3]
+
+        def score(f: Path) -> int:
+            n = f.name.lower(); s = 0
+            for kw in ("resume", "cv", "power", "bi", "report", "invoice", "cover"):
+                if kw in low and kw in n:
+                    s += 5
+            if f.suffix.lower() == ".pdf" and any(k in low for k in ("pdf", "resume", "cv")):
+                s += 2
+            for tok in toks:
+                if tok in n:
+                    s += 3
+            return s
+
+        best = max(files, key=score)
+        if score(best) == 0:
+            docs = [f for f in files if f.suffix.lower() in (".pdf", ".txt", ".md", ".docx", ".csv")]
+            if len(docs) == 1:
+                best = docs[0]
+            else:
+                return None  # ambiguous — let the full loop handle it
+        content = (await FileSystemTool().run({"action": "read", "path": best.name}) or "")[:8000]
+        if content.startswith("file_system:"):
+            return None
+        record_thought("Chief Orchestrator", f"📄 read {best.name} from workspace", "observe")
+        mem = memory_format(await memory_recent())
+        sys_p = ("You are Jaxvora. The user asked about a file in their workspace and you ALREADY "
+                 "have its content below — never ask them to paste it. Answer accurately and "
+                 "concisely using only that content.")
+        up = (f"{mem}\n\n" if mem else "") + f"File: {best.name}\n--- file content ---\n{content}\n--- end ---\n\nUser request: {user_input}"
+        try:
+            reply = await call_orchestrator_llm(sys_p, up)
+        except Exception as e:
+            reply = f"[error reading {best.name}: {e}]"
+        if not reply or reply.startswith("[All LLM"):
+            return None  # let the loop / fallback try
+        await memory_append("user", user_input)
+        await memory_append("assistant", reply)
+        return {
+            "plan": f"Read {best.name} from the workspace",
+            "agents": ["Chief Orchestrator"],
+            "response": reply,
+            "results": [{"agent": "file_system", "success": True, "output": best.name}],
+            "steps": [], "organization": {"mode": "workspace_read", "file": best.name},
+        }
+
     async def _handle_attachment_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
         if self.ATTACHMENT_ERROR_MARKER in user_input:
             return {
@@ -5011,6 +5093,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         # Attachment / Gmail / SSH / Doctor shortcuts
         for handler in [
             self._handle_attachment_chat,
+            self._handle_workspace_read,
             lambda u: self._handle_gmail_chat(u, admin_token=admin_token),
             self._handle_ssh_chat,
             self._handle_doctor_chat,
