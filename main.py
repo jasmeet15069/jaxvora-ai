@@ -51,6 +51,11 @@ OPENCODE_ZEN_MODEL = os.environ.get("OPENCODE_ZEN_MODEL", "north-mini-code-free"
 # When the key is present, route every agent LLM call through OpenCode Zen
 # (override with OPENCODE_ZEN_PRIMARY=0 to fall back to per-agent providers).
 OPENCODE_ZEN_PRIMARY = bool(OPENCODE_ZEN_API_KEY) and os.environ.get("OPENCODE_ZEN_PRIMARY", "1") not in ("0", "false", "False", "no")
+# Global override: pin EVERY agent + workflow LLM call to one provider (the rest of the
+# chain stays as failover). Set AGENTS_FORCE_PROVIDER=groq to make qwen3-32b (the current
+# Groq model) the universal default brain, overriding Zen-primary and per-agent models.
+# Empty = original per-agent / Zen-primary behavior.
+AGENTS_FORCE_PROVIDER = os.environ.get("AGENTS_FORCE_PROVIDER", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 
@@ -79,7 +84,7 @@ SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "")
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat-v3-0324"
-LLAMA_MODEL = "llama-3.3-70b-versatile"
+LLAMA_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3-32b")
 DEEPSEEK_V4_MODEL = "deepseek/deepseek-v4-flash:free"
 DEEPSEEK_V4_BASE = "https://openrouter.ai/api/v1"
 MAX_TOKENS = 8192
@@ -136,25 +141,30 @@ class _RetryableLLMError(Exception):
 
 
 async def _post_chat(url: str, headers: Dict[str, str], model: str,
-                     system: str, user: str, max_tokens: int, timeout: float) -> str:
+                     system: str, user: str, max_tokens: int, timeout: float,
+                     extra_body: Optional[Dict[str, Any]] = None) -> str:
     """One OpenAI-compatible chat call. Raises _RetryableLLMError on 429/5xx/timeout,
     a plain Exception (with the HTTP status in the message) on any other failure;
     returns the message content on success. Throttled by the global LLM semaphore so
-    bursts don't trip free-tier rate limits."""
+    bursts don't trip free-tier rate limits. `extra_body` merges provider-specific
+    params (e.g. Groq reasoning_format) into the request."""
     try:
         async with _llm_semaphore:
             async with httpx.AsyncClient(timeout=timeout) as client:
+                body: Dict[str, Any] = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "max_tokens": max_tokens,
+                }
+                if extra_body:
+                    body.update(extra_body)
                 r = await client.post(
                     url,
                     headers={"Content-Type": "application/json", **headers},
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                        "max_tokens": max_tokens,
-                    },
+                    json=body,
                 )
             if r.status_code == 429 or r.status_code >= 500:
                 raise _RetryableLLMError(f"HTTP {r.status_code}")
@@ -178,10 +188,15 @@ async def _raw_zen(system: str, user: str, max_tokens: int) -> str:
 
 
 async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
+    # qwen3-32b (and other Groq reasoning models) emit <think> traces; reasoning_format
+    # "hidden" keeps message.content as the clean final answer. Harmless for non-reasoning
+    # Groq models. Override the model via GROQ_MODEL / reasoning via GROQ_REASONING_FORMAT.
+    extra = {"reasoning_format": os.environ.get("GROQ_REASONING_FORMAT", "hidden")}
     return await _post_chat(
         "https://api.groq.com/openai/v1/chat/completions",
         {"Authorization": f"Bearer {GROQ_API_KEY}"},
-        LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60)
+        LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60,
+        extra_body=extra)
 
 
 async def _raw_deepseek_v4(system: str, user: str, max_tokens: int) -> str:
@@ -237,7 +252,9 @@ def llm_provider_status() -> Dict[str, Any]:
     """Snapshot for /settings/status — which providers are configured/cooling."""
     now = time.time()
     return {
-        "primary": "zen" if OPENCODE_ZEN_PRIMARY else "per-agent",
+        "primary": AGENTS_FORCE_PROVIDER or ("zen" if OPENCODE_ZEN_PRIMARY else "per-agent"),
+        "forced_provider": AGENTS_FORCE_PROVIDER or None,
+        "groq_model": LLAMA_MODEL,
         "chain": _build_provider_chain(),
         "providers": {
             n: {
@@ -269,6 +286,10 @@ async def call_llm_failover(system: str, user: str,
                             prefer: Optional[str] = None) -> str:
     """Single entrypoint every agent/tool uses. Walks the provider chain and
     returns the first working response, shifting providers on any failure."""
+    # Global pin (AGENTS_FORCE_PROVIDER) applies whenever a caller didn't request a
+    # specific provider — covers parallel_team / job_hunt / generic calls.
+    if prefer is None and AGENTS_FORCE_PROVIDER:
+        prefer = AGENTS_FORCE_PROVIDER
     cache_key = f"llm|{max_tokens}|{system}|{user}"
     cached = await redis_cache.get("llm", cache_key)
     if cached:
@@ -3250,6 +3271,10 @@ class BaseAgent:
         # pin a provider via force_prefer (used to keep the Chief on fast Groq);
         # otherwise Zen leads when primary, else the agent's own model. Any failure
         # shifts to the next provider automatically.
+        # Global override wins over everything (incl. force_prefer / per-agent model)
+        # so every agent shares one default brain when AGENTS_FORCE_PROVIDER is set.
+        if AGENTS_FORCE_PROVIDER:
+            return await call_llm_failover(system, user, prefer=AGENTS_FORCE_PROVIDER)
         if self.force_prefer:
             return await call_llm_failover(system, user, prefer=self.force_prefer)
         prefer = {"groq": "groq", "deepseek_v4": "deepseek_v4"}.get(self.model, "openrouter")
