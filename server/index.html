@@ -1294,9 +1294,19 @@ body.chat-view #content { overflow: hidden; }
     <div id="modal-agent-status" style="margin-bottom:12px"></div>
     <div id="modal-current-task" style="font-size:11px;font-family:var(--mono);color:var(--text2);margin-bottom:14px;min-height:14px"></div>
     <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:8px;display:flex;align-items:center;gap:8px">
-      Live Activity <span id="modal-live-dot" style="width:7px;height:7px;border-radius:50%;background:#00d4aa;display:none;animation:pulse 1.4s infinite"></span>
+      Live Thoughts <span id="modal-live-dot" style="width:7px;height:7px;border-radius:50%;background:#00d4aa;display:none;animation:pulse 1.4s infinite"></span>
     </div>
-    <div id="modal-activity" style="max-height:260px;overflow-y:auto;font-family:var(--mono);font-size:11px"></div>
+    <div id="modal-thoughts" style="max-height:150px;overflow-y:auto;font-family:var(--mono);font-size:11px;background:var(--glass);border-radius:6px;padding:8px;margin-bottom:14px"></div>
+    <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:8px">Talk to this agent</div>
+    <div style="display:flex;gap:6px;margin-bottom:14px">
+      <input id="modal-chat-input" type="text" placeholder="Ask this agent directly…" style="flex:1;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:12px" onkeydown="if(event.key==='Enter')sendAgentChat()">
+      <button class="btn btn-primary btn-sm" onclick="sendAgentChat()" id="modal-chat-send">Send</button>
+    </div>
+    <div id="modal-chat-thread" style="margin-bottom:14px"></div>
+    <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:8px;display:flex;align-items:center;gap:8px">
+      Recent Activity
+    </div>
+    <div id="modal-activity" style="max-height:200px;overflow-y:auto;font-family:var(--mono);font-size:11px"></div>
     <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin:14px 0 8px">Recent Tasks</div>
     <div id="modal-history"></div>
   </div>
@@ -1962,6 +1972,9 @@ function loadAgents() {
 }
 
 let _agentPollTimer = null;
+let _modalAgent = null;
+
+const _thoughtColor = { think:'#8b85ff', task:'#6c63ff', done:'#00d4aa', error:'#ff4d6a', dispatch:'#ffb020', observe:'#00d4aa', reflect:'#8b85ff' };
 
 async function renderAgentActivity(name) {
   let d = null;
@@ -1977,6 +1990,16 @@ async function renderAgentActivity(name) {
     : '<span style="color:var(--text3)">idle — no active task</span>';
   const dot = document.getElementById('modal-live-dot');
   if (dot) dot.style.display = d.status === 'running' ? 'inline-block' : 'none';
+  // live thought-stream
+  const th = document.getElementById('modal-thoughts');
+  if (th) {
+    const ts = d.thoughts || [];
+    const atBottom = th.scrollHeight - th.scrollTop - th.clientHeight < 30;
+    th.innerHTML = ts.length ? ts.map(t =>
+      `<div style="display:flex;gap:6px;padding:2px 0"><span style="color:${_thoughtColor[t.kind] || '#8b85ff'}">●</span><span style="color:var(--text2);white-space:pre-wrap;word-break:break-word">${escHtml(t.text)}</span></div>`
+    ).join('') : '<div style="color:var(--text3)">No thoughts yet — this agent is idle.</div>';
+    if (atBottom) th.scrollTop = th.scrollHeight;
+  }
   const act = document.getElementById('modal-activity');
   if (act) {
     const rows = d.recent || [];
@@ -2012,18 +2035,58 @@ async function openAgentModal(name) {
       </div>`
     ).join('') : '<div class="empty-state"><div>No recent tasks</div></div>';
   }
+  // reset the direct-chat thread for this agent
+  _modalAgent = name;
+  const thread = document.getElementById('modal-chat-thread'); if (thread) thread.innerHTML = '';
+  const cin = document.getElementById('modal-chat-input'); if (cin) cin.value = '';
   // live activity + focus the agent in the flow graph
   await renderAgentActivity(name);
-  if (window.flow && flow.setFocus) flow.setFocus(name);
+  if (typeof flow !== 'undefined' && flow.setFocus) flow.setFocus(name);
   if (_agentPollTimer) clearInterval(_agentPollTimer);
-  _agentPollTimer = setInterval(() => renderAgentActivity(name), 2500);
+  _agentPollTimer = setInterval(() => renderAgentActivity(name), 1500);
   document.getElementById('agent-modal').classList.add('open');
+}
+
+async function sendAgentChat() {
+  const input = document.getElementById('modal-chat-input');
+  const thread = document.getElementById('modal-chat-thread');
+  const btn = document.getElementById('modal-chat-send');
+  if (!input || !_modalAgent) return;
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  const add = (who, text, cls) => {
+    if (!thread) return;
+    const d = document.createElement('div');
+    d.style.cssText = 'margin-bottom:6px;padding:6px 8px;border-radius:6px;background:var(--glass);font-size:12px;white-space:pre-wrap;word-break:break-word';
+    d.innerHTML = `<span style="color:${cls};font-family:var(--mono);font-size:10px">${escHtml(who)}</span><br>${escHtml(text)}`;
+    thread.appendChild(d); thread.scrollTop = thread.scrollHeight;
+  };
+  add('You', msg, '#6c63ff');
+  const pending = document.createElement('div');
+  pending.style.cssText = 'color:var(--text3);font-size:11px;margin-bottom:6px'; pending.textContent = _modalAgent + ' is thinking…';
+  if (thread) { thread.appendChild(pending); thread.scrollTop = thread.scrollHeight; }
+  try {
+    const r = await fetch('/agents/' + encodeURIComponent(_modalAgent) + '/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg })
+    });
+    const data = await r.json();
+    pending.remove();
+    add(_modalAgent, (data && data.response) ? data.response : (data && data.error) || 'No response', '#00d4aa');
+  } catch (e) {
+    pending.remove();
+    add('Error', String(e), '#ff4d6a');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
+  }
 }
 
 function closeModal() {
   document.getElementById('agent-modal').classList.remove('open');
   if (_agentPollTimer) { clearInterval(_agentPollTimer); _agentPollTimer = null; }
-  if (window.flow && flow.clearFocus) flow.clearFocus();
+  _modalAgent = null;
+  if (typeof flow !== 'undefined' && flow.clearFocus) flow.clearFocus();
 }
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
@@ -2951,6 +3014,7 @@ const flow = {
     if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) return;
     const n = this._hitAgent(x, y);
     if (n && document.getElementById('agent-modal')) openAgentModal(n.name);
+    else if (!n) this.clearFocus();   // click empty space → clear focus
   },
 };
 

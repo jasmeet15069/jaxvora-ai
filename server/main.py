@@ -18,7 +18,7 @@ import sys
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Set, Callable
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -1227,6 +1227,38 @@ def memory_format(turns: List[Dict[str, str]]) -> str:
         lines.append(f"{who}: {t['content'][:600]}")
     return ("=== Recent conversation (for context — do not repeat verbatim) ===\n"
             + "\n".join(lines) + "\n=== End recent conversation ===")
+
+
+# === Live thought-stream =======================================================
+# Per-agent ring buffer of recent reasoning/activity lines, fed by the TAOR loop
+# (via AgentGraphState.add_step), BaseAgent.run/call_llm, and direct agent chat.
+# Polled by the focus modal for a live "watch it think" stream. In-memory only.
+AGENT_THOUGHTS: Dict[str, deque] = {}
+_THOUGHT_SEQ = 0
+
+
+def record_thought(agent_name: str, text: str, kind: str = "info") -> None:
+    global _THOUGHT_SEQ
+    if not agent_name or not text:
+        return
+    dq = AGENT_THOUGHTS.get(agent_name)
+    if dq is None:
+        dq = deque(maxlen=50)
+        AGENT_THOUGHTS[agent_name] = dq
+    _THOUGHT_SEQ += 1
+    try:
+        ts = time.time()
+    except Exception:
+        ts = 0
+    dq.append({"id": _THOUGHT_SEQ, "t": ts, "kind": str(kind)[:16], "text": str(text)[:400]})
+
+
+def thoughts_for(agent_name: str, since: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+    dq = AGENT_THOUGHTS.get(agent_name)
+    if not dq:
+        return []
+    items = [x for x in dq if x["id"] > since]
+    return items[-limit:]
 
 
 async def log_to_db(level: str, message: str, task_id: Optional[str] = None):
@@ -3406,6 +3438,7 @@ class BaseAgent:
         # shifts to the next provider automatically.
         # Global override wins over everything (incl. force_prefer / per-agent model)
         # so every agent shares one default brain when AGENTS_FORCE_PROVIDER is set.
+        record_thought(self.name, "🧠 thinking…", "think")
         if AGENTS_FORCE_PROVIDER:
             return await call_llm_failover(system, user, prefer=AGENTS_FORCE_PROVIDER)
         if self.force_prefer:
@@ -3416,6 +3449,7 @@ class BaseAgent:
     async def run(self, task: str, project_id: Optional[str] = None) -> AgentResult:
         self._status = "running"
         self._current_task = task
+        record_thought(self.name, f"▸ received task: {task[:120]}", "task")
         task_id = str(uuid.uuid4())
         try:
             await db_execute(
@@ -3460,6 +3494,7 @@ class BaseAgent:
                 await ws_manager.broadcast_agent_status(self.name, "error", str(e)[:60])
             except Exception:
                 pass
+            record_thought(self.name, f"✗ error: {str(e)[:120]}", "error")
             return AgentResult(self.name, task, f"Error: {e}\n{tb}", False, task_id)
 
         try:
@@ -3474,6 +3509,7 @@ class BaseAgent:
             await log_to_db("INFO", f"[{self.name}] Completed ✓", task_id)
         except Exception as e:
             logger.warning(f"[{self.name}] Post-execution bookkeeping failed: {e}")
+        record_thought(self.name, "✓ completed", "done")
         self._status = "idle"
         self._current_task = ""
         await ws_manager.broadcast_agent_status(self.name, "idle", "")
@@ -3535,6 +3571,8 @@ class AgentGraphState:
             "status": status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        # mirror into the live thought-stream so the focus modal can watch it think
+        record_thought(agent or "Chief Orchestrator", f"{type_}: {description}", type_)
 
     def add_message(self, role: str, content: str):
         self.messages.append({"role": role, "content": content})
@@ -5920,7 +5958,63 @@ async def agent_activity(name: str):
         "current_task": agent._current_task,
         "collaborators": AGENT_NETWORK.get(agent.name, []),
         "recent": recent, "history": history,
+        "thoughts": thoughts_for(agent.name),
     }
+
+
+@app.get("/agents/{name}/stream")
+async def agent_stream(name: str, since: int = 0):
+    """Incremental live thought-stream for one agent (poll with the last seen id)."""
+    agent = AGENT_REGISTRY.get(name) or next(
+        (a for a in AGENT_REGISTRY.values() if a.name.lower() == name.lower()), None)
+    if agent is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown agent '{name}'"})
+    return {"ok": True, "name": agent.name, "status": agent._status,
+            "current_task": agent._current_task, "thoughts": thoughts_for(agent.name, since)}
+
+
+class AgentChatRequest(BaseModel):
+    message: str
+
+
+@app.post("/agents/{name}/chat")
+async def agent_chat(name: str, req: AgentChatRequest):
+    """Talk directly to ONE agent (bypasses the Chief orchestrator). Fast single-agent
+    reply that uses conversation memory for context. Persists the turn to memory."""
+    agent = AGENT_REGISTRY.get(name) or next(
+        (a for a in AGENT_REGISTRY.values() if a.name.lower() == name.lower()), None)
+    if agent is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown agent '{name}'"})
+    msg = (req.message or "").strip()
+    if not msg:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "message is required"})
+
+    record_thought(agent.name, f"▸ direct chat: {msg[:120]}", "task")
+    agent._status = "running"
+    agent._current_task = f"Direct chat: {msg[:60]}"
+    try:
+        await ws_manager.broadcast_agent_status(agent.name, "running", msg[:60])
+    except Exception:
+        pass
+    mem_ctx = memory_format(await memory_recent())
+    sys_prompt = getattr(agent, "system_prompt", "") or agent.description or f"You are {agent.name}."
+    user_prompt = (f"{mem_ctx}\n\nUser (talking directly to you, {agent.name}): {msg}"
+                   if mem_ctx else f"User (talking directly to you, {agent.name}): {msg}")
+    try:
+        reply = await agent.call_llm(sys_prompt, user_prompt)
+    except Exception as e:
+        reply = f"[error: {e}]"
+    finally:
+        agent._status = "idle"
+        agent._current_task = ""
+        try:
+            await ws_manager.broadcast_agent_status(agent.name, "idle", "")
+        except Exception:
+            pass
+    record_thought(agent.name, "✓ replied", "done")
+    await memory_append("user", msg)
+    await memory_append("assistant", reply, agent=agent.name)
+    return {"ok": True, "agent": agent.name, "response": reply}
 
 
 @app.get("/organization")
