@@ -184,6 +184,26 @@ def _cooldown_for(msg: str) -> float:
 
 class _RetryableLLMError(Exception):
     """Transient provider failure (429 / timeout) — retry same provider briefly."""
+    retry_after: float = 0.0
+
+
+def _parse_retry_after(raw: str) -> float:
+    """Parse a retry-after / rate-limit-reset value ('2', '590ms', '1m26.4s') → seconds."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return 0.0
+    try:
+        if s.endswith("ms"):
+            return float(s[:-2]) / 1000.0
+        if "m" in s or "s" in s:
+            mins = re.search(r'([\d.]+)m(?!s)', s)
+            secs = re.search(r'([\d.]+)s', s)
+            total = (float(mins.group(1)) * 60 if mins else 0.0) + (float(secs.group(1)) if secs else 0.0)
+            if total:
+                return total
+        return float(s)
+    except Exception:
+        return 0.0
 
 
 async def _post_chat(url: str, headers: Dict[str, str], model: str,
@@ -213,7 +233,15 @@ async def _post_chat(url: str, headers: Dict[str, str], model: str,
                     json=body,
                 )
             if r.status_code == 429 or r.status_code >= 500:
-                raise _RetryableLLMError(f"HTTP {r.status_code}")
+                err = _RetryableLLMError(f"HTTP {r.status_code}")
+                if r.status_code == 429:
+                    # Groq TPM resets fast (often <2s) — honor the header so we wait the
+                    # right amount and retry on a fresh key instead of giving up.
+                    err.retry_after = _parse_retry_after(
+                        r.headers.get("retry-after")
+                        or r.headers.get("x-ratelimit-reset-tokens")
+                        or r.headers.get("x-ratelimit-reset-requests") or "")
+                raise err
             if r.status_code >= 400:
                 # auth/payment/other client errors — non-retryable; keep the status code
                 # in the message so the failover can pick a long (auth) cooldown.
@@ -331,17 +359,22 @@ def llm_provider_status() -> Dict[str, Any]:
 
 
 async def _provider_attempt(name: str, system: str, user: str, max_tokens: int) -> str:
-    """Try one provider with brief in-place retry for transient (429/timeout)."""
+    """Try one provider with in-place retry for transient (429/timeout). For a pooled
+    provider (Groq with N keys) we retry enough to cycle every key, waiting the header's
+    reset time (capped) — Groq TPM resets in ~1-2s, so this turns a burst 429 into a
+    success on a fresh key instead of a hard failure when no other provider has credits."""
     fn = _PROVIDERS[name]["fn"]
-    delays = [0, 1, 3]
+    pooled = name == "groq" and len(GROQ_API_KEYS) > 1
+    attempts = max(6, len(GROQ_API_KEYS) + 2) if pooled else 3
     last: Optional[Exception] = None
-    for d in delays:
-        if d:
-            await asyncio.sleep(d)
+    for i in range(attempts):
         try:
             return await fn(system, user, max_tokens)
         except _RetryableLLMError as e:
             last = e
+            wait = getattr(e, "retry_after", 0.0) or 0.0
+            wait = min(wait if wait > 0 else (1.0 + i), 4.0)  # cap each wait at 4s
+            await asyncio.sleep(wait)
             continue
     raise last or RuntimeError("retryable attempts exhausted")
 
@@ -1279,6 +1312,25 @@ def thoughts_for(agent_name: str, since: int = 0, limit: int = 50) -> List[Dict[
         return []
     items = [x for x in dq if x["id"] > since]
     return items[-limit:]
+
+
+# Action verbs that signal a real multi-step task needing the full TAOR orchestration.
+# Anything else (greetings, simple questions) takes a cheap single-call fast-path —
+# this is the main lever against Groq TPM 429s, since one call ≪ a full agent loop.
+_TASK_HINTS = re.compile(
+    r"\b(build|create|make me|deploy|implement|write (a|the|some|code|tests?)|refactor|"
+    r"fix|debug|run|execute|scan|audit|generate|design|set ?up|configure|install|"
+    r"send (an )?email|apply (to|for)|search (for )?jobs?|find jobs?|scrape|automate|"
+    r"migrate|integrate|orchestrate|dispatch|use the team|parallel|add (a|an|the)?\s*"
+    r"(feature|endpoint|page|tool|agent)|ssh|commit|push)\b", re.IGNORECASE)
+
+
+def is_simple_chat(msg: str) -> bool:
+    """True for short conversational/Q&A messages that don't need the agent team."""
+    m = (msg or "").strip()
+    if not m or len(m) > 280:
+        return False
+    return not _TASK_HINTS.search(m)
 
 
 async def log_to_db(level: str, message: str, task_id: Optional[str] = None):
@@ -4966,6 +5018,30 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
             result = await handler(user_input)
             if result:
                 return result
+
+        # ── Fast-path: simple chat answers in ONE compact call, skipping the heavy TAOR
+        # loop. This is the primary defence against Groq TPM 429s — most messages are
+        # small talk / Q&A that don't need the 37-agent orchestration. Real tasks (build,
+        # deploy, fix, search jobs, …) fall through to the full loop below.
+        if is_simple_chat(user_input) and not (confirmation_response and user_input.startswith("__CONFIRM")):
+            try:
+                _mem = memory_format(await memory_recent())
+                _sys = ("You are Jaxvora, a friendly multi-agent AI assistant for data, BI, "
+                        "Power BI and career help. Answer the user directly and concisely. "
+                        "If they later ask for a multi-step build/deploy/automation task, you'll "
+                        "coordinate the specialist team. Do not invent personal facts about the user.")
+                _up = f"{_mem}\n\nUser: {user_input}" if _mem else user_input
+                record_thought("Chief Orchestrator", f"⚡ quick answer: {user_input[:80]}", "think")
+                _fast = await call_orchestrator_llm(_sys, _up, max_tokens=DEFAULT_MAX_TOKENS)
+                if _fast and not _fast.startswith("[All LLM providers"):
+                    await memory_append("user", user_input)
+                    await memory_append("assistant", _fast)
+                    return {"plan": "Direct answer (fast-path)", "agents": [], "response": _fast,
+                            "results": [], "steps": [],
+                            "organization": {"mode": "fast_chat"}}
+                # else: fall through to the full loop / fallbacks
+            except Exception as e:
+                logger.warning(f"fast-path failed, using full loop: {e}")
 
         # ── Groq prompt enhancer (cheap prep for better TAOR results) ──
         _enhanced_input = await self._enhance_prompt(user_input)
