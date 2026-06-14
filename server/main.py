@@ -4904,8 +4904,32 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── Workspace routes ─────────────────────────────────────────────────────────────
 
+# Dependency/cache/build dirs the Computer browser hides by default — they're tool
+# artifacts (e.g. an agent's `pdfenv` virtualenv for parsing a resume PDF), not user
+# work, and bury real files. Override per-call with ?show_all=true.
+WS_NOISE_NAMES = {
+    "__pycache__", "node_modules", ".git", ".venv", "venv", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".cache", ".idea", ".vscode", ".DS_Store",
+    "site-packages", ".egg-info",
+}
+
+
+def _ws_is_noise(f: Path) -> bool:
+    name = f.name
+    if name in WS_NOISE_NAMES or name.endswith(".egg-info"):
+        return True
+    if f.is_dir():
+        try:
+            # Any Python virtualenv (e.g. pdfenv) — identified by its pyvenv.cfg.
+            if (f / "pyvenv.cfg").exists():
+                return True
+        except Exception:
+            pass
+    return False
+
+
 @app.get("/workspace")
-async def workspace_list(subdir: str = ""):
+async def workspace_list(subdir: str = "", show_all: bool = False):
     base = WORKSPACE_DIR.resolve()
     target = (base / subdir).resolve()
     if not str(target).startswith(str(base)):
@@ -4914,7 +4938,11 @@ async def workspace_list(subdir: str = ""):
         return {"ok": True, "files": [], "path": str(target)}
     try:
         files = []
+        hidden = 0
         for f in sorted(target.iterdir()):
+            if not show_all and _ws_is_noise(f):
+                hidden += 1
+                continue
             files.append({
                 "name": f.name,
                 "path": str(f.relative_to(base)),
@@ -4922,7 +4950,7 @@ async def workspace_list(subdir: str = ""):
                 "size": f.stat().st_size if f.is_file() else 0,
                 "modified": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
             })
-        return {"ok": True, "files": files, "path": str(target)}
+        return {"ok": True, "files": files, "path": str(target), "hidden": hidden}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
