@@ -1409,7 +1409,7 @@ class FileSystemTool(MCPTool):
             if action == "read":
                 if not resolved.exists():
                     return f"file_system: not found: {rel}"
-                # PDFs are binary — extract real text instead of returning mojibake.
+                # PDFs/Excel are binary — extract real text instead of returning mojibake.
                 if resolved.suffix.lower() == ".pdf":
                     try:
                         info = _extract_pdf_upload_text(resolved.read_bytes())
@@ -1418,6 +1418,14 @@ class FileSystemTool(MCPTool):
                         return f"file_system: could not extract PDF text from {rel}: {info.get('error', 'no text')}"
                     except Exception as e:
                         return f"file_system: PDF read error for {rel}: {e}"
+                if resolved.suffix.lower() in (".xlsx", ".xlsm", ".xltx"):
+                    try:
+                        info = _extract_xlsx_text(resolved.read_bytes())
+                        if info.get("ok") and info.get("content"):
+                            return f"[Excel {rel} — {info.get('pages', '?')} sheet(s)]\n{info['content'][:20000]}"
+                        return f"file_system: could not extract Excel data from {rel}: {info.get('error', 'no data')}"
+                    except Exception as e:
+                        return f"file_system: Excel read error for {rel}: {e}"
                 return resolved.read_text(encoding="utf-8", errors="ignore")[:20000]
             if action == "write":
                 resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -4536,7 +4544,7 @@ Always respond in this JSON format:
         return "%PDF" in sample or ("/Type /Catalog" in sample and "endobj" in sample and "stream" in sample)
 
     _WS_READ_VERB = re.compile(r'\b(read|open|show|view|summari[sz]e|analy[sz]e|review|look at|extract|parse|check)\b', re.IGNORECASE)
-    _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report)\b', re.IGNORECASE)
+    _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report|data|dataset|excel|spreadsheet|xlsx?|sheet|csv|stock)\b', re.IGNORECASE)
 
     async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
         """Deterministically answer about the Computer workspace: LIST what's there
@@ -4618,10 +4626,11 @@ Always respond in this JSON format:
 
         def score(f: Path) -> int:
             n = f.name.lower(); s = 0
-            for kw in ("resume", "cv", "power", "bi", "report", "invoice", "cover"):
+            for kw in ("resume", "cv", "power", "bi", "report", "invoice", "cover", "stock", "data", "sales"):
                 if kw in low and kw in n:
                     s += 5
-            if f.suffix.lower() == ".pdf" and any(k in low for k in ("pdf", "resume", "cv")):
+            if f.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv") and any(
+                    k in low for k in ("pdf", "resume", "cv", "excel", "spreadsheet", "data", "sheet", "stock", "csv")):
                 s += 2
             for tok in toks:
                 if tok in n:
@@ -4630,7 +4639,7 @@ Always respond in this JSON format:
 
         best = max(files, key=score)
         if score(best) == 0:
-            docs = [f for f in files if f.suffix.lower() in (".pdf", ".txt", ".md", ".docx", ".csv")]
+            docs = [f for f in files if f.suffix.lower() in (".pdf", ".txt", ".md", ".docx", ".csv", ".xlsx", ".xls", ".xlsm")]
             if len(docs) == 1:
                 best = docs[0]
             else:
@@ -6939,6 +6948,204 @@ def _extract_pdf_upload_text(content: bytes) -> Dict[str, Any]:
         }
 
 
+def _looks_like_xlsx_bytes(content: bytes, filename: str, content_type: str) -> bool:
+    fn = (filename or "").lower()
+    ct = (content_type or "").lower()
+    return (fn.endswith((".xlsx", ".xlsm", ".xltx"))
+            or "spreadsheetml" in ct
+            or "officedocument.spreadsheet" in ct)
+
+
+def _extract_xlsx_text(content: bytes) -> Dict[str, Any]:
+    """Parse a .xlsx into clean markdown tables (one per sheet) so agents get real data,
+    not the raw OOXML the ZIP path would otherwise dump."""
+    try:
+        import openpyxl
+    except Exception as exc:
+        return {"ok": False, "error": f"Excel parser not installed ({type(exc).__name__})",
+                "content": "", "pages": 0, "truncated": False}
+    try:
+        wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not open Excel file: {exc}",
+                "content": "", "pages": 0, "truncated": False}
+    parts: List[str] = []
+    sheet_count = 0
+    try:
+        for ws in wb.worksheets:
+            sheet_count += 1
+            rows: List[List[str]] = []
+            for row in ws.iter_rows(values_only=True):
+                if row is None:
+                    continue
+                cells = ["" if v is None else str(v) for v in row]
+                if not any(c.strip() for c in cells):
+                    continue
+                rows.append(cells)
+                if len(rows) >= 300:  # cap rows per sheet
+                    break
+            if not rows:
+                continue
+            width = max(len(r) for r in rows)
+            rows = [r + [""] * (width - len(r)) for r in rows]
+
+            def _fmt(c: str) -> str:
+                return c.replace("|", "\\|").replace("\n", " ").strip()[:80]
+
+            header = [_fmt(c) or f"col{i+1}" for i, c in enumerate(rows[0])]
+            md = ["| " + " | ".join(header) + " |",
+                  "| " + " | ".join(["---"] * width) + " |"]
+            for r in rows[1:]:
+                md.append("| " + " | ".join(_fmt(c) for c in r) + " |")
+            parts.append(f"### Sheet: {ws.title} ({len(rows)} rows × {width} cols)\n" + "\n".join(md))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    if not parts:
+        return {"ok": False, "error": "Excel file has no readable cells.",
+                "content": "", "pages": 0, "truncated": False}
+    text = _clean_upload_text("\n\n".join(parts))
+    truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
+    if truncated:
+        text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
+    return {"ok": True, "error": "", "content": text, "pages": sheet_count, "truncated": truncated}
+
+
+def _looks_like_docx(filename: str, content_type: str) -> bool:
+    fn = (filename or "").lower()
+    return fn.endswith(".docx") or "wordprocessingml" in (content_type or "").lower()
+
+
+def _extract_docx_text(content: bytes) -> Dict[str, Any]:
+    """Extract text from a .docx (a zip) without external deps — read word/document.xml."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(BytesIO(content)) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "replace")
+        xml = re.sub(r"</w:p>", "\n", xml)
+        xml = re.sub(r"<w:tab[ /]", "\t", xml)
+        text = _clean_upload_text(html.unescape(re.sub(r"<[^>]+>", "", xml)))
+        if not text.strip():
+            return {"ok": False, "error": "DOCX has no readable text", "content": "", "pages": 0, "truncated": False}
+        truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
+        return {"ok": True, "error": "", "content": text[:MAX_UPLOAD_TEXT_CHARS], "pages": 0, "truncated": truncated}
+    except Exception as e:
+        return {"ok": False, "error": f"DOCX parse failed: {e}", "content": "", "pages": 0, "truncated": False}
+
+
+def _binary_strings(content: bytes, min_len: int = 4, limit: int = 16000) -> str:
+    """Extract printable ASCII runs from binary data (like the unix `strings` tool)."""
+    out: List[str] = []
+    cur = bytearray()
+    total = 0
+    for b in content:
+        if 32 <= b < 127:
+            cur.append(b)
+        else:
+            if len(cur) >= min_len:
+                s = cur.decode("ascii", "ignore"); out.append(s); total += len(s)
+            cur = bytearray()
+            if total > limit:
+                break
+    if len(cur) >= min_len and total <= limit:
+        out.append(cur.decode("ascii", "ignore"))
+    return "\n".join(out)[:limit]
+
+
+_MAGIC = [
+    (b"\x89PNG", "PNG image"), (b"\xff\xd8\xff", "JPEG image"), (b"GIF8", "GIF image"),
+    (b"BM", "BMP image"), (b"RIFF", "RIFF media (WAV/AVI/WEBP)"), (b"\x00\x00\x01\x00", "ICO icon"),
+    (b"OggS", "OGG audio"), (b"ID3", "MP3 audio"), (b"\x1aE\xdf\xa3", "Matroska/WebM video"),
+    (b"\x7fELF", "ELF executable"), (b"MZ", "Windows PE/EXE"), (b"\xca\xfe\xba\xbe", "Java class/Mach-O"),
+    (b"%PDF", "PDF"), (b"PK\x03\x04", "ZIP-based (office/jar/zip)"),
+]
+
+
+def _classify_binary(content: bytes, filename: str, content_type: str) -> str:
+    head = content[:16]
+    for sig, name in _MAGIC:
+        if head.startswith(sig):
+            return name
+    ext = (Path(filename).suffix or "").lower().lstrip(".")
+    if ext in ("png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico", "tiff"):
+        return f"{ext.upper()} image"
+    if ext in ("mp3", "wav", "flac", "aac", "ogg", "m4a"):
+        return f"{ext.upper()} audio"
+    if ext in ("mp4", "mov", "avi", "mkv", "webm", "wmv"):
+        return f"{ext.upper()} video"
+    if ext in ("exe", "dll", "so", "bin", "o", "a", "dylib"):
+        return f"{ext.upper()} binary/executable"
+    return content_type or "unknown binary"
+
+
+def _describe_binary(content: bytes, filename: str, content_type: str) -> Dict[str, Any]:
+    """Best-effort 'parse' for binaries we can't fully decode (images, audio/video, exes,
+    unknown): report type + size + a hex header + any embedded printable strings. Honest
+    about what needs OCR / vision / transcription that this server doesn't run."""
+    kind = _classify_binary(content, filename, content_type)
+    size_kb = len(content) / 1024
+    hex_head = content[:24].hex(" ")
+    strings = _binary_strings(content)
+    note = ""
+    k = kind.lower()
+    if "image" in k:
+        note = "Image content can't be OCR'd/described here (no vision model wired in). Metadata + any embedded text below."
+    elif "audio" in k or "video" in k:
+        note = "Audio/video can't be transcribed here (no speech-to-text wired in). Metadata + any embedded text below."
+    elif "executable" in k or "binary" in k or "elf" in k or "exe" in k or "pe/" in k:
+        note = "Binary/executable — showing type, header, and extracted printable strings."
+    lines = [f"**File type:** {kind}", f"**Size:** {size_kb:.1f} KB", f"**Header (hex):** {hex_head}"]
+    if note:
+        lines.append(f"**Note:** {note}")
+    if strings.strip():
+        lines.append("\n**Embedded printable strings:**\n```\n" + strings[:8000] + "\n```")
+    else:
+        lines.append("\n_No printable text found in this file._")
+    text = "\n".join(lines)
+    return {"ok": True, "error": "", "content": text[:MAX_UPLOAD_TEXT_CHARS], "pages": 0,
+            "truncated": len(text) > MAX_UPLOAD_TEXT_CHARS, "binary": True, "kind": kind}
+
+
+def _try_decode_text(content: bytes) -> Optional[str]:
+    """Return decoded text if the bytes are predominantly printable (covers ALL code/text
+    formats — .py/.java/.cpp/.go/.js/.html/.css/.php/.tex/.csv/.json/… — without enumerating)."""
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            text = content.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        sample = text[:4000]
+        if not sample:
+            return text
+        printable = sum(1 for c in sample if c.isprintable() or c in "\n\r\t")
+        if printable / len(sample) >= 0.85:
+            return text
+    return None
+
+
+def _maybe_base64(content: bytes, filename: str) -> Optional[bytes]:
+    """If the upload is a base64 text blob (or .b64 file), decode it back to raw bytes."""
+    fn = (filename or "").lower()
+    try:
+        s = content.decode("ascii").strip()
+    except Exception:
+        return None
+    compact = re.sub(r"\s+", "", s)
+    if len(compact) < 16 or len(compact) % 4 != 0:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
+        return None
+    if not (fn.endswith(".b64") or fn.endswith(".base64") or len(compact) > 128):
+        return None
+    try:
+        import base64 as _b64
+        return _b64.b64decode(compact, validate=True)
+    except Exception:
+        return None
+
+
 def _extract_upload_text(content: bytes, filename: str, content_type: str) -> Dict[str, Any]:
     if len(content) > MAX_UPLOAD_BYTES:
         return {
@@ -6949,60 +7156,44 @@ def _extract_upload_text(content: bytes, filename: str, content_type: str) -> Di
             "truncated": False,
         }
 
+    # Universal extractor — handles ANY file: structured docs, all text/code, archives,
+    # base64 blobs, and binaries (images/audio/video/exe) via metadata + embedded strings.
+
+    # 0) base64 text blob → decode and re-dispatch on the real bytes (once).
+    decoded = _maybe_base64(content, filename)
+    if decoded is not None and decoded[:8] != content[:8]:
+        inner = _extract_upload_text(decoded, re.sub(r"\.(b64|base64)$", "", filename or ""), "")
+        if inner.get("ok"):
+            inner["content"] = "[decoded from base64]\n\n" + inner["content"]
+            return inner
+
+    # 1) Structured documents.
     if _looks_like_pdf_bytes(content, filename, content_type):
         return _extract_pdf_upload_text(content)
+    if _looks_like_xlsx_bytes(content, filename, content_type):
+        return _extract_xlsx_text(content)          # .xlsx is a ZIP — parse before archive
+    if _looks_like_docx(filename, content_type):
+        return _extract_docx_text(content)          # .docx is a ZIP — parse before archive
 
+    # 2) Real archives (zip/tar) → concatenated member text.
     archive_result = _try_extract_archive(content, filename)
     if archive_result:
         text = _clean_upload_text(archive_result["content"])
         truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
-        if truncated:
-            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
-        return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
+        return {"ok": True, "error": "", "content": text[:MAX_UPLOAD_TEXT_CHARS] if truncated else text,
+                "pages": 0, "truncated": truncated}
 
-    text_types = (
-        "text/",
-        "application/json",
-        "application/xml",
-        "application/x-yaml",
-        "application/yaml",
-        "application/javascript",
-    )
-    text_extensions = (
-        ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
-        ".js", ".ts", ".py", ".html", ".css",
-        ".skill", ".ps1", ".sh", ".bat", ".cmd", ".sql", ".log",
-        ".env", ".toml", ".ini", ".cfg", ".conf",
-        ".svg", ".gradle", ".kt", ".swift", ".go", ".rb", ".php",
-        ".pl", ".r", ".lua", ".proto", ".graphql", ".prisma",
-        ".tf", ".hcl", ".vue", ".svelte", ".astro", ".tsx", ".jsx",
-        ".mjs", ".cjs", ".mts", ".cts", ".zig", ".nim", ".rs",
-        ".dockerfile", ".makefile", ".cmake",
-    )
-    known_text = content_type.lower().startswith(text_types) or filename.lower().endswith(text_extensions)
-    if known_text:
-        text = _clean_upload_text(content.decode("utf-8", errors="replace"))
+    # 3) Anything that decodes as predominantly-printable text — covers EVERY code/markup/
+    #    data format (.py/.java/.cpp/.go/.js/.html/.css/.php/.tex/.csv/.json/.yaml/…).
+    as_text = _try_decode_text(content)
+    if as_text is not None:
+        text = _clean_upload_text(as_text)
         truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
-        if truncated:
-            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
-        return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
+        return {"ok": True, "error": "", "content": text[:MAX_UPLOAD_TEXT_CHARS] if truncated else text,
+                "pages": 0, "truncated": truncated}
 
-    try:
-        text = _clean_upload_text(content.decode("utf-8"))
-        truncated = len(text) > MAX_UPLOAD_TEXT_CHARS
-        if truncated:
-            text = text[:MAX_UPLOAD_TEXT_CHARS].rstrip()
-        return {"ok": True, "error": "", "content": text, "pages": 0, "truncated": truncated}
-    except (UnicodeDecodeError, UnicodeError):
-        pass
-
-    return {
-        "ok": False,
-        "error": f"Could not read file: {filename}. Jaxvora supports text files (code, docs, data), PDFs, and archives (ZIP, TAR). Binary files are not supported.",
-        "content": "",
-        "pages": 0,
-        "truncated": False,
-    }
+    # 4) True binary (image/audio/video/exe/unknown) → metadata + embedded strings.
+    return _describe_binary(content, filename, content_type)
 
 
 @app.post("/upload")
