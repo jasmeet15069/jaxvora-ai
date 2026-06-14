@@ -4539,19 +4539,52 @@ Always respond in this JSON format:
     _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report)\b', re.IGNORECASE)
 
     async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
-        """Deterministically read a file from the workspace and answer about it — instead
-        of hoping the TAOR loop calls the file_system tool. Finds the best-matching file
-        (resume/cv/pdf/named), reads its text (PDF-aware), and answers in one call."""
+        """Deterministically answer about the Computer workspace: LIST what's there
+        ('what can you see in computer'), or READ a specific file ('summarize my resume')
+        — instead of hoping the TAOR loop calls the file_system tool."""
         t = (user_input or "").strip()
-        if len(t) > 400 or not (self._WS_READ_VERB.search(t) and self._WS_READ_NOUN.search(t)):
-            return None
-        try:
-            files = [f for f in WORKSPACE_DIR.iterdir() if f.is_file() and not _ws_is_noise(f)]
-        except Exception:
-            return None
-        if not files:
+        if len(t) > 400:
             return None
         low = t.lower()
+        mentions_ws = bool(re.search(r'\b(computer|workspace|files?|folder|directory|documents?)\b', low))
+        try:
+            entries = [f for f in WORKSPACE_DIR.iterdir() if not _ws_is_noise(f)]
+        except Exception:
+            return None
+
+        # ── LIST intent: "what can you see in computer", "list my files", "what's in workspace"
+        list_q = mentions_ws and bool(re.search(r'\b(what|which|list|show|see|view|have|contents?|inside|browse)\b', low))
+        read_q = bool(self._WS_READ_VERB.search(t) and self._WS_READ_NOUN.search(t))
+        wants_specific = any(k in low for k in ("resume", "cv", "summari", "analy", "open ", "read "))
+        if list_q and not (read_q and wants_specific):
+            if not entries:
+                resp = "Your Computer workspace is currently empty — drop a file in and I can read it."
+            else:
+                lines = []
+                for f in sorted(entries, key=lambda x: (not x.is_dir(), x.name.lower())):
+                    if f.is_dir():
+                        lines.append(f"📁 {f.name}/")
+                    else:
+                        try:
+                            kb = f.stat().st_size / 1024
+                            lines.append(f"📄 {f.name} ({kb:.0f} KB)")
+                        except Exception:
+                            lines.append(f"📄 {f.name}")
+                resp = ("Here's what I can see in your Computer workspace:\n\n" + "\n".join(lines)
+                        + "\n\nAsk me to read or summarize any of these — e.g. \"summarize my resume\".")
+            record_thought("Chief Orchestrator", "📂 listed workspace", "observe")
+            await memory_append("user", user_input)
+            await memory_append("assistant", resp)
+            return {"plan": "List the Computer workspace", "agents": ["Chief Orchestrator"],
+                    "response": resp, "results": [{"agent": "file_system", "success": True, "output": f"{len(entries)} items"}],
+                    "steps": [], "organization": {"mode": "workspace_list"}}
+
+        # ── READ intent: read the best-matching file and answer about it
+        if not read_q:
+            return None
+        files = [f for f in entries if f.is_file()]
+        if not files:
+            return None
         toks = [w for w in re.findall(r'[a-z0-9_]+', low) if len(w) > 3]
 
         def score(f: Path) -> int:
