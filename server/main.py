@@ -2250,7 +2250,7 @@ class PlaywrightTool(MCPTool):
                         return "playwright error: url required for screenshot"
                     await page.goto(url, timeout=timeout_s * 1000, wait_until="domcontentloaded")
                     await page.wait_for_timeout(1000)
-                    screenshot_path = str(self.SANDBOX / f"screenshot_{int(time.time())}.png")
+                    screenshot_path = str(self._artifacts() / f"screenshot_{int(time.time())}.png")
                     await page.screenshot(path=screenshot_path, full_page=True)
                     await browser.close()
                     return f"Screenshot saved to {screenshot_path}"
@@ -2327,7 +2327,7 @@ class PlaywrightTool(MCPTool):
 
                     block = await _detect_block(fpage)
                     if block:
-                        shot = str(self.SANDBOX / f"autofill_block_{int(time.time())}.png")
+                        shot = str(self._artifacts() / f"autofill_block_{int(time.time())}.png")
                         try:
                             await fpage.screenshot(path=shot, full_page=True)
                         except Exception:
@@ -2345,7 +2345,7 @@ class PlaywrightTool(MCPTool):
                         sub = await _submit_form(fpage, timeout_s)
                         result["submitted"] = bool(sub.get("ok"))
                         result["submit_detail"] = sub
-                    shot = str(self.SANDBOX / f"autofill_{int(time.time())}.png")
+                    shot = str(self._artifacts() / f"autofill_{int(time.time())}.png")
                     try:
                         await fpage.screenshot(path=shot, full_page=True)
                         result["screenshot"] = shot
@@ -2364,6 +2364,13 @@ class PlaywrightTool(MCPTool):
             return f"playwright error: {e}"
 
     SANDBOX = Path("/root/jaxvora-ai/workspace")
+
+    def _artifacts(self) -> Path:
+        """Hidden subdir for Jaxvora-generated files (screenshots) so they don't
+        clutter the user's Computer view. Dotdir → filtered by the workspace browser."""
+        d = self.SANDBOX / ".artifacts"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
 
 # ── Job-application form auto-fill helpers (used by PlaywrightTool.auto_fill) ──
@@ -4904,19 +4911,27 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── Workspace routes ─────────────────────────────────────────────────────────────
 
-# Dependency/cache/build dirs the Computer browser hides by default — they're tool
-# artifacts (e.g. an agent's `pdfenv` virtualenv for parsing a resume PDF), not user
-# work, and bury real files. Override per-call with ?show_all=true.
+# The Computer browser shows only what the USER added/created — Jaxvora's own config
+# and system artifacts are hidden by default (override per-call with ?show_all=true):
+#   • dotfiles/dirs (.git, .env, .artifacts, ...) — config/system, hidden like any file browser
+#   • dependency/cache/build dirs and Python virtualenvs (e.g. an agent's `pdfenv`)
+#   • Jaxvora-generated files: Playwright screenshots, compiled/log/lock files
 WS_NOISE_NAMES = {
-    "__pycache__", "node_modules", ".git", ".venv", "venv", ".mypy_cache",
-    ".pytest_cache", ".ruff_cache", ".cache", ".idea", ".vscode", ".DS_Store",
-    "site-packages", ".egg-info",
+    "__pycache__", "node_modules", "venv", "site-packages",
 }
+WS_NOISE_SUFFIXES = (".pyc", ".pyo", ".log", ".lock", ".egg-info")
+# Screenshots etc. the Playwright tool emits (now routed to .artifacts/, but match any
+# legacy ones left in the workspace root).
+WS_ARTIFACT_RE = re.compile(r"^(screenshot|autofill|autofill_block)_\d+\.png$")
 
 
 def _ws_is_noise(f: Path) -> bool:
     name = f.name
-    if name in WS_NOISE_NAMES or name.endswith(".egg-info"):
+    if name.startswith("."):                       # dotfiles/dirs = config/system
+        return True
+    if name in WS_NOISE_NAMES or name.endswith(WS_NOISE_SUFFIXES):
+        return True
+    if f.is_file() and WS_ARTIFACT_RE.match(name):
         return True
     if f.is_dir():
         try:
