@@ -1076,6 +1076,15 @@ CREATE TABLE IF NOT EXISTS jaxvora_ssh_audit (
     risk_level TEXT DEFAULT 'low',
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS jaxvora_chat_memory (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    agent TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_memory_created ON jaxvora_chat_memory (created_at DESC);
 """
 
 async def get_db() -> asyncpg.Pool:
@@ -1101,6 +1110,71 @@ async def db_fetchrow(query: str, *args) -> Optional[asyncpg.Record]:
     pool = await get_db()
     async with pool.acquire() as conn:
         return await conn.fetchrow(query, *args)
+
+
+# === Conversation memory ======================================================
+# Durable chat memory so agents recall prior turns across requests AND restarts.
+# Postgres (Neon) is the source of truth; a short Redis-cached window keeps recall
+# fast on the hot path. Toggle with CONVERSATION_MEMORY=0; window = MEMORY_TURNS.
+CONVERSATION_MEMORY = os.environ.get("CONVERSATION_MEMORY", "1") not in ("0", "false", "False", "no")
+MEMORY_TURNS = int(os.environ.get("MEMORY_TURNS", "10") or 10)
+_MEM_CACHE_NS = "chatmem"
+_MEM_CACHE_KEY = "recent"
+
+
+async def memory_append(role: str, content: str, agent: str = "") -> None:
+    """Persist one conversation turn (role=user|assistant). Best-effort; invalidates
+    the cached recall window so the next read reflects it."""
+    if not CONVERSATION_MEMORY or db_pool is None:
+        return
+    content = (content or "").strip()
+    if not content:
+        return
+    try:
+        await db_execute(
+            "INSERT INTO jaxvora_chat_memory (role, content, agent) VALUES ($1, $2, $3)",
+            role[:16], content[:8000], (agent or "")[:120])
+        await redis_cache.delete_prefix(_MEM_CACHE_NS)
+    except Exception as e:
+        logger.warning(f"memory_append failed: {e}")
+
+
+async def memory_recent(limit: int = MEMORY_TURNS) -> List[Dict[str, str]]:
+    """Last `limit` turns in chronological order. Redis-cached for speed."""
+    if not CONVERSATION_MEMORY or db_pool is None:
+        return []
+    cached = await redis_cache.get(_MEM_CACHE_NS, _MEM_CACHE_KEY)
+    if cached:
+        try:
+            return json.loads(cached)[-limit:]
+        except Exception:
+            pass
+    try:
+        rows = await db_fetch(
+            "SELECT role, content, agent, created_at FROM jaxvora_chat_memory "
+            "ORDER BY created_at DESC LIMIT $1", limit)
+    except Exception as e:
+        logger.warning(f"memory_recent failed: {e}")
+        return []
+    turns = [{"role": r["role"], "content": r["content"], "agent": r["agent"] or ""}
+             for r in reversed(rows)]
+    try:
+        await redis_cache.set(_MEM_CACHE_NS, _MEM_CACHE_KEY, json.dumps(turns), ttl=120)
+    except Exception:
+        pass
+    return turns
+
+
+def memory_format(turns: List[Dict[str, str]]) -> str:
+    """Render recent turns as a compact context block for the orchestrator prompt."""
+    if not turns:
+        return ""
+    lines = []
+    for t in turns:
+        who = "User" if t["role"] == "user" else (t["agent"] or "Assistant")
+        lines.append(f"{who}: {t['content'][:600]}")
+    return ("=== Recent conversation (for context — do not repeat verbatim) ===\n"
+            + "\n".join(lines) + "\n=== End recent conversation ===")
 
 
 async def log_to_db(level: str, message: str, task_id: Optional[str] = None):
@@ -4801,9 +4875,13 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
 
         # ── TAOR Loop ──
         try:
-            _taor_state = AgentGraphState(_enhanced_input, self.SYSTEM, max_iterations=8,
+            # Prepend durable conversation memory so the Chief recalls prior turns.
+            _mem_ctx = memory_format(await memory_recent())
+            _loop_input = (f"{_mem_ctx}\n\nCurrent request: {_enhanced_input}"
+                           if _mem_ctx else _enhanced_input)
+            _taor_state = AgentGraphState(_loop_input, self.SYSTEM, max_iterations=8,
                                           cancel_flag=cancel_flag)
-            _taor_state.add_message("user", _enhanced_input)
+            _taor_state.add_message("user", _loop_input)
             loop_output = await AgentWorkflow.run(
                 ToolCallingAgent(
                     name="Chief Orchestrator", model="deepseek_v4",
@@ -4812,11 +4890,15 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                     system_prompt=self.SYSTEM,
                     force_prefer=ORCHESTRATOR_PROVIDER,
                 ),
-                _enhanced_input, max_iterations=8,
+                _loop_input, max_iterations=8,
                 state=_taor_state,
                 pending_states=self._pending_states,
             )
-            return await self._handle_loop_output(loop_output, _taor_state, user_input, stream_fn)
+            result = await self._handle_loop_output(loop_output, _taor_state, user_input, stream_fn)
+            # Remember this turn (raw user input + final answer) for future context.
+            await memory_append("user", user_input)
+            await memory_append("assistant", (result or {}).get("response", ""))
+            return result
         except Exception as e:
             logger.error(f"TAOR loop failed: {e}", exc_info=True)
             # Fallback to direct LLM
@@ -5741,6 +5823,54 @@ async def list_agents():
     return [a.status_dict() for a in AGENT_REGISTRY.values()]
 
 
+@app.get("/agents/{name}/activity")
+async def agent_activity(name: str):
+    """Live focus view for one agent: current status/task plus its recent subtask
+    activity and history. Powers click-to-focus in the Agent Flow graph."""
+    agent = AGENT_REGISTRY.get(name)
+    if agent is None:
+        # case-insensitive fallback
+        agent = next((a for a in AGENT_REGISTRY.values() if a.name.lower() == name.lower()), None)
+    if agent is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown agent '{name}'"})
+
+    recent: List[Dict[str, Any]] = []
+    history: List[Dict[str, Any]] = []
+    if db_pool is not None:
+        try:
+            rows = await db_fetch(
+                "SELECT subtask, status, output, error, started_at, completed_at "
+                "FROM jaxvora_subtask_log WHERE agent_name=$1 ORDER BY started_at DESC LIMIT 12",
+                agent.name)
+            recent = [{
+                "subtask": r["subtask"], "status": r["status"],
+                "output": (r["output"] or "")[:600], "error": (r["error"] or "")[:300],
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+            } for r in rows]
+        except Exception as e:
+            logger.warning(f"agent_activity subtasks failed: {e}")
+        try:
+            hrows = await db_fetch(
+                "SELECT task_summary, outcome, created_at FROM agent_history "
+                "WHERE agent_name=$1 ORDER BY created_at DESC LIMIT 8", agent.name)
+            history = [{
+                "task": h["task_summary"], "outcome": h["outcome"],
+                "created_at": h["created_at"].isoformat() if h["created_at"] else None,
+            } for h in hrows]
+        except Exception as e:
+            logger.warning(f"agent_activity history failed: {e}")
+
+    return {
+        "ok": True,
+        "name": agent.name, "division": agent.division, "model": agent.model,
+        "description": agent.description, "status": agent._status,
+        "current_task": agent._current_task,
+        "collaborators": AGENT_NETWORK.get(agent.name, []),
+        "recent": recent, "history": history,
+    }
+
+
 @app.get("/organization")
 async def get_organization():
     return organization_snapshot()
@@ -5973,6 +6103,26 @@ async def memory_search(q: str = Query(...), collection: Optional[str] = None, l
     return results
 
 
+@app.get("/memory/chat")
+async def memory_chat_get(limit: int = 20):
+    """Recent conversation turns the agents remember (chronological)."""
+    turns = await memory_recent(max(1, min(limit, 100)))
+    return {"enabled": CONVERSATION_MEMORY, "turns": turns, "window": MEMORY_TURNS}
+
+
+@app.delete("/memory/chat")
+async def memory_chat_clear():
+    """Forget the conversation history."""
+    if db_pool is None:
+        return {"ok": False, "error": "database unavailable"}
+    try:
+        await db_execute("TRUNCATE TABLE jaxvora_chat_memory")
+        await redis_cache.delete_prefix(_MEM_CACHE_NS)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "cleared": True}
+
+
 class RAGIngestRequest(BaseModel):
     text: str
     source: str = ""
@@ -6139,7 +6289,7 @@ async def admin_reset(req: dict):
     if db_pool is None:
         return {"ok": False, "error": "Database unavailable."}
     tables = [
-        "jaxvora_ssh_audit", "jaxvora_operation_log", "jaxvora_subtask_log",
+        "jaxvora_ssh_audit", "jaxvora_operation_log", "jaxvora_subtask_log", "jaxvora_chat_memory",
         "jaxvora_sessions", "agent_history", "audit", "logs", "tasks",
     ]
     cleared = {}

@@ -1291,8 +1291,13 @@ body.chat-view #content { overflow: hidden; }
     <span class="modal-close" onclick="closeModal()">✕</span>
     <div class="modal-title" id="modal-agent-name">Agent</div>
     <div id="modal-agent-desc" style="font-size:12px;color:var(--text2);margin-bottom:12px;font-family:var(--mono)"></div>
-    <div id="modal-agent-status" style="margin-bottom:16px"></div>
-    <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:8px">Recent Tasks</div>
+    <div id="modal-agent-status" style="margin-bottom:12px"></div>
+    <div id="modal-current-task" style="font-size:11px;font-family:var(--mono);color:var(--text2);margin-bottom:14px;min-height:14px"></div>
+    <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:8px;display:flex;align-items:center;gap:8px">
+      Live Activity <span id="modal-live-dot" style="width:7px;height:7px;border-radius:50%;background:#00d4aa;display:none;animation:pulse 1.4s infinite"></span>
+    </div>
+    <div id="modal-activity" style="max-height:260px;overflow-y:auto;font-family:var(--mono);font-size:11px"></div>
+    <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin:14px 0 8px">Recent Tasks</div>
     <div id="modal-history"></div>
   </div>
 </div>
@@ -1956,23 +1961,47 @@ function loadAgents() {
     .catch(console.error);
 }
 
+let _agentPollTimer = null;
+
+async function renderAgentActivity(name) {
+  let d = null;
+  try { d = await fetch('/agents/' + encodeURIComponent(name) + '/activity').then(r => r.ok ? r.json() : null); } catch {}
+  if (!d || !d.ok) return;
+  const safe = ['idle','running','error'].includes(d.status) ? d.status : 'idle';
+  const statusEl = document.getElementById('modal-agent-status');
+  if (statusEl) statusEl.innerHTML =
+    `<div class="pill ${d.status === 'running' ? 'green' : ''}" style="display:inline-flex;gap:6px;align-items:center"><div class="status-indicator ${safe}" style="width:6px;height:6px;flex-shrink:0"></div>${escHtml(d.status.toUpperCase())}</div> <span style="font-size:10px;color:var(--text3)">${escHtml(d.division || '')} · ${escHtml(d.model || '')}</span>`;
+  const ct = document.getElementById('modal-current-task');
+  if (ct) ct.innerHTML = d.current_task
+    ? ('▸ ' + escHtml(d.current_task.slice(0, 160)))
+    : '<span style="color:var(--text3)">idle — no active task</span>';
+  const dot = document.getElementById('modal-live-dot');
+  if (dot) dot.style.display = d.status === 'running' ? 'inline-block' : 'none';
+  const act = document.getElementById('modal-activity');
+  if (act) {
+    const rows = d.recent || [];
+    act.innerHTML = rows.length ? rows.map(r => {
+      const out = (r.output || '').slice(0, 200);
+      const c = r.status === 'error' ? '#ff4d6a' : (r.status === 'done' ? '#00d4aa' : '#6c63ff');
+      return `<div style="padding:6px 8px;border-left:2px solid ${c};margin-bottom:6px;background:var(--glass);border-radius:4px">
+        <div style="color:var(--text2)">${statusBadge(r.status)} ${escHtml((r.subtask || '').slice(0, 90))}</div>
+        ${out ? `<div style="color:var(--text3);margin-top:3px;white-space:pre-wrap;word-break:break-word">${escHtml(out)}</div>` : ''}
+        <div style="color:var(--text3);font-size:9px;margin-top:2px">${fmtDate(r.completed_at || r.started_at)}</div>
+      </div>`;
+    }).join('') : '<div class="empty-state"><div>No recent activity yet</div></div>';
+  }
+}
+
 async function openAgentModal(name) {
   document.getElementById('modal-agent-name').textContent = name;
   try {
-    const agents = await fetch('/agents').then(r => { if (!r.ok) throw new Error('Failed to fetch agents'); return r.json(); });
+    const agents = await fetch('/agents').then(r => r.ok ? r.json() : []);
     const agent = Array.isArray(agents) ? agents.find(x => x.name === name) : null;
-    if (agent) {
-      document.getElementById('modal-agent-desc').textContent = agent.description || '';
-      const safeStatus = ['idle','running','error'].includes(agent.status) ? agent.status : 'idle';
-      document.getElementById('modal-agent-status').innerHTML =
-        `<div class="pill ${agent.status === 'running' ? 'green' : ''}" style="display:inline-flex;gap:6px;align-items:center"><div class="status-indicator ${safeStatus}" style="width:6px;height:6px;flex-shrink:0"></div>${escHtml(agent.status.toUpperCase())}</div>`;
-    }
-  } catch (e) {
-    document.getElementById('modal-agent-desc').textContent = 'Failed to load agent details: ' + e.message;
-  }
+    if (agent) document.getElementById('modal-agent-desc').textContent = agent.description || '';
+  } catch {}
   let rows = [];
   try {
-    rows = await fetch('/tasks?agent=' + encodeURIComponent(name) + '&limit=5').then(r => { if (!r.ok) return []; return r.json(); });
+    rows = await fetch('/tasks?agent=' + encodeURIComponent(name) + '&limit=5').then(r => r.ok ? r.json() : []);
   } catch {}
   const hist = document.getElementById('modal-history');
   if (hist) {
@@ -1983,10 +2012,19 @@ async function openAgentModal(name) {
       </div>`
     ).join('') : '<div class="empty-state"><div>No recent tasks</div></div>';
   }
+  // live activity + focus the agent in the flow graph
+  await renderAgentActivity(name);
+  if (window.flow && flow.setFocus) flow.setFocus(name);
+  if (_agentPollTimer) clearInterval(_agentPollTimer);
+  _agentPollTimer = setInterval(() => renderAgentActivity(name), 2500);
   document.getElementById('agent-modal').classList.add('open');
 }
 
-function closeModal() { document.getElementById('agent-modal').classList.remove('open'); }
+function closeModal() {
+  document.getElementById('agent-modal').classList.remove('open');
+  if (_agentPollTimer) { clearInterval(_agentPollTimer); _agentPollTimer = null; }
+  if (window.flow && flow.clearFocus) flow.clearFocus();
+}
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
 function renderTasks(tasks) {
@@ -2573,6 +2611,10 @@ const flow = {
   raf: null, t: 0, lastTs: 0, _loop: null,
   drag: { active: false, node: null, dx: 0, dy: 0, moved: false }, _suppressClick: false,
   RETURN_MS: 520,
+  focusName: null,   // when set, this agent is emphasized and the rest dimmed
+
+  setFocus(name) { this.focusName = name; this.ensureRunning(); },
+  clearFocus() { this.focusName = null; },
 
   init() {
     this.canvas = document.getElementById('flow-canvas');
@@ -2732,6 +2774,7 @@ const flow = {
 
     // edges + particles (behind nodes)
     live.forEach(n => {
+      ctx.globalAlpha = (this.focusName && n.name !== this.focusName) ? 0.16 : 1;
       const float = Math.sin(this.t * 0.0016 + n.phase);
       const rad = R * (0.55 + 0.45 * n.appear);
       // natural orbit position
@@ -2778,10 +2821,13 @@ const flow = {
         ctx.shadowColor = `rgb(${pcol})`; ctx.shadowBlur = inbound ? 8 : 6;
         ctx.fill(); ctx.shadowBlur = 0;
       }
+      ctx.globalAlpha = 1;
     });
 
     // agent nodes
     live.forEach(n => {
+      const _focusDim = (this.focusName && n.name !== this.focusName) ? 0.22 : 1;
+      ctx.globalAlpha = _focusDim;
       const breathe = 1 + 0.06 * Math.sin(this.t * 0.002 + n.phase);
       const rNode = (n.lead ? 9 : 7) * n.appear * breathe;
       const [r, g, b] = flowHexToRgb(n.color);
@@ -2802,6 +2848,14 @@ const flow = {
       ctx.fillStyle = `rgba(232,233,240,${0.92 * n.appear})`;
       const ly = n._y + rNode + 9;
       ctx.fillText((n.lead ? '★ ' : '') + flowShort(n.name), n._x, ly);
+      // focus ring on the selected agent
+      if (this.focusName && n.name === this.focusName) {
+        ctx.globalAlpha = 1;
+        ctx.beginPath(); ctx.arc(n._x, n._y, rNode + 7, 0, Math.PI * 2);
+        ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,212,170,0.95)';
+        ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([]);
+      }
+      ctx.globalAlpha = 1;
     });
 
     // chief node (center, on top)
