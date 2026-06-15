@@ -15,6 +15,7 @@ import time
 import hmac
 import html
 import sys
+import contextvars
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Set, Callable
@@ -93,17 +94,23 @@ def _bench_groq_key(key: str, error: str):
     elif "429" in m or "413" in m or "rate" in m or "too large" in m or "too many" in m:
         _GROQ_KEY_COOLDOWN[key] = time.time() + GROQ_KEY_COOLDOWN_S
 
-# OpenCode Zen — free North Mini Code, used as the default brain for all agents.
+# OpenCode Zen — free DeepSeek V4 Flash, the default brain for ALL agents (Chief
+# Orchestrator + every subagent). Free/unlimited, OpenAI-compatible.
 OPENCODE_ZEN_API_KEY = os.environ.get("OPENCODE_ZEN_API_KEY", "")
 OPENCODE_ZEN_BASE = os.environ.get("OPENCODE_ZEN_BASE", "https://opencode.ai/zen/v1")
-OPENCODE_ZEN_MODEL = os.environ.get("OPENCODE_ZEN_MODEL", "north-mini-code-free")
+OPENCODE_ZEN_MODEL = os.environ.get("OPENCODE_ZEN_MODEL", "deepseek-v4-flash-free")
+# deepseek-v4-flash is a *reasoning* model: it emits a long <reasoning_content> trace and,
+# under a small token budget, returns an EMPTY message.content (which the old code counted
+# as a failure → needless failover). Send reasoning:false to keep it fast and make
+# message.content the answer. Override with ZEN_REASONING=1 to re-enable thinking.
+ZEN_DISABLE_REASONING = os.environ.get("ZEN_REASONING", "0") in ("0", "false", "False", "no")
 # When the key is present, route every agent LLM call through OpenCode Zen
 # (override with OPENCODE_ZEN_PRIMARY=0 to fall back to per-agent providers).
 OPENCODE_ZEN_PRIMARY = bool(OPENCODE_ZEN_API_KEY) and os.environ.get("OPENCODE_ZEN_PRIMARY", "1") not in ("0", "false", "False", "no")
 # Global override: pin EVERY agent + workflow LLM call to one provider (the rest of the
-# chain stays as failover). Set AGENTS_FORCE_PROVIDER=groq to make qwen3-32b (the current
-# Groq model) the universal default brain, overriding Zen-primary and per-agent models.
-# Empty = original per-agent / Zen-primary behavior.
+# chain stays as failover). Set AGENTS_FORCE_PROVIDER=zen to make Zen deepseek-v4-flash-free
+# the universal brain for ALL agents (Chief + subagents), overriding per-agent models;
+# Groq stays as the fast failover. Empty = per-agent / Zen-primary behavior.
 AGENTS_FORCE_PROVIDER = os.environ.get("AGENTS_FORCE_PROVIDER", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
@@ -133,7 +140,20 @@ SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "")
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat-v3-0324"
-LLAMA_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3-32b")
+# Groq failover models (qwen3-32b retired — it reasons, is TPM-heavy, and 413'd on big
+# prompts). Three live Groq tiers, all verified working on the key pool:
+#   capable → llama-3.3-70b-versatile   (default + tool/function calling; the dedicated
+#             llama3-groq-70b-8192-tool-use-preview was DECOMMISSIONED by Groq, and
+#             versatile supports native tool use)
+#   fast    → llama-3.1-8b-instant      (used for the simple-chat fast-path & prompt enhancer)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL_FAST = os.environ.get("GROQ_MODEL_FAST", "llama-3.1-8b-instant")
+GROQ_MODEL_TOOLS = os.environ.get("GROQ_MODEL_TOOLS", GROQ_MODEL)
+LLAMA_MODEL = GROQ_MODEL  # back-compat alias / default Groq model used by _raw_groq
+# Per-call Groq model override (contextvar): speed-critical paths (simple-chat fast-path,
+# prompt enhancer) set this to GROQ_MODEL_FAST so that IF the call falls through to Groq it
+# uses the fastest model. Defaults to None → _raw_groq uses the capable GROQ_MODEL.
+_groq_model_var: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("groq_model", default=None)
 DEEPSEEK_V4_MODEL = "deepseek/deepseek-v4-flash:free"
 DEEPSEEK_V4_BASE = "https://openrouter.ai/api/v1"
 MAX_TOKENS = 8192
@@ -249,7 +269,13 @@ async def _post_chat(url: str, headers: Dict[str, str], model: str,
                 # auth/payment/other client errors — non-retryable; keep the status code
                 # in the message so the failover can pick a long (auth) cooldown.
                 raise Exception(f"HTTP {r.status_code} {r.text[:120]}")
-            content = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            msg = r.json()["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+            if not content:
+                # Reasoning models (e.g. Zen deepseek-v4-flash) can put everything in
+                # reasoning_content and leave content empty when the budget is tight.
+                # Use the reasoning trace as a last resort so this is NOT a hard failure.
+                content = (msg.get("reasoning_content") or "").strip()
             if not content:
                 raise Exception("empty response")
             return content
@@ -257,29 +283,41 @@ async def _post_chat(url: str, headers: Dict[str, str], model: str,
         raise _RetryableLLMError(str(e))
 
 
+def _is_reasoning_model(name: str) -> bool:
+    """Groq reasoning models (qwen, deepseek, gpt-oss, o*) accept reasoning_format;
+    llama-3.x do NOT and 400 on it. Gate the param so failover never breaks on it."""
+    n = (name or "").lower()
+    return any(t in n for t in ("qwen", "deepseek", "gpt-oss", "o1", "o3", "reason"))
+
+
 async def _raw_zen(system: str, user: str, max_tokens: int) -> str:
+    # deepseek-v4-flash reasons; reasoning:false keeps it fast and fills message.content.
+    extra = {"reasoning": False} if (ZEN_DISABLE_REASONING and "deepseek" in OPENCODE_ZEN_MODEL.lower()) else None
     return await _post_chat(
         f"{OPENCODE_ZEN_BASE}/chat/completions",
         {"Authorization": f"Bearer {OPENCODE_ZEN_API_KEY}"},
-        OPENCODE_ZEN_MODEL, system, user, min(max_tokens, ZEN_MAX_OUT), timeout=120)
+        OPENCODE_ZEN_MODEL, system, user, min(max_tokens, ZEN_MAX_OUT), timeout=120,
+        extra_body=extra)
 
 
 async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
-    # qwen3-32b (and other Groq reasoning models) emit <think> traces; reasoning_format
-    # "hidden" keeps message.content as the clean final answer. Harmless for non-reasoning
-    # Groq models. Override the model via GROQ_MODEL / reasoning via GROQ_REASONING_FORMAT.
-    extra = {"reasoning_format": os.environ.get("GROQ_REASONING_FORMAT", "hidden")}
+    model = _groq_model_var.get() or LLAMA_MODEL  # fast-path may pin GROQ_MODEL_FAST
+    # reasoning_format=hidden hides <think> traces — but ONLY reasoning models accept it
+    # (llama-3.x 400 with "reasoning_format is not supported with this model"). Send it
+    # only for reasoning models so llama failover always works.
+    extra = ({"reasoning_format": os.environ.get("GROQ_REASONING_FORMAT", "hidden")}
+             if _is_reasoning_model(model) else None)
     url = "https://api.groq.com/openai/v1/chat/completions"
     key = _next_groq_key()                       # round-robin across the key pool
     try:
         return await _post_chat(
             url, {"Authorization": f"Bearer {key}"},
-            LLAMA_MODEL, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60,
+            model, system, user, min(max_tokens, GROQ_MAX_OUT), timeout=60,
             extra_body=extra)
     except Exception as e:
         m = str(e)
         _bench_groq_key(key, m)                   # bench this key on rate/size error
-        # qwen free tier counts requested max_tokens toward its ~6000 TPM budget, so a big
+        # free tier counts requested max_tokens toward its ~6000 TPM budget, so a big
         # output ask alone can 413. Retry once on a fresh key with a tiny output budget —
         # this slips under the ceiling whenever the INPUT itself fits.
         if "413" in m or "too large" in m:
@@ -287,7 +325,7 @@ async def _raw_groq(system: str, user: str, max_tokens: int) -> str:
             try:
                 return await _post_chat(
                     url, {"Authorization": f"Bearer {k2}"},
-                    LLAMA_MODEL, system, user, 512, timeout=60, extra_body=extra)
+                    model, system, user, 512, timeout=60, extra_body=extra)
             except Exception as e2:
                 _bench_groq_key(k2, str(e2))
                 raise
@@ -343,22 +381,97 @@ def _build_provider_chain(prefer: Optional[str] = None) -> List[str]:
     return hot or enabled  # if everything is cooling down, try them all anyway
 
 
+def _provider_model(name: str) -> str:
+    """Human-readable model id behind each provider (for health/status displays)."""
+    return {"zen": OPENCODE_ZEN_MODEL, "groq": LLAMA_MODEL,
+            "deepseek_v4": DEEPSEEK_V4_MODEL, "openrouter": DEEPSEEK_MODEL}.get(name, name)
+
+
 def llm_provider_status() -> Dict[str, Any]:
-    """Snapshot for /settings/status — which providers are configured/cooling."""
+    """Snapshot for /settings/status — which providers are configured/cooling/healthy."""
     now = time.time()
     return {
         "primary": AGENTS_FORCE_PROVIDER or ("zen" if OPENCODE_ZEN_PRIMARY else "per-agent"),
         "forced_provider": AGENTS_FORCE_PROVIDER or None,
+        "zen_model": OPENCODE_ZEN_MODEL,
         "groq_model": LLAMA_MODEL,
+        "groq_model_fast": GROQ_MODEL_FAST,
         "groq_keys": len(GROQ_API_KEYS),
         "chain": _build_provider_chain(),
+        "active_provider": (_build_provider_chain() or ["none"])[0],
+        "last_healthcheck_s_ago": round(now - _LAST_HEALTHCHECK, 1) if _LAST_HEALTHCHECK else None,
+        "health": _LLM_HEALTH,
         "providers": {
             n: {
                 "configured": _PROVIDERS[n]["enabled"](),
                 "cooldown_s": max(0, round(_PROVIDER_COOLDOWN.get(n, 0) - now, 1)),
+                "model": _provider_model(n),
             } for n in _PROVIDERS
         },
     }
+
+
+# ── Proactive LLM health-check ───────────────────────────────────────────────
+# Probes every configured provider/model so dead or rate-limited ones are benched and
+# live ones cleared BEFORE a user chats. The failover chain reads the resulting
+# cooldowns, so a single probe transparently switches EVERY agent (Chief Orchestrator
+# + all subagents) onto a working model. Runs on startup, on a periodic loop, and
+# (throttled) whenever the website is opened — so "model failed" never reaches the chat.
+_LLM_HEALTH: Dict[str, Dict[str, Any]] = {}
+_LAST_HEALTHCHECK: float = 0.0
+_HEALTHCHECK_INTERVAL = float(os.environ.get("LLM_HEALTHCHECK_INTERVAL", "60") or 60)
+_healthcheck_lock = asyncio.Lock()
+
+
+async def llm_healthcheck() -> Dict[str, Any]:
+    """Probe all providers in parallel with a tiny call; bench failures, clear successes."""
+    global _LAST_HEALTHCHECK
+    async with _healthcheck_lock:
+        _LAST_HEALTHCHECK = time.time()
+
+        async def probe(name: str):
+            if not _PROVIDERS[name]["enabled"]():
+                _LLM_HEALTH[name] = {"ok": False, "configured": False, "ts": time.time()}
+                return
+            t0 = time.time()
+            try:
+                # single quick attempt (not _provider_attempt — we don't want long retries here)
+                await _PROVIDERS[name]["fn"]("You are a health probe.", "Reply with: OK", 48)
+                _PROVIDER_COOLDOWN.pop(name, None)  # revive it for the failover chain
+                _LLM_HEALTH[name] = {"ok": True, "configured": True,
+                                     "latency_ms": int((time.time() - t0) * 1000),
+                                     "model": _provider_model(name), "ts": time.time()}
+            except Exception as e:
+                msg = str(e)
+                _PROVIDER_COOLDOWN[name] = time.time() + _cooldown_for(msg)
+                _LLM_HEALTH[name] = {"ok": False, "configured": True, "error": msg[:160],
+                                     "model": _provider_model(name), "ts": time.time()}
+
+        await asyncio.gather(*[probe(n) for n in _PROVIDERS])
+    live = [n for n, v in _LLM_HEALTH.items() if v.get("ok")]
+    logger.info(f"LLM healthcheck: live={live or 'NONE'} → active chain={_build_provider_chain()}")
+    return _LLM_HEALTH
+
+
+def maybe_refresh_llm_health():
+    """Fire-and-forget, throttled health refresh — safe to call on every page load."""
+    global _LAST_HEALTHCHECK
+    if time.time() - _LAST_HEALTHCHECK >= _HEALTHCHECK_INTERVAL:
+        _LAST_HEALTHCHECK = time.time()  # claim the slot now to avoid a stampede
+        try:
+            asyncio.create_task(llm_healthcheck())
+        except RuntimeError:
+            pass  # no running loop (e.g. called outside async context)
+
+
+async def _llm_health_loop():
+    """Background heartbeat: keep provider health fresh while the app is up."""
+    while True:
+        try:
+            await llm_healthcheck()
+        except Exception as e:
+            logger.warning(f"LLM health loop error: {e}")
+        await asyncio.sleep(_HEALTHCHECK_INTERVAL)
 
 
 async def _provider_attempt(name: str, system: str, user: str, max_tokens: int) -> str:
@@ -395,25 +508,39 @@ async def call_llm_failover(system: str, user: str,
     cached = await redis_cache.get("llm", cache_key)
     if cached:
         return cached
-    chain = _build_provider_chain(prefer)
-    if not chain:
+    base_chain = _build_provider_chain(prefer)
+    if not base_chain:
         return f"[Mock response — no LLM provider configured] Task: {user[:100]}"
     errors: List[str] = []
-    for idx, name in enumerate(chain):
-        try:
-            result = await _provider_attempt(name, system, user, max_tokens)
-            _PROVIDER_COOLDOWN.pop(name, None)
-            if idx > 0:
-                logger.warning(f"LLM shifted to fallback provider '{name}' after: {'; '.join(errors)}")
-            await redis_cache.set("llm", cache_key, result)
-            return result
-        except Exception as e:
-            msg = str(e)
-            errors.append(f"{name}: {msg}")
-            cool = _cooldown_for(msg)
-            _PROVIDER_COOLDOWN[name] = time.time() + cool
-            logger.warning(f"LLM provider '{name}' failed ({msg}) — benched {int(cool)}s, shifting to next")
+    # Two passes: free-tier 429s reset in ~1-2s, so if the WHOLE chain trips on the first
+    # pass we clear the short rate-limit benches and try once more before giving up. This
+    # is what stops a transient burst from ever surfacing as a rate-limit error to the user.
+    for _pass in range(2):
+        chain = _build_provider_chain(prefer)
+        for idx, name in enumerate(chain):
+            try:
+                result = await _provider_attempt(name, system, user, max_tokens)
+                _PROVIDER_COOLDOWN.pop(name, None)
+                if idx > 0 or _pass > 0:
+                    logger.warning(f"LLM shifted to fallback provider '{name}' after: {'; '.join(errors)}")
+                await redis_cache.set("llm", cache_key, result)
+                return result
+            except Exception as e:
+                msg = str(e)
+                errors.append(f"{name}: {msg}")
+                cool = _cooldown_for(msg)
+                _PROVIDER_COOLDOWN[name] = time.time() + cool
+                logger.warning(f"LLM provider '{name}' failed ({msg}) — benched {int(cool)}s, shifting to next")
+        # whole chain failed this pass — only retry if a provider is merely rate-limited
+        # (not auth/credit), since those recover quickly. Clear their short benches first.
+        if _pass == 0 and any(("429" in e or "rate" in e.lower() or "too many" in e.lower()
+                               or "timeout" in e.lower()) for e in errors):
+            for n in base_chain:
+                if _PROVIDER_COOLDOWN.get(n, 0) - time.time() <= RATE_LIMIT_COOLDOWN_SECONDS + 1:
+                    _PROVIDER_COOLDOWN.pop(n, None)
+            await asyncio.sleep(1.5)
             continue
+        break
     logger.error(f"All LLM providers failed: {errors}")
     return f"[All LLM providers failed] {'; '.join(errors)[:400]}"
 
@@ -435,12 +562,10 @@ async def call_deepseek_v4(system: str, user: str) -> str:
     return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else "deepseek_v4")
 
 
-# The Chief Orchestrator runs many think-steps per request; OpenCode Zen
-# (north-mini-code-free) is high-quality but slow. Run the orchestrator on the
-# FASTEST free model — Groq (LPU inference, llama-3.3-70b) — FIRST, regardless of
-# OPENCODE_ZEN_PRIMARY, with the rest of the chain (incl. Zen) as fallback. Agents
-# still default to Zen as their brain.
-ORCHESTRATOR_PROVIDER = os.environ.get("ORCHESTRATOR_PROVIDER", "groq")
+# Every agent — Chief Orchestrator AND all subagents — runs on OpenCode Zen
+# (deepseek-v4-flash-free, free) FIRST, with Groq (llama-3.3-70b-versatile / -8b-instant)
+# as the fast failover. Set ORCHESTRATOR_PROVIDER=groq to put the Chief on Groq instead.
+ORCHESTRATOR_PROVIDER = os.environ.get("ORCHESTRATOR_PROVIDER", "zen")
 
 
 async def call_orchestrator_llm(system: str, user: str, max_tokens: int = MAX_TOKENS) -> str:
@@ -3947,9 +4072,11 @@ Rules:
             # turned a provider outage into a ~130s hang). Surface a clean message.
             if response.startswith("[All LLM providers failed"):
                 state.add_step("error", agent.name, "LLM providers unavailable", response[:300], "error")
+                # Don't leak provider/rate-limit internals to the user — give a calm,
+                # actionable message. (The detail stays in the step log for ops.)
                 state.final_output = (
-                    "⚠️ All LLM providers are currently unavailable (rate-limited or out of "
-                    "credits), so I couldn't complete this request. Details: " + response[:300]
+                    "I'm getting a lot of requests right now and couldn't finish that one. "
+                    "Please send it again in a moment — it should go through."
                 )
                 return state.final_output
 
@@ -5124,6 +5251,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
     async def _enhance_prompt(self, raw: str) -> str:
         if len(raw) < 10 or raw.startswith("__CONFIRM_"):
             return raw
+        _tok = _groq_model_var.set(GROQ_MODEL_FAST)  # if this falls to Groq, use the fastest model
         try:
             enhanced = await call_orchestrator_llm(
                 "You reformat user input for an AI command center. Fix typos, clarify intent, "
@@ -5137,6 +5265,8 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
             return raw
         except Exception:
             return raw
+        finally:
+            _groq_model_var.reset(_tok)  # don't leak the fast model into the TAOR loop
 
     async def process(self, user_input: str, stream_fn=None,
                       admin_token: Optional[str] = None,
@@ -5201,7 +5331,11 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
                         "coordinate the specialist team. Do not invent personal facts about the user.")
                 _up = f"{_mem}\n\nUser: {user_input}" if _mem else user_input
                 record_thought("Chief Orchestrator", f"⚡ quick answer: {user_input[:80]}", "think")
-                _fast = await call_orchestrator_llm(_sys, _up, max_tokens=DEFAULT_MAX_TOKENS)
+                _tok = _groq_model_var.set(GROQ_MODEL_FAST)  # fast-path → fastest Groq model if it falls back
+                try:
+                    _fast = await call_orchestrator_llm(_sys, _up, max_tokens=DEFAULT_MAX_TOKENS)
+                finally:
+                    _groq_model_var.reset(_tok)  # don't leak the fast model into the TAOR loop
                 if _fast and not _fast.startswith("[All LLM providers"):
                     await memory_append("user", user_input)
                     await memory_append("assistant", _fast)
@@ -5737,6 +5871,9 @@ async def apple_touch_icon():
 
 @app.get("/", response_class=HTMLResponse)
 async def frontend():
+    # Website opened → refresh LLM provider health in the background (throttled) so the
+    # chat that follows lands on a known-good model and never hits a dead provider.
+    maybe_refresh_llm_health()
     app_dir = Path(__file__).parent
     for index_path in (app_dir / "index.html", app_dir / "server" / "index.html"):
         if index_path.exists():
@@ -7409,8 +7546,20 @@ async def get_notification_email():
     return {"email": NOTIFICATION_EMAIL}
 
 
+@app.get("/llm/health")
+async def llm_health_endpoint(force: bool = False):
+    """LLM provider/model health. `?force=1` re-probes now; otherwise returns the last
+    snapshot and triggers a throttled background refresh."""
+    if force:
+        await llm_healthcheck()
+    else:
+        maybe_refresh_llm_health()
+    return llm_provider_status()
+
+
 @app.get("/settings/status")
 async def get_settings_status():
+    maybe_refresh_llm_health()  # website/admin opened → keep model health fresh
     gmail_sender_ready = bool(GMAIL_SENDER)
     gmail_password_ready = bool(GMAIL_APP_PASSWORD)
     gmail_ready = gmail_sender_ready and gmail_password_ready
@@ -7682,6 +7831,10 @@ async def startup():
     global auto_healer
     auto_healer = AutoHealDaemon(orchestrator)
     auto_healer.start()
+
+    # Probe all LLM providers now (so the first chat hits a known-good model) and keep
+    # them fresh on a background heartbeat.
+    asyncio.create_task(_llm_health_loop())
 
     # Bootstrap sequence
     asyncio.create_task(_bootstrap_sequence())
