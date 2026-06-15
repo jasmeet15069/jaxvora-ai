@@ -562,10 +562,12 @@ async def call_deepseek_v4(system: str, user: str) -> str:
     return await call_llm_failover(system, user, prefer=None if OPENCODE_ZEN_PRIMARY else "deepseek_v4")
 
 
-# Every agent — Chief Orchestrator AND all subagents — runs on OpenCode Zen
-# (deepseek-v4-flash-free, free) FIRST, with Groq (llama-3.3-70b-versatile / -8b-instant)
-# as the fast failover. Set ORCHESTRATOR_PROVIDER=groq to put the Chief on Groq instead.
-ORCHESTRATOR_PROVIDER = os.environ.get("ORCHESTRATOR_PROVIDER", "zen")
+# Specialist subagents run on OpenCode Zen (deepseek-v4-flash-free) — the deep reasoning
+# brain. The Chief Orchestrator only coordinates/routes across MANY sequential think-steps,
+# so it runs on Groq (llama-3.3-70b-versatile, ~0.2s/call on LPU) to keep complex tasks
+# fast (~1-2min vs ~6min all-Zen); Zen stays as its failover. Set ORCHESTRATOR_PROVIDER=zen
+# to put the Chief on Zen too (slower but maximally consistent). Subagents are unaffected.
+ORCHESTRATOR_PROVIDER = os.environ.get("ORCHESTRATOR_PROVIDER", "groq")
 
 
 async def call_orchestrator_llm(system: str, user: str, max_tokens: int = MAX_TOKENS) -> str:
