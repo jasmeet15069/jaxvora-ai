@@ -42,6 +42,8 @@
     { "source": "/apps", "destination": "http://172.105.41.151:8090/apps" },
     { "source": "/apps/:path/", "destination": "http://172.105.41.151:8090/apps/:path/" },
     { "source": "/apps/:path*", "destination": "http://172.105.41.151:8090/apps/:path*" },
+    { "source": "/privacy", "destination": "/privacy.html" },
+    { "source": "/terms", "destination": "/terms.html" },
     { "source": "/:path*", "destination": "/index.html" }
   ]
 }

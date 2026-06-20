@@ -27,12 +27,18 @@ html = html.replace(
 // handler, so this build step no longer needs a brittle string replacement.
 
 writeFileSync(outputHtml, html);
+
+// Static legal pages (served at /privacy and /terms via vercel.json rewrites).
+for (const page of ["privacy.html", "terms.html"]) {
+  copyFileSync(resolve(rootDir, "server", page), resolve(outputDir, page));
+}
+
 writeFileSync(resolve(outputDir, "robots.txt"), "User-agent: *\nAllow: /\n");
 writeFileSync(
   resolve(outputDir, "_headers"),
   "/\n  Cache-Control: public, max-age=0, must-revalidate\n",
 );
-for (const assetName of ["favicon.ico", "favicon.png", "apple-touch-icon.png"]) {
+for (const assetName of ["favicon.ico", "favicon.png", "apple-touch-icon.png", "jaxvora-logo.jpg"]) {
   copyFileSync(resolve(sourceAssets, assetName), resolve(outputDir, assetName));
 }
 

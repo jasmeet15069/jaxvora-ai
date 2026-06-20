@@ -5871,6 +5871,14 @@ async def apple_touch_icon():
     return FileResponse(icon_path, media_type="image/png")
 
 
+@app.get("/jaxvora-logo.jpg")
+async def jaxvora_logo():
+    logo_path = _resolve_app_resource("", "assets", "jaxvora-logo.jpg")
+    if not logo_path:
+        raise HTTPException(status_code=404, detail="jaxvora-logo.jpg is missing")
+    return FileResponse(logo_path, media_type="image/jpeg")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def frontend():
     # Website opened → refresh LLM provider health in the background (throttled) so the
@@ -5881,6 +5889,26 @@ async def frontend():
         if index_path.exists():
             return index_path.read_text(encoding="utf-8")
     raise HTTPException(status_code=500, detail="Frontend index.html is missing")
+
+
+def _serve_static_page(filename: str) -> HTMLResponse:
+    app_dir = Path(__file__).parent
+    for page_path in (app_dir / filename, app_dir / "server" / filename):
+        if page_path.exists():
+            return HTMLResponse(page_path.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail=f"{filename} is missing")
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+@app.get("/privacy.html", response_class=HTMLResponse)
+async def privacy_policy():
+    return _serve_static_page("privacy.html")
+
+
+@app.get("/terms", response_class=HTMLResponse)
+@app.get("/terms.html", response_class=HTMLResponse)
+async def terms_of_service():
+    return _serve_static_page("terms.html")
 
 
 TODOLIST_BASE = "http://127.0.0.1:8080"

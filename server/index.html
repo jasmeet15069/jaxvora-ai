@@ -84,11 +84,10 @@ input, textarea { font-family: var(--sans); }
 }
 .logo-icon {
   width: 32px; height: 32px;
-  background: linear-gradient(135deg, var(--violet), var(--teal));
   border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 16px; font-weight: 700; color: #fff;
-  font-family: var(--mono);
+  object-fit: cover;
+  display: block;
+  box-shadow: 0 0 0 1px var(--border2), 0 2px 8px rgba(108,99,255,0.25);
 }
 .logo-text { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
 .logo-sub { font-size: 10px; color: var(--text3); font-family: var(--mono); margin-top: 2px; letter-spacing: 1px; text-transform: uppercase; }
@@ -778,7 +777,7 @@ body.chat-view #content { overflow: hidden; }
 <aside id="sidebar">
   <div class="logo">
     <div class="logo-mark">
-      <div class="logo-icon">J</div>
+      <img class="logo-icon" src="/jaxvora-logo.jpg" alt="Jaxvora logo" width="32" height="32">
       <div>
         <div class="logo-text">Jaxvora</div>
         <div class="logo-sub">AI Command Center</div>
@@ -804,8 +803,15 @@ body.chat-view #content { overflow: hidden; }
     <div class="nav-item" data-section="knowledge"><span class="icon">▣</span>Knowledge Base <span class="nav-badge" id="kb-count" style="display:none">0</span></div>
     <div class="nav-item" data-section="connectors"><span class="icon">⇄</span>Connectors <span class="nav-badge" id="social-count" style="display:none">0</span></div>
   <div class="sidebar-footer">
-    <span class="status-dot"></span>
-    System <span id="sys-status" style="color:var(--teal)">online</span>
+    <div>
+      <span class="status-dot"></span>
+      System <span id="sys-status" style="color:var(--teal)">online</span>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text3)">
+      <a href="/privacy" target="_blank" rel="noopener" style="color:var(--text3);text-decoration:none">Privacy</a>
+      &nbsp;·&nbsp;
+      <a href="/terms" target="_blank" rel="noopener" style="color:var(--text3);text-decoration:none">Terms</a>
+    </div>
   </div>
 </aside>
 
