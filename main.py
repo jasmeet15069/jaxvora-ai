@@ -2196,7 +2196,7 @@ class ParallelTeamTool(MCPTool):
         super().__init__("parallel_team",
             "Run a BIG / multi-part task with multiple workers of ANY role IN PARALLEL (fast, no slow nested "
             "agent loops), then a Head/Lead of that role reviews and MERGES all their work into one finalized "
-            "deliverable. Works for any agent role (Software Engineer, Data Analyst, QA/Test Agent, Research, "
+            "deliverable. Works for any agent role (Software Engineer, Data Analyst, QA Test Agent, Research, "
             "Cybersecurity, Documentation, ...). Use instead of dispatching one agent for large/multi-part work. "
             "params: role (agent/role name, default 'Software Engineer'); task (required); parts (optional: "
             "integer worker count 2-6, OR a list of subtask strings); project (optional context).",
@@ -4409,7 +4409,7 @@ def build_registry():
         ToolCallingAgent(name="Debug Agent", model="deepseek_v4", division="Engineering",
             description="Root-cause analysis, log investigation, automated bug fixing",
             system_prompt="You are an expert debugger. Use file_system to read source code and logs, terminal to run diagnostic commands. Never guess what code looks like — read the actual files. Perform systematic root-cause analysis, investigate logs, and provide precise bug fixes with explanations. After identifying a fix, use file_system to edit the code and terminal to rebuild/restart."),
-        ToolCallingAgent(name="QA/Test Agent", model="groq", division="Engineering",
+        ToolCallingAgent(name="QA Test Agent", model="groq", division="Engineering",
             description="Unit, integration, E2E, regression tests",
             system_prompt="You are a QA automation engineer. Use file_system to read existing test files and source code, terminal to run test suites. Never invent test results — run the actual tests. Write comprehensive test suites covering unit, integration, and E2E scenarios. Use pytest, Jest, or appropriate frameworks."),
         ToolCallingAgent(name="Code Review", model="groq", division="Engineering",
@@ -4630,7 +4630,7 @@ Example ACT blocks:
 </mcp_call>
 
 Available agents:
-Engineering: AI Engineer, Software Engineer, Debug Agent, QA/Test Agent, Code Review, Architecture, Database, DevOps
+Engineering: AI Engineer, Software Engineer, Debug Agent, QA Test Agent, Code Review, Architecture, Database, DevOps
 Security: Cybersecurity, Red Team, Compliance
 Data: Data Analyst, BI Agent, Data Engineer, ML Engineer
 Career: Resume Agent, Interview Coach, Career Coach
@@ -4645,11 +4645,11 @@ Always respond in this JSON format:
 }"""
 
     KEYWORD_ROUTES = [
-        (("bug", "debug", "fix", "error", "crash", "issue"), ["Debug Agent", "Software Engineer", "QA/Test Agent", "Code Review"]),
-        (("mobile", "ui", "frontend", "responsive", "css", "design"), ["Software Engineer", "Product Manager", "QA/Test Agent", "Code Review"]),
+        (("bug", "debug", "fix", "error", "crash", "issue"), ["Debug Agent", "Software Engineer", "QA Test Agent", "Code Review"]),
+        (("mobile", "ui", "frontend", "responsive", "css", "design"), ["Software Engineer", "Product Manager", "QA Test Agent", "Code Review"]),
         (("security", "vulnerability", "audit", "secret", "attack"), ["Cybersecurity", "Red Team", "Compliance", "Code Review"]),
         (("database", "postgres", "sql", "schema", "query", "neon"), ["Database", "Data Engineer", "Software Engineer"]),
-        (("deploy", "server", "ci", "cd", "vercel", "vm", "ssh", "background", "run", "host"), ["DevOps", "Architecture", "QA/Test Agent"]),
+        (("deploy", "server", "ci", "cd", "vercel", "vm", "ssh", "background", "run", "host"), ["DevOps", "Architecture", "QA Test Agent"]),
         (("data", "etl", "analytics", "dashboard", "power bi", "kpi"), ["Data Analyst", "Data Engineer", "BI Agent", "ML Engineer"]),
         (("resume", "interview", "career", "job"), ["Resume Agent", "Interview Coach", "Career Coach"]),
         (("prd", "document", "docs", "roadmap", "feature", "product"), ["Product Manager", "Documentation", "Research"]),
@@ -4667,6 +4667,15 @@ Always respond in this JSON format:
     def _is_gmail_chat_intent(self, user_input: str) -> bool:
         text = user_input.lower()
         return any(word in text for word in self.GMAIL_INTENT_WORDS) and any(word in text for word in self.GMAIL_READ_WORDS)
+
+    def _is_send_email_intent(self, user_input: str) -> bool:
+        """True when the user is asking to SEND an email (vs read the mailbox)."""
+        text = user_input.lower()
+        has_mail = ("email" in text) or ("e-mail" in text) or ("mail" in text)
+        has_send = any(w in text for w in ("send", "shoot", "fire off", "compose and send",
+                                           "write and send", "email to", "mail to", "send it to"))
+        has_addr = bool(re.search(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", user_input))
+        return has_mail and has_send and has_addr
 
     def _is_ssh_chat_intent(self, user_input: str) -> bool:
         text = user_input.lower()
@@ -4869,7 +4878,7 @@ Always respond in this JSON format:
             return None
         iterations = 3 if any(word in low for word in ("until fixed", "loop", "continuously", "monitor")) else 2
         result = await run_jaxvora_doctor(max_iterations=iterations)
-        agents = ["Chief Orchestrator", "Debug Agent", "QA/Test Agent", "DevOps", "Cybersecurity"]
+        agents = ["Chief Orchestrator", "Debug Agent", "QA Test Agent", "DevOps", "Cybersecurity"]
         return {
             "plan": "Run the concrete Jaxvora Doctor diagnostics loop and report real pass/fail results.",
             "agents": agents,
@@ -4969,6 +4978,61 @@ Always respond in this JSON format:
         if subject_match:
             query_parts.append(f"subject:({subject_match.group(1).strip()})")
         return " ".join(query_parts)
+
+    async def _handle_send_email_chat(self, user_input: str, admin_token: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Deterministically SEND an email when asked. Extracts recipient/subject/body and
+        calls send_gmail directly, so the result reflects a REAL send (never a hallucinated
+        'email sent' with nothing actually delivered)."""
+        if not self._is_send_email_intent(user_input):
+            return None
+        if not gmail_automation_status().get("configured") and not (GMAIL_SENDER and GMAIL_APP_PASSWORD):
+            return {
+                "plan": "Send email requested, but email delivery is not configured.",
+                "agents": ["Chief Orchestrator", "Gmail Automation"],
+                "response": "Email sending isn't configured yet. Set up Gmail OAuth or GMAIL_SENDER/GMAIL_APP_PASSWORD in Settings.",
+                "results": [], "organization": {"mode": "gmail_send"},
+            }
+        if not _gmail_action_authorized(admin_token):
+            return {
+                "plan": "Send email requested; admin token required.",
+                "agents": ["Chief Orchestrator", "Gmail Automation"],
+                "response": "Sending email from chat needs the Gmail admin token saved in Settings > Gmail Automation. Paste the token, click Use Token, then ask me again.",
+                "results": [], "organization": {"mode": "gmail_guard"},
+            }
+        addrs = re.findall(r"[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+", user_input)
+        to = (addrs[0] if addrs else NOTIFICATION_EMAIL).strip().rstrip(".,;")
+        extracted = await call_llm_failover(
+            "You compose emails. From the user's request, produce the email to send. "
+            "Return ONLY a JSON object: {\"subject\": \"...\", \"body\": \"...\"}. "
+            "Write a complete, professional, ready-to-send body (no placeholders, no [brackets]). "
+            "If the user dictated exact subject/body, use them verbatim.",
+            f"Request: {user_input}\nRecipient: {to}")
+        subject, body = "", ""
+        m = re.search(r"\{.*\}", extracted or "", re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                subject = str(obj.get("subject") or "").strip()
+                body = str(obj.get("body") or "").strip()
+            except Exception:
+                pass
+        if not subject:
+            subject = "Message from Jaxvora"
+        if not body:
+            body = (extracted or "").strip() or "Hello,\n\nThis message was sent by Jaxvora.\n\n— Jaxvora AI"
+        record_thought("Gmail Automation", f"▸ send email → {to}: {subject[:60]}", "task")
+        send_result = await send_gmail(to, subject, body)
+        ok = "sent" in send_result.lower() and "[" not in send_result
+        record_thought("Gmail Automation", f"{'✓ sent' if ok else '✗ failed'} → {to}", "done" if ok else "error")
+        response = (f"✅ Email sent to {to}\n\nSubject: {subject}\n\n{body}" if ok
+                    else f"❌ I could not send the email to {to}: {send_result}")
+        return {
+            "plan": f"Compose and send an email to {to}.",
+            "agents": ["Chief Orchestrator", "Gmail Automation"],
+            "response": response,
+            "results": [{"agent": "Gmail Automation", "success": ok, "output": send_result}],
+            "organization": {"mode": "gmail_send"},
+        }
 
     async def _handle_gmail_chat(self, user_input: str, admin_token: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if not self._is_gmail_chat_intent(user_input):
@@ -5076,7 +5140,7 @@ Always respond in this JSON format:
                 if peer not in expanded:
                     expanded.append(peer)
 
-        priority = ["Project Intelligence", "Architecture", "Product Manager", "Software Engineer", "Debug Agent", "QA/Test Agent", "Code Review"]
+        priority = ["Project Intelligence", "Architecture", "Product Manager", "Software Engineer", "Debug Agent", "QA Test Agent", "Code Review"]
         ordered = sorted(expanded, key=lambda name: priority.index(name) if name in priority else len(priority))
         return ordered[:max(1, MAX_PARALLEL_AGENTS)]
 
@@ -5312,6 +5376,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         for handler in [
             self._handle_attachment_chat,
             self._handle_workspace_read,
+            lambda u: self._handle_send_email_chat(u, admin_token=admin_token),
             lambda u: self._handle_gmail_chat(u, admin_token=admin_token),
             self._handle_ssh_chat,
             self._handle_doctor_chat,
