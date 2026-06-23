@@ -1299,6 +1299,11 @@ body.chat-view #content { overflow: hidden; }
     <div id="modal-agent-desc" style="font-size:12px;color:var(--text2);margin-bottom:12px;font-family:var(--mono)"></div>
     <div id="modal-agent-status" style="margin-bottom:12px"></div>
     <div id="modal-current-task" style="font-size:11px;font-family:var(--mono);color:var(--text2);margin-bottom:14px;min-height:14px"></div>
+    <div id="modal-model-switch" style="display:none;margin-bottom:14px;padding:10px;background:var(--glass);border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:6px">⚙ Orchestrator Model</div>
+      <select id="modal-model-select" onchange="switchOrchestratorModel(this.value)" style="width:100%;background:var(--glass2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:12px"></select>
+      <div id="modal-model-hint" style="font-size:10px;color:var(--text3);margin-top:6px">Switch which model the Chief Orchestrator uses — applies instantly. 🟢 healthy · 🟡 configured · 🔴 no key</div>
+    </div>
     <div style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);margin-bottom:8px;display:flex;align-items:center;gap:8px">
       Live Thoughts <span id="modal-live-dot" style="width:7px;height:7px;border-radius:50%;background:#00d4aa;display:none;animation:pulse 1.4s infinite"></span>
     </div>
@@ -2047,6 +2052,12 @@ async function openAgentModal(name) {
   _modalAgent = name;
   const thread = document.getElementById('modal-chat-thread'); if (thread) thread.innerHTML = '';
   const cin = document.getElementById('modal-chat-input'); if (cin) cin.value = '';
+  // Chief Orchestrator: show the live model switcher
+  const ms = document.getElementById('modal-model-switch');
+  if (ms) {
+    if (name === 'Chief Orchestrator') { ms.style.display = 'block'; loadOrchestratorModels(); }
+    else ms.style.display = 'none';
+  }
   // live activity + focus the agent in the flow graph
   await renderAgentActivity(name);
   if (typeof flow !== 'undefined' && flow.setFocus) flow.setFocus(name);
@@ -2088,6 +2099,40 @@ async function sendAgentChat() {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
   }
+}
+
+async function loadOrchestratorModels() {
+  const sel = document.getElementById('modal-model-select');
+  if (!sel) return;
+  try {
+    const d = await fetch('/llm/models').then(r => r.ok ? r.json() : null);
+    if (!d || !d.ok || !Array.isArray(d.models)) { sel.innerHTML = '<option>Unable to load models</option>'; return; }
+    sel.innerHTML = d.models.map(m => {
+      const val = m.provider + '|' + m.model;
+      const tag = m.healthy ? '🟢' : (m.configured ? '🟡' : '🔴');
+      return `<option value="${escHtml(val)}"${m.selected ? ' selected' : ''}${m.configured ? '' : ' disabled'}>${tag} ${escHtml(m.label)}</option>`;
+    }).join('');
+  } catch { sel.innerHTML = '<option>Unable to load models</option>'; }
+}
+
+async function switchOrchestratorModel(val) {
+  if (!val || val.indexOf('|') < 0) return;
+  const idx = val.indexOf('|');
+  const provider = val.slice(0, idx), model = val.slice(idx + 1);
+  const hint = document.getElementById('modal-model-hint');
+  if (hint) hint.textContent = 'Switching…';
+  try {
+    const r = await fetch('/llm/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, model }) });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      toast('Orchestrator model → ' + d.provider + ' · ' + d.model, 'success');
+      if (hint) hint.textContent = 'Active: ' + d.current.provider + ' · ' + d.current.model;
+    } else {
+      toast((d && d.error) || 'Switch failed', 'error');
+      if (hint) hint.textContent = 'Switch failed.';
+      loadOrchestratorModels();
+    }
+  } catch (e) { toast('Network error: ' + e, 'error'); loadOrchestratorModels(); }
 }
 
 function closeModal() {

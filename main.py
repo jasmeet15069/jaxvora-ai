@@ -411,6 +411,46 @@ def llm_provider_status() -> Dict[str, Any]:
     }
 
 
+def _llm_model_catalog() -> List[Dict[str, Any]]:
+    """Curated, selectable (provider, model) options for the Chief Orchestrator dropdown,
+    each tagged configured/healthy/selected so the UI can guide the choice."""
+    items = [
+        ("groq", "llama-3.3-70b-versatile", "Groq · Llama 3.3 70B (versatile)"),
+        ("groq", "llama-3.1-8b-instant", "Groq · Llama 3.1 8B (fast)"),
+        ("openrouter", DEEPSEEK_MODEL, f"OpenRouter · {DEEPSEEK_MODEL.split('/')[-1]}"),
+        ("zen", OPENCODE_ZEN_MODEL, f"Zen · {OPENCODE_ZEN_MODEL}"),
+    ]
+    if (DEEPSEEK_V4_API_KEY or "").strip():
+        items.append(("deepseek_v4", DEEPSEEK_V4_MODEL, f"DeepSeek · {DEEPSEEK_V4_MODEL.split('/')[-1]}"))
+    cur_p = ORCHESTRATOR_PROVIDER
+    cur_m = _provider_model(cur_p)
+    out: List[Dict[str, Any]] = []
+    for prov, model, label in items:
+        out.append({
+            "provider": prov, "model": model, "label": label,
+            "configured": bool(_PROVIDERS.get(prov, {}).get("enabled", lambda: False)()),
+            "healthy": bool((_LLM_HEALTH.get(prov) or {}).get("ok")),
+            "selected": (prov == cur_p and model == cur_m),
+        })
+    return out
+
+
+def _apply_orchestrator_model(provider: str, model: str) -> None:
+    """Switch the Chief Orchestrator's preferred provider + that provider's model at
+    runtime (no restart). Provider model globals are shared, so this also sets the model
+    used whenever that provider is hit elsewhere in the failover chain."""
+    global ORCHESTRATOR_PROVIDER, OPENCODE_ZEN_MODEL, LLAMA_MODEL, GROQ_MODEL, GROQ_MODEL_TOOLS, DEEPSEEK_MODEL, DEEPSEEK_V4_MODEL
+    ORCHESTRATOR_PROVIDER = provider
+    if provider == "groq":
+        GROQ_MODEL = model; LLAMA_MODEL = model; GROQ_MODEL_TOOLS = model
+    elif provider == "zen":
+        OPENCODE_ZEN_MODEL = model
+    elif provider == "openrouter":
+        DEEPSEEK_MODEL = model
+    elif provider == "deepseek_v4":
+        DEEPSEEK_V4_MODEL = model
+
+
 # ── Proactive LLM health-check ───────────────────────────────────────────────
 # Probes every configured provider/model so dead or rate-limited ones are benched and
 # live ones cleared BEFORE a user chats. The failover chain reads the resulting
@@ -6635,8 +6675,8 @@ async def agent_activity(name: str):
             logger.warning(f"agent_activity subtasks failed: {e}")
         try:
             hrows = await db_fetch(
-                "SELECT task_summary, outcome, created_at FROM agent_history "
-                "WHERE agent_name=$1 ORDER BY created_at DESC LIMIT 8", agent.name)
+                "SELECT task_summary, outcome, timestamp AS created_at FROM agent_history "
+                "WHERE agent_name=$1 ORDER BY timestamp DESC LIMIT 8", agent.name)
             history = [{
                 "task": h["task_summary"], "outcome": h["outcome"],
                 "created_at": h["created_at"].isoformat() if h["created_at"] else None,
@@ -7871,6 +7911,45 @@ async def llm_health_endpoint(force: bool = False):
     return llm_provider_status()
 
 
+@app.get("/llm/models")
+async def llm_models():
+    """Selectable models for the Chief Orchestrator dropdown + the current selection."""
+    maybe_refresh_llm_health()
+    return {"ok": True, "models": _llm_model_catalog(),
+            "current": {"provider": ORCHESTRATOR_PROVIDER, "model": _provider_model(ORCHESTRATOR_PROVIDER)}}
+
+
+class LLMModelRequest(BaseModel):
+    provider: str
+    model: str
+
+
+@app.post("/llm/model")
+async def set_llm_model(req: LLMModelRequest):
+    """Switch the Chief Orchestrator's model at runtime (persisted across restarts)."""
+    prov = (req.provider or "").strip().lower()
+    model = (req.model or "").strip()
+    if prov not in _PROVIDERS:
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"unknown provider '{prov}'"})
+    if not _PROVIDERS[prov]["enabled"]():
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"provider '{prov}' is not configured (no API key)"})
+    if not model:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "model is required"})
+    _apply_orchestrator_model(prov, model)
+    try:
+        if db_pool is not None:
+            await db_execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES ('orchestrator_llm', $1, NOW()) "
+                "ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()",
+                json.dumps({"provider": prov, "model": model}))
+    except Exception as e:
+        logger.warning(f"persist orchestrator_llm failed: {e}")
+    record_thought(CHIEF_NAME, f"⚙ model switched → {prov} · {model}", "info")
+    logger.info(f"Orchestrator model switched to {prov} · {model}")
+    return {"ok": True, "provider": prov, "model": model,
+            "current": {"provider": ORCHESTRATOR_PROVIDER, "model": _provider_model(ORCHESTRATOR_PROVIDER)}}
+
+
 @app.get("/settings/status")
 async def get_settings_status():
     maybe_refresh_llm_health()  # website/admin opened → keep model health fresh
@@ -8098,6 +8177,16 @@ async def startup():
                         """,
                         NOTIFICATION_EMAIL,
                     )
+                # Restore a persisted Chief Orchestrator model choice (POST /llm/model).
+                try:
+                    mrow = await conn.fetchrow("SELECT value FROM app_settings WHERE key='orchestrator_llm'")
+                    if mrow and mrow["value"]:
+                        sel = json.loads(mrow["value"])
+                        if sel.get("provider") in _PROVIDERS and sel.get("model"):
+                            _apply_orchestrator_model(sel["provider"], sel["model"])
+                            logger.info(f"Orchestrator model restored: {sel['provider']} · {sel['model']}")
+                except Exception as e:
+                    logger.warning(f"load orchestrator_llm failed: {e}")
             logger.info("✓ PostgreSQL connected and schema ready")
         except Exception as e:
             logger.error(f"✗ PostgreSQL connection failed: {e}")

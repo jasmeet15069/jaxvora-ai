@@ -28,6 +28,7 @@
     { "source": "/upload", "destination": "http://172.104.35.34:8090/upload" },
     { "source": "/download", "destination": "http://172.104.35.34:8090/download" },
     { "source": "/settings/:path*", "destination": "http://172.104.35.34:8090/settings/:path*" },
+    { "source": "/llm/:path*", "destination": "http://172.104.35.34:8090/llm/:path*" },
     { "source": "/send-email/:path*", "destination": "http://172.104.35.34:8090/send-email/:path*" },
     { "source": "/gmail/:path*", "destination": "http://172.104.35.34:8090/gmail/:path*" },
     { "source": "/social/:path*", "destination": "http://172.104.35.34:8090/social/:path*" },
