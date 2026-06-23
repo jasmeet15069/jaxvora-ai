@@ -1444,6 +1444,36 @@ def thoughts_for(agent_name: str, since: int = 0, limit: int = 50) -> List[Dict[
     return items[-limit:]
 
 
+CHIEF_NAME = "Chief Orchestrator"
+
+
+def _is_chief_name(name: str) -> bool:
+    """The Chief Orchestrator is not a registry agent, so its name is matched explicitly
+    when serving the per-agent activity / stream / chat endpoints."""
+    return (name or "").strip().lower() in ("chief orchestrator", "chief", "orchestrator")
+
+
+def chief_activity_snapshot(recent: Optional[List[Dict[str, Any]]] = None,
+                            history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Synthetic activity view for the Chief Orchestrator (it has no AGENT_REGISTRY entry).
+    Status is derived from how recently it recorded a thought — it streams its planning and
+    routing steps via record_thought(CHIEF_NAME, …) just like every other agent."""
+    ths = thoughts_for(CHIEF_NAME)
+    last_t = ths[-1]["t"] if ths else 0
+    running = bool(last_t) and (time.time() - last_t) < 8
+    return {
+        "ok": True, "name": CHIEF_NAME, "division": "Orchestration",
+        "model": ORCHESTRATOR_PROVIDER,
+        "description": ("Reads your request, plans the work, and dispatches the specialist "
+                        "agents. Its live reasoning and routing steps appear here."),
+        "status": "running" if running else "idle",
+        "current_task": (ths[-1]["text"] if running and ths else ""),
+        "collaborators": [a.name for a in AGENT_REGISTRY.values()][:12],
+        "recent": recent or [], "history": history or [],
+        "thoughts": ths,
+    }
+
+
 # Action verbs that signal a real multi-step task needing the full TAOR orchestration.
 # Anything else (greetings, simple questions) takes a cheap single-call fast-path —
 # this is the main lever against Groq TPM 429s, since one call ≪ a full agent loop.
@@ -4717,6 +4747,22 @@ Always respond in this JSON format:
         if m:
             location = re.split(r'[.,;]', m.group(1))[0].strip()
 
+        # make the specialist agents visible in the Agent Flow graph (this IS the Career
+        # squad doing the work — surface it so the user sees/inspects the agents).
+        async def _live(agent_name: str, status: str, task: str = "") -> None:
+            a = AGENT_REGISTRY.get(agent_name)
+            if a is not None:
+                a._status = status
+                a._current_task = task
+            try:
+                await ws_manager.broadcast_agent_status(agent_name, status, task[:60])
+            except Exception:
+                pass
+
+        record_thought(CHIEF_NAME, f"🔎 job search request → dispatching Career squad", "act")
+        await _live("Resume Agent", "running", "Reading your resume to extract the target role")
+        record_thought("Resume Agent", "▸ reading résumé from your workspace", "task")
+
         # 1) try to read a resume file from the workspace to base the query on
         resume_text = ""
         resume_name = ""
@@ -4752,7 +4798,7 @@ Always respond in this JSON format:
                     if txt and not txt.startswith("file_system:"):
                         resume_text = txt[:6000]
                         resume_name = best.name
-                        record_thought("Chief Orchestrator", f"📄 read {rel} for job search", "observe")
+                        record_thought("Resume Agent", f"📄 read {rel} ({len(resume_text)} chars)", "observe")
                 except Exception:
                     pass
 
@@ -4780,25 +4826,37 @@ Always respond in this JSON format:
             if mm:
                 query = re.sub(r'\s+', ' ', mm.group(1)).strip()
 
+        if query:
+            record_thought("Resume Agent", f"✓ target role: {query}", "done")
+        await _live("Resume Agent", "idle")
+
         # we've committed to a job request — never fall through to file-listing
         if not query:
             resp = ("I can search for jobs and send you the links — what role/title should I search for? "
                     "(I couldn't infer one from your resume — e.g. \"find Power BI Developer jobs in Remote\".)")
             await memory_append("user", user_input)
             await memory_append("assistant", resp)
-            return {"plan": "Job search — need a role", "agents": ["Job Search Agent"], "response": resp,
+            return {"plan": "Job search — need a role", "agents": ["Resume Agent"], "response": resp,
                     "results": [], "steps": [], "organization": {"mode": "job_search", "need": "query"}}
 
         task_id = "jobchat-" + uuid.uuid4().hex[:8]
-        record_thought("Chief Orchestrator", f"🔎 job search: {query}{(' @ ' + location) if location else ''}", "act")
-        listings = await _jobhunt_find_listings(query, location, 6, task_id)
+        record_thought(CHIEF_NAME, f"→ dispatched Job Search Agent: {query}{(' @ ' + location) if location else ''}", "act")
+        await _live("Job Search Agent", "running", f"Searching: {query}{(' in ' + location) if location else ''}")
+        record_thought("Job Search Agent", f"🔎 searching the web for: {query}{(' in ' + location) if location else ''}", "task")
+        listings: List[Dict[str, Any]] = []
+        try:
+            listings = await _jobhunt_find_listings(query, location, 6, task_id)
+        finally:
+            record_thought("Job Search Agent", f"✓ found {len(listings)} listings", "done")
+            await _live("Job Search Agent", "idle")
         src = f" (from your resume **{resume_name}**)" if resume_name else ""
         loc = f" in {location}" if location else ""
+        agents_used = ["Resume Agent", "Job Search Agent"] if resume_name else ["Job Search Agent"]
         if not listings:
             resp = (f"I searched for **{query}** jobs{loc}{src} but couldn't pull back usable links right "
                     "now. Try again in a moment, or refine the role/location.")
         else:
-            lines = [f"Here are {len(listings)} **{query}** job links{loc}{src}:\n"]
+            lines = [f"**Job Search Agent** found {len(listings)} **{query}** job links{loc}{src}:\n"]
             for i, j in enumerate(listings, 1):
                 title = (j.get("title") or query).strip()
                 co = f" — {j['company']}" if j.get("company") else ""
@@ -4808,10 +4866,11 @@ Always respond in this JSON format:
             resp = "\n".join(lines)
         await memory_append("user", user_input)
         await memory_append("assistant", resp)
-        return {"plan": f"Search jobs: {query}", "agents": ["Job Search Agent"], "response": resp,
+        return {"plan": f"Career squad — search jobs: {query}", "agents": agents_used, "response": resp,
                 "results": [{"agent": "Job Search Agent", "success": bool(listings),
                              "output": f"{len(listings)} listings"}],
-                "steps": [], "organization": {"mode": "job_search", "query": query, "location": location}}
+                "steps": [], "organization": {"mode": "job_search", "query": query, "location": location,
+                                              "agents": agents_used}}
 
     async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
         """Deterministically answer about the Computer workspace: LIST what's there
@@ -6537,6 +6596,25 @@ async def agent_activity(name: str):
         # case-insensitive fallback
         agent = next((a for a in AGENT_REGISTRY.values() if a.name.lower() == name.lower()), None)
     if agent is None:
+        if _is_chief_name(name):
+            # Chief Orchestrator: not a registry agent — serve its thought-stream + any
+            # subtask rows it logged (e.g. the job-search flow logs under its agents).
+            chief_recent: List[Dict[str, Any]] = []
+            if db_pool is not None:
+                try:
+                    rows = await db_fetch(
+                        "SELECT subtask, status, output, error, started_at, completed_at "
+                        "FROM jaxvora_subtask_log WHERE agent_name=$1 ORDER BY started_at DESC LIMIT 12",
+                        CHIEF_NAME)
+                    chief_recent = [{
+                        "subtask": r["subtask"], "status": r["status"],
+                        "output": (r["output"] or "")[:600], "error": (r["error"] or "")[:300],
+                        "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                        "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+                    } for r in rows]
+                except Exception as e:
+                    logger.warning(f"chief activity subtasks failed: {e}")
+            return chief_activity_snapshot(recent=chief_recent)
         return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown agent '{name}'"})
 
     recent: List[Dict[str, Any]] = []
@@ -6583,6 +6661,10 @@ async def agent_stream(name: str, since: int = 0):
     agent = AGENT_REGISTRY.get(name) or next(
         (a for a in AGENT_REGISTRY.values() if a.name.lower() == name.lower()), None)
     if agent is None:
+        if _is_chief_name(name):
+            snap = chief_activity_snapshot()
+            return {"ok": True, "name": CHIEF_NAME, "status": snap["status"],
+                    "current_task": snap["current_task"], "thoughts": thoughts_for(CHIEF_NAME, since)}
         return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown agent '{name}'"})
     return {"ok": True, "name": agent.name, "status": agent._status,
             "current_task": agent._current_task, "thoughts": thoughts_for(agent.name, since)}
@@ -6599,6 +6681,25 @@ async def agent_chat(name: str, req: AgentChatRequest):
     agent = AGENT_REGISTRY.get(name) or next(
         (a for a in AGENT_REGISTRY.values() if a.name.lower() == name.lower()), None)
     if agent is None:
+        if _is_chief_name(name):
+            msg = (req.message or "").strip()
+            if not msg:
+                return JSONResponse(status_code=400, content={"ok": False, "error": "message is required"})
+            record_thought(CHIEF_NAME, f"▸ direct chat: {msg[:120]}", "task")
+            mem_ctx = memory_format(await memory_recent())
+            sys_p = ("You are the Chief Orchestrator of Jaxvora's multi-agent team. Answer the user "
+                     "directly and concisely. If they want a multi-step build/automation/job task, "
+                     "briefly explain which specialist agents you'd coordinate and how.")
+            up = (f"{mem_ctx}\n\nUser (talking to the Chief Orchestrator): {msg}"
+                  if mem_ctx else f"User (talking to the Chief Orchestrator): {msg}")
+            try:
+                reply = await call_orchestrator_llm(sys_p, up)
+            except Exception as e:
+                reply = f"[error: {e}]"
+            record_thought(CHIEF_NAME, "✓ replied", "done")
+            await memory_append("user", msg)
+            await memory_append("assistant", reply, agent=CHIEF_NAME)
+            return {"ok": True, "agent": CHIEF_NAME, "response": reply}
         return JSONResponse(status_code=404, content={"ok": False, "error": f"Unknown agent '{name}'"})
     msg = (req.message or "").strip()
     if not msg:

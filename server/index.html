@@ -1990,6 +1990,8 @@ async function renderAgentActivity(name) {
   const statusEl = document.getElementById('modal-agent-status');
   if (statusEl) statusEl.innerHTML =
     `<div class="pill ${d.status === 'running' ? 'green' : ''}" style="display:inline-flex;gap:6px;align-items:center"><div class="status-indicator ${safe}" style="width:6px;height:6px;flex-shrink:0"></div>${escHtml(d.status.toUpperCase())}</div> <span style="font-size:10px;color:var(--text3)">${escHtml(d.division || '')} · ${escHtml(d.model || '')}</span>`;
+  const descEl = document.getElementById('modal-agent-desc');
+  if (descEl && d.description) descEl.textContent = d.description;
   const ct = document.getElementById('modal-current-task');
   if (ct) ct.innerHTML = d.current_task
     ? ('▸ ' + escHtml(d.current_task.slice(0, 160)))
@@ -2989,7 +2991,8 @@ const flow = {
       // hover affordance
       const [hx, hy] = this._evtXY(e);
       const over = this._hitAgent(hx, hy);
-      this.canvas.style.cursor = over ? 'grab' : 'default';
+      const overChief = this.chiefHit && Math.hypot(hx - this.chiefHit.x, hy - this.chiefHit.y) <= this.chiefHit.r;
+      this.canvas.style.cursor = over ? 'grab' : (overChief ? 'pointer' : 'default');
       return;
     }
     const [x, y] = this._evtXY(e);
@@ -3017,7 +3020,10 @@ const flow = {
   onClick(e) {
     if (this._suppressClick) { this._suppressClick = false; return; }
     const [x, y] = this._evtXY(e);
-    if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) return;
+    if (this.chiefHit && Math.hypot(x - this.chiefHit.x, y - this.chiefHit.y) <= this.chiefHit.r) {
+      if (document.getElementById('agent-modal')) openAgentModal('Chief Orchestrator');
+      return;
+    }
     const n = this._hitAgent(x, y);
     if (n && document.getElementById('agent-modal')) openAgentModal(n.name);
     else if (!n) this.clearFocus();   // click empty space → clear focus
