@@ -2110,7 +2110,10 @@ async function loadOrchestratorModels() {
     sel.innerHTML = d.models.map(m => {
       const val = m.provider + '|' + m.model;
       const tag = m.healthy ? '🟢' : (m.configured ? '🟡' : '🔴');
-      return `<option value="${escHtml(val)}"${m.selected ? ' selected' : ''}${m.configured ? '' : ' disabled'}>${tag} ${escHtml(m.label)}</option>`;
+      const reason = m.healthy ? '' : (m.configured ? ' — unavailable now' : ' — no API key');
+      // dead models (rate-limited / no key) can't be picked, except the current one so it still shows
+      const disabled = (!m.healthy && !m.selected) ? ' disabled' : '';
+      return `<option value="${escHtml(val)}"${m.selected ? ' selected' : ''}${disabled}>${tag} ${escHtml(m.label)}${reason}</option>`;
     }).join('');
   } catch { sel.innerHTML = '<option>Unable to load models</option>'; }
 }
@@ -2125,8 +2128,13 @@ async function switchOrchestratorModel(val) {
     const r = await fetch('/llm/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, model }) });
     const d = await r.json().catch(() => ({}));
     if (r.ok && d.ok) {
-      toast('Orchestrator model → ' + d.provider + ' · ' + d.model, 'success');
-      if (hint) hint.textContent = 'Active: ' + d.current.provider + ' · ' + d.current.model;
+      if (d.warning) {
+        toast(d.warning, 'error');
+        if (hint) hint.textContent = '⚠ ' + d.warning;
+      } else {
+        toast('Orchestrator model → ' + d.provider + ' · ' + d.model, 'success');
+        if (hint) hint.textContent = 'Active: ' + d.current.provider + ' · ' + d.current.model;
+      }
     } else {
       toast((d && d.error) || 'Switch failed', 'error');
       if (hint) hint.textContent = 'Switch failed.';

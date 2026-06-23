@@ -373,7 +373,10 @@ def _build_provider_chain(prefer: Optional[str] = None) -> List[str]:
         order = ["groq", "deepseek_v4", "openrouter", "zen"]
     if not order:
         order = ["zen", "groq"]
-    if prefer in _PROVIDERS and prefer in order:
+    # An explicit pick (e.g. the orchestrator model dropdown) is tried first even if it's
+    # not in LLM_PROVIDER_ORDER — otherwise selecting it would be a silent no-op. If it's
+    # benched/unhealthy the `hot` filter below still drops it so we fall back cleanly.
+    if prefer in _PROVIDERS:
         order = [prefer] + [p for p in order if p != prefer]
     enabled = [n for n in order if _PROVIDERS[n]["enabled"]()]
     now = time.time()
@@ -7946,8 +7949,14 @@ async def set_llm_model(req: LLMModelRequest):
         logger.warning(f"persist orchestrator_llm failed: {e}")
     record_thought(CHIEF_NAME, f"⚙ model switched → {prov} · {model}", "info")
     logger.info(f"Orchestrator model switched to {prov} · {model}")
-    return {"ok": True, "provider": prov, "model": model,
+    resp = {"ok": True, "provider": prov, "model": model,
             "current": {"provider": ORCHESTRATOR_PROVIDER, "model": _provider_model(ORCHESTRATOR_PROVIDER)}}
+    if not bool((_LLM_HEALTH.get(prov) or {}).get("ok")):
+        err = (_LLM_HEALTH.get(prov) or {}).get("error", "")
+        resp["warning"] = (f"'{prov}' is currently unavailable"
+                           + (f" ({err[:60]})" if err else "")
+                           + " — the orchestrator will fall back to a working model until it recovers.")
+    return resp
 
 
 @app.get("/settings/status")
