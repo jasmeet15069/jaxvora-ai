@@ -1584,9 +1584,9 @@ class FileSystemTool(MCPTool):
     def __init__(self):
         super().__init__(
             "file_system",
-            ("Read/write/edit/append/list/mkdir/delete files in the workspace folder. "
-             "params: action (read|write|edit|append|list|mkdir|delete|exists), path, "
-             "content (for write/append), old_string + new_string (for edit). "
+            ("Read/write/edit/append/list/mkdir/delete/move files in the workspace folder. "
+             "params: action (read|write|edit|append|list|mkdir|delete|move|exists), path, "
+             "content (for write/append), old_string + new_string (for edit), dest (for move). "
              "All paths are sandboxed to /root/jaxvora-ai/workspace."),
             risk_level="medium", requires_confirmation=True)
         self.SANDBOX.mkdir(parents=True, exist_ok=True)
@@ -1679,6 +1679,14 @@ class FileSystemTool(MCPTool):
                 else:
                     return "file_system: nothing to delete"
                 return f"Deleted {rel}"
+            if action in ("move", "rename"):
+                if not resolved.exists():
+                    return f"file_system: not found: {rel}"
+                dest = self._resolve(params.get("dest", "") or params.get("new_path", ""))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.move(str(resolved), str(dest))
+                return f"Moved {rel} -> {dest.relative_to(self.SANDBOX.resolve())}"
             return f"file_system: unknown action '{action}'"
         except ValueError as e:
             return f"file_system error: {e}"
@@ -4766,7 +4774,7 @@ Always respond in this JSON format:
         sample = user_input[:12000]
         return "%PDF" in sample or ("/Type /Catalog" in sample and "endobj" in sample and "stream" in sample)
 
-    _WS_READ_VERB = re.compile(r'\b(read|open|show|view|summari[sz]e|analy[sz]e|review|look at|extract|parse|check)\b', re.IGNORECASE)
+    _WS_READ_VERB = re.compile(r'\b(read|open|show|view|use|using|access|load|import|grab|fetch|scan|summari[sz]e|analy[sz]e|review|look at|see|extract|parse|check)\b', re.IGNORECASE)
     _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report|data|dataset|excel|spreadsheet|xlsx?|sheet|csv|stock|image|photo|picture|screenshot|audio|video|recording|png|jpe?g|mp3|mp4|transcri)\b', re.IGNORECASE)
 
     # Deterministic job-search fast-path (see _handle_job_search_chat).
@@ -4915,6 +4923,109 @@ Always respond in this JSON format:
                 "steps": [], "organization": {"mode": "job_search", "query": query, "location": location,
                                               "agents": agents_used}}
 
+    async def _handle_workspace_crud(self, user_input: str) -> Optional[Dict[str, Any]]:
+        """Deterministic CRUD on the Computer workspace — explicit file commands run
+        directly via FileSystemTool (create file/folder, write/append content, rename/move,
+        delete) so the Chief Orchestrator can manage files instantly and reliably, even when
+        the LLM providers are rate-limited. Read/list stay in _handle_workspace_read."""
+        t = (user_input or "").strip()
+        if not t or len(t) > 1500:
+            return None
+        I = re.IGNORECASE
+        fs = FileSystemTool()
+        FN = r'["‘’“”\'`]?([\w .\-()/]+?)["‘’“”\'`]?'
+
+        def _find(name: str) -> Optional[str]:
+            """Resolve a bare name to an existing workspace-relative path (top + 1 level deep)."""
+            name = (name or "").strip().strip("/")
+            if not name:
+                return None
+            try:
+                if (WORKSPACE_DIR / name).exists():
+                    return name
+                base = name.lower()
+                for f in WORKSPACE_DIR.iterdir():
+                    if _ws_is_noise(f):
+                        continue
+                    if f.name.lower() == base:
+                        return f.name
+                    if f.is_dir():
+                        for g in f.iterdir():
+                            if not _ws_is_noise(g) and g.name.lower() == base:
+                                return g.relative_to(WORKSPACE_DIR).as_posix()
+            except Exception:
+                pass
+            return None
+
+        async def _settle(action: str, path: str, msg: str, ok: bool = True) -> Dict[str, Any]:
+            record_thought(CHIEF_NAME, f"🗂 {action} {path}".strip(), "act")
+            await memory_append("user", user_input)
+            await memory_append("assistant", msg)
+            return {"plan": f"Workspace {action}", "agents": ["Chief Orchestrator"], "response": msg,
+                    "results": [{"agent": "file_system", "success": ok, "output": path or action}],
+                    "steps": [], "organization": {"mode": "workspace_crud", "action": action, "path": path}}
+
+        # ── CREATE FOLDER ──
+        m = re.match(rf'(?:create|make|add|new|mkdir)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:folder|directory|dir)\s+(?:called\s+|named\s+)?{FN}\s*$', t, I)
+        if m:
+            name = m.group(1).strip()
+            out = await fs.run({"action": "mkdir", "path": name})
+            ok = out.startswith("Created")
+            return await _settle("mkdir", name, (f"📁 Created folder **{name}** in your workspace." if ok else out), ok)
+
+        # ── RENAME / MOVE  (a → b) ──
+        m = re.match(rf'(?:rename|move|mv)\s+(?:the\s+)?(?:file\s+|folder\s+)?{FN}\s+(?:to|as|into)\s+{FN}\s*$', t, I)
+        if m:
+            src = _find(m.group(1).strip()) or m.group(1).strip()
+            dst = m.group(2).strip()
+            out = await fs.run({"action": "move", "path": src, "dest": dst})
+            ok = out.startswith("Moved")
+            return await _settle("move", f"{src}→{dst}", (f"✏️ Renamed **{src}** → **{dst}**." if ok else out), ok)
+
+        # ── DELETE / REMOVE  (only if it actually exists) ──
+        m = re.match(rf'(?:delete|remove|rm|trash|del)\s+(?:the\s+)?(?:file\s+|folder\s+|directory\s+)?{FN}(?:\s+from\s+(?:my\s+)?(?:computer|workspace|the\s+computer))?\s*$', t, I)
+        if m:
+            name_in = m.group(1).strip()
+            name = _find(name_in)
+            if not name:
+                return await _settle("delete", name_in, f"⚠️ I couldn't find **{name_in}** in your workspace — nothing was deleted.", False)
+            out = await fs.run({"action": "delete", "path": name})
+            ok = out.startswith("Deleted")
+            return await _settle("delete", name, (f"🗑️ Deleted **{name}** from your workspace." if ok else out), ok)
+
+        # ── WRITE / CREATE FILE WITH CONTENT  (requires the word "file") ──
+        m = re.search(rf'(?:create|make|new|write|save)\s+(?:a\s+)?(?:new\s+)?file\s+{FN}\s+(?:with\s+(?:content|text)|containing|that\s+says?|holding|with)\s*[:\-]?\s*(.+)$', t, I | re.DOTALL)
+        if m:
+            name, content = m.group(1).strip(), m.group(2).strip().strip('"“”\'`')
+            out = await fs.run({"action": "write", "path": name, "content": content})
+            ok = out.startswith("Wrote")
+            return await _settle("write", name, (f"📝 Saved {len(content)} chars to **{name}**." if ok else out), ok)
+        m = re.search(rf'(?:write|save|put)\s+(.+?)\s+(?:to|into|in)\s+(?:the\s+)?file\s+{FN}\s*$', t, I | re.DOTALL)
+        if m:
+            content, name = m.group(1).strip().strip('"“”\'`'), m.group(2).strip()
+            out = await fs.run({"action": "write", "path": name, "content": content})
+            ok = out.startswith("Wrote")
+            return await _settle("write", name, (f"📝 Saved {len(content)} chars to **{name}**." if ok else out), ok)
+
+        # ── APPEND  (requires the word "file") ──
+        m = re.search(rf'(?:append|add)\s+(.+?)\s+(?:to|into|onto)\s+(?:the\s+)?file\s+{FN}\s*$', t, I | re.DOTALL)
+        if m:
+            content, name_in = m.group(1).strip().strip('"“”\'`'), m.group(2).strip()
+            name = _find(name_in) or name_in
+            out = await fs.run({"action": "append", "path": name, "content": "\n" + content})
+            ok = out.startswith("Appended")
+            return await _settle("append", name, (f"➕ Appended to **{name}**." if ok else out), ok)
+
+        # ── CREATE EMPTY FILE ──
+        m = re.match(rf'(?:create|make|add|new|touch)\s+(?:a\s+|the\s+)?(?:new\s+|empty\s+|blank\s+)*file\s+(?:called\s+|named\s+)?{FN}\s*$', t, I)
+        if m:
+            name = m.group(1).strip()
+            out = await fs.run({"action": "write", "path": name, "content": ""})
+            ok = out.startswith("Wrote")
+            return await _settle("create", name, (f"📄 Created empty file **{name}** in your workspace." if ok else out), ok)
+
+        return None
+
     async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
         """Deterministically answer about the Computer workspace: LIST what's there
         ('what can you see in computer'), or READ a specific file ('summarize my resume')
@@ -4980,7 +5091,11 @@ Always respond in this JSON format:
                     "steps": [], "organization": {"mode": "workspace_list"}}
 
         # ── READ intent: read the best-matching file (searches subfolders too) ──
-        if not (self._WS_READ_VERB.search(t) and self._WS_READ_NOUN.search(t)):
+        # Trigger on a read verb + either a file-type noun OR an explicit filename/path
+        # (e.g. "read my_reports/greeting.txt") so we read the real file instead of letting
+        # the fast-path reconstruct (hallucinate) its contents from memory.
+        has_filename = bool(re.search(r'[\w\-]+\.[a-z0-9]{1,8}\b', t, re.IGNORECASE) or "/" in t)
+        if not (self._WS_READ_VERB.search(t) and (self._WS_READ_NOUN.search(t) or has_filename)):
             return None
         files = [f for f in top if f.is_file()]
         for d in top:
@@ -5022,15 +5137,29 @@ Always respond in this JSON format:
         record_thought("Chief Orchestrator", f"📄 read {rel} from workspace", "observe")
         mem = memory_format(await memory_recent())
         sys_p = ("You are Jaxvora. The user asked about a file in their workspace and you ALREADY "
-                 "have its content below — never ask them to paste it. Answer accurately and "
-                 "concisely using only that content.")
+                 "have its content below — never ask them to paste or send it; you can read it. "
+                 "Answer accurately and concisely using only that content. If it is a resume/CV, "
+                 "confirm the candidate's target role in one line and offer to search matching jobs "
+                 "(e.g. \"want me to find matching jobs?\").")
         up = (f"{mem}\n\n" if mem else "") + f"File: {rel}\n--- file content ---\n{content}\n--- end ---\n\nUser request: {user_input}"
         try:
             reply = await call_orchestrator_llm(sys_p, up)
         except Exception as e:
             reply = f"[error reading {rel}: {e}]"
         if not reply or reply.startswith("[All LLM"):
-            return None  # let the loop / fallback try
+            # We DID read the file — never fall through to a generic reply that asks the
+            # user to "send the file" (it's already here). Surface the real cause instead.
+            busy = (f"I've loaded **{rel}** from your workspace, but the AI models are "
+                    "overloaded right now (free-tier rate limits) — please try again in a "
+                    "moment and I'll work with it.")
+            await memory_append("user", user_input)
+            await memory_append("assistant", busy)
+            return {
+                "plan": f"Read {rel} (models busy)", "agents": ["Chief Orchestrator"],
+                "response": busy,
+                "results": [{"agent": "file_system", "success": True, "output": rel}],
+                "steps": [], "organization": {"mode": "workspace_read", "file": rel, "llm": "unavailable"},
+            }
         await memory_append("user", user_input)
         await memory_append("assistant", reply)
         return {
@@ -5595,6 +5724,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         for handler in [
             self._handle_attachment_chat,
             self._handle_job_search_chat,
+            self._handle_workspace_crud,
             self._handle_workspace_read,
             lambda u: self._handle_send_email_chat(u, admin_token=admin_token),
             lambda u: self._handle_gmail_chat(u, admin_token=admin_token),
