@@ -4696,6 +4696,123 @@ Always respond in this JSON format:
     _WS_READ_VERB = re.compile(r'\b(read|open|show|view|summari[sz]e|analy[sz]e|review|look at|extract|parse|check)\b', re.IGNORECASE)
     _WS_READ_NOUN = re.compile(r'\b(resume|cv|pdf|file|document|docx?|workspace|computer|report|data|dataset|excel|spreadsheet|xlsx?|sheet|csv|stock|image|photo|picture|screenshot|audio|video|recording|png|jpe?g|mp3|mp4|transcri)\b', re.IGNORECASE)
 
+    # Deterministic job-search fast-path (see _handle_job_search_chat).
+    _JOB_NOUN = re.compile(r'\b(jobs?|vacanc\w*|openings?|hiring|recruit\w*|positions?|job[-\s]*hunt)\b', re.IGNORECASE)
+    _JOB_ACTION = re.compile(r'\b(search|find|look(?:ing)?|hunt|list|give|show|get|fetch|related|relevant|match\w*|appl(?:y|ication)|recommend|suggest|for me)\b', re.IGNORECASE)
+
+    async def _handle_job_search_chat(self, user_input: str) -> Optional[Dict[str, Any]]:
+        """Deterministic job search: 'find jobs from my resume and give me the links'.
+        Derives a query (resume file in workspace → saved /jobs/profile → a role phrase in
+        the message), then returns a clean list of job links via _jobhunt_find_listings.
+        Runs BEFORE _handle_workspace_read so a job request isn't swallowed by the
+        'list my files' fast-path, and skips the slow/flaky multi-agent loop + Playwright."""
+        t = (user_input or "").strip()
+        low = t.lower()
+        if len(t) > 600 or not self._JOB_NOUN.search(low) or not self._JOB_ACTION.search(low):
+            return None
+
+        # optional location, e.g. "... in Remote", "jobs at Bangalore"
+        location = ""
+        m = re.search(r'\b(?:in|at|near|located in|based in)\s+([A-Za-z][A-Za-z .,-]{1,40})', t)
+        if m:
+            location = re.split(r'[.,;]', m.group(1))[0].strip()
+
+        # 1) try to read a resume file from the workspace to base the query on
+        resume_text = ""
+        resume_name = ""
+        try:
+            files = [f for f in WORKSPACE_DIR.iterdir() if f.is_file() and not _ws_is_noise(f)]
+            for d in WORKSPACE_DIR.iterdir():
+                if d.is_dir() and not _ws_is_noise(d):
+                    try:
+                        files += [g for g in d.iterdir() if g.is_file() and not _ws_is_noise(g)]
+                    except Exception:
+                        pass
+        except Exception:
+            files = []
+        if files:
+            def _rscore(f: Path) -> int:
+                n = f.name.lower(); s = 0
+                for kw in ("resume", "cv", "power", "bi", "developer", "data", "analyst", "engineer"):
+                    if kw in n:
+                        s += 2
+                    if kw in low and kw in n:
+                        s += 2
+                if f.suffix.lower() in (".pdf", ".docx", ".doc", ".txt", ".md"):
+                    s += 2
+                for tok in re.findall(r'[a-z0-9_]+', low):
+                    if len(tok) > 3 and tok in n:
+                        s += 3
+                return s
+            best = max(files, key=_rscore)
+            if _rscore(best) > 0:
+                try:
+                    rel = best.relative_to(WORKSPACE_DIR).as_posix()
+                    txt = (await FileSystemTool().run({"action": "read", "path": rel}) or "")
+                    if txt and not txt.startswith("file_system:"):
+                        resume_text = txt[:6000]
+                        resume_name = best.name
+                        record_thought("Chief Orchestrator", f"📄 read {rel} for job search", "observe")
+                except Exception:
+                    pass
+
+        # 2) derive a concise search query: resume → saved profile → role phrase
+        query = ""
+        if resume_text:
+            try:
+                q = await call_llm_failover(
+                    "From the resume below, output ONE concise job-search query — a job title plus 1-3 key "
+                    "skills, max 8 words. Output ONLY the query text, no quotes, no explanation.",
+                    f"Resume ({resume_name}):\n{resume_text}")
+                if q and not q.startswith("[All LLM"):
+                    query = q.strip().strip('"').splitlines()[0][:80]
+            except Exception:
+                query = ""
+        if not query:
+            try:
+                prof = await job_profile_load()
+                if prof and prof.get("current_title"):
+                    query = str(prof["current_title"])[:80]
+            except Exception:
+                pass
+        if not query:
+            mm = re.search(r'\b([A-Za-z][A-Za-z /+.&-]{2,40}?\s*(?:developer|engineer|analyst|scientist|manager|designer|consultant|administrator|specialist|architect|lead))\b', t, re.IGNORECASE)
+            if mm:
+                query = re.sub(r'\s+', ' ', mm.group(1)).strip()
+
+        # we've committed to a job request — never fall through to file-listing
+        if not query:
+            resp = ("I can search for jobs and send you the links — what role/title should I search for? "
+                    "(I couldn't infer one from your resume — e.g. \"find Power BI Developer jobs in Remote\".)")
+            await memory_append("user", user_input)
+            await memory_append("assistant", resp)
+            return {"plan": "Job search — need a role", "agents": ["Job Search Agent"], "response": resp,
+                    "results": [], "steps": [], "organization": {"mode": "job_search", "need": "query"}}
+
+        task_id = "jobchat-" + uuid.uuid4().hex[:8]
+        record_thought("Chief Orchestrator", f"🔎 job search: {query}{(' @ ' + location) if location else ''}", "act")
+        listings = await _jobhunt_find_listings(query, location, 6, task_id)
+        src = f" (from your resume **{resume_name}**)" if resume_name else ""
+        loc = f" in {location}" if location else ""
+        if not listings:
+            resp = (f"I searched for **{query}** jobs{loc}{src} but couldn't pull back usable links right "
+                    "now. Try again in a moment, or refine the role/location.")
+        else:
+            lines = [f"Here are {len(listings)} **{query}** job links{loc}{src}:\n"]
+            for i, j in enumerate(listings, 1):
+                title = (j.get("title") or query).strip()
+                co = f" — {j['company']}" if j.get("company") else ""
+                lines.append(f"{i}. [{title}{co}]({j['url']})")
+            lines.append("\n_Want me to tailor a cover note or auto-apply to any of these? "
+                         "Auto-apply needs your LinkedIn session saved on the server._")
+            resp = "\n".join(lines)
+        await memory_append("user", user_input)
+        await memory_append("assistant", resp)
+        return {"plan": f"Search jobs: {query}", "agents": ["Job Search Agent"], "response": resp,
+                "results": [{"agent": "Job Search Agent", "success": bool(listings),
+                             "output": f"{len(listings)} listings"}],
+                "steps": [], "organization": {"mode": "job_search", "query": query, "location": location}}
+
     async def _handle_workspace_read(self, user_input: str) -> Optional[Dict[str, Any]]:
         """Deterministically answer about the Computer workspace: LIST what's there
         ('what can you see in computer'), or READ a specific file ('summarize my resume')
@@ -5375,6 +5492,7 @@ Write one polished final answer. Do not dump raw traces. Mention the agents that
         # Attachment / Gmail / SSH / Doctor shortcuts
         for handler in [
             self._handle_attachment_chat,
+            self._handle_job_search_chat,
             self._handle_workspace_read,
             lambda u: self._handle_send_email_chat(u, admin_token=admin_token),
             lambda u: self._handle_gmail_chat(u, admin_token=admin_token),
